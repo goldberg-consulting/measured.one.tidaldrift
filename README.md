@@ -194,7 +194,7 @@ BUILD_NUMBER=10403
 The release build script sources `TidalDrift/.env` for Apple notarization credentials. This file is gitignored and must never be committed.
 
 ```bash
-cp TidalDrift/.env.example TidalDrift/.env
+cp TidalDrift/.env.template TidalDrift/.env
 ```
 
 Then edit `TidalDrift/.env` with your values:

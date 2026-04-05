@@ -39,7 +39,12 @@ struct MenuBarView: View {
     /// Close the menu bar popover, then run an action on the next run loop
     /// so the target window can become key without competing for focus.
     private func dismissPopoverAndRun(_ action: @escaping () -> Void) {
-        if let popover = NSApp.keyWindow, popover.level == .statusBar || popover.styleMask.contains(.nonactivatingPanel) || popover.className.contains("StatusBar") {
+        if let popover = NSApp.windows.first(where: {
+            $0.isVisible
+                && ($0.level == .statusBar
+                    || $0.styleMask.contains(.nonactivatingPanel)
+                    || $0.className.contains("StatusBar"))
+        }) {
             popover.close()
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
@@ -224,7 +229,7 @@ struct MenuBarView: View {
             
             MenuBarActionButton(icon: "gearshape", label: "Settings...") {
                 dismissPopoverAndRun {
-                    (NSApp.delegate as? AppDelegate)?.showSettingsWindow(nil)
+                    NSApp.sendAction(#selector(AppDelegate.showSettingsWindow(_:)), to: nil, from: nil)
                 }
             }
             

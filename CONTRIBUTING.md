@@ -24,7 +24,7 @@ Thank you for your interest in contributing to TidalDrift. This document covers 
 - Releases are automated: publishing a GitHub Release triggers a workflow that builds, signs, notarizes, uploads the DMG, and bumps the Homebrew cask.
 - The release workflow requires maintainer approval via a protected GitHub environment.
 - Build version metadata is sourced from `TidalDrift/version.env` (`APP_VERSION`, `BUILD_NUMBER`).
-- For local release builds, `build-release.sh` loads credentials from `TidalDrift/.env` (never committed). Pass `--skip-notarize` to skip Apple notarization.
+- For local release builds, copy `TidalDrift/.env.template` to `TidalDrift/.env`, then fill in credentials. `build-release.sh` loads `TidalDrift/.env` (never committed). Pass `--skip-notarize` to skip Apple notarization.
 
 ## Code Style
 
