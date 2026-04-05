@@ -56,7 +56,7 @@ brew upgrade --cask tidaldrift
 
 ### Manual
 
-Download the latest signed and notarized DMG from [Releases](https://github.com/goldberg-consulting/measured.one.tidal-drift/releases), open it, and drag TidalDrift to Applications.
+Download the latest signed and notarized DMG from [Releases](https://github.com/goldberg-consulting/measured.one-tidaldrift/releases), open it, and drag TidalDrift to Applications.
 
 ## Requirements
 
