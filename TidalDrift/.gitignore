@@ -33,6 +33,7 @@ xcuserdata/
 # Environment secrets
 .env
 !.env.example
+!.env.template
 
 # Build output from build-app.sh
 build-xcode/

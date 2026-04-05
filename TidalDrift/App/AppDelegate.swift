@@ -117,6 +117,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     private func showSettings() {
         NSApp.activate(ignoringOtherApps: true)
         if let existing = settingsWindow {
+            if existing.isMiniaturized {
+                existing.deminiaturize(nil)
+            }
+            existing.level = .floating
             existing.orderFrontRegardless()
             existing.makeKeyAndOrderFront(nil)
             return
@@ -137,7 +141,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         window.contentView = hostingView
         window.center()
         window.isReleasedWhenClosed = false
+        window.level = .floating
+        window.collectionBehavior.insert(.moveToActiveSpace)
         window.delegate = self
+        window.orderFrontRegardless()
         window.makeKeyAndOrderFront(nil)
         
         NSApp.activate(ignoringOtherApps: true)

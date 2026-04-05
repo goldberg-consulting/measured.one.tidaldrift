@@ -109,6 +109,7 @@ TidalDrift/TidalDrift\ *.app/
 .env
 *.env
 !.env.example
+!.env.template
 !TidalDrift/version.env
 
 # Build artifacts from build-app.sh / build-release.sh
