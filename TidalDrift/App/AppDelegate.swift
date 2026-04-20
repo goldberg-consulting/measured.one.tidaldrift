@@ -24,6 +24,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             TidalDriftPeerService.shared.startDiscovery()
             
             _ = TidalDropService.shared
+            
+            if UserDefaults.standard.bool(forKey: "localCastAutoHost") {
+                Task {
+                    do {
+                        try await LocalCastService.shared.startHosting()
+                    } catch {
+                        print("LocalCast: Auto-host failed: \(error.localizedDescription)")
+                    }
+                }
+            }
         }
         
         // Show onboarding on first launch

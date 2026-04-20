@@ -7,6 +7,8 @@ struct DeviceCardView: View {
     
     @State private var isPressed = false
     @State private var isTargetedForDrop = false
+    @State private var showPINEntry = false
+    
     @ObservedObject private var dropService = TidalDropService.shared
     
     /// Active transfer to/from this device
@@ -39,6 +41,19 @@ struct DeviceCardView: View {
         .onTapGesture { handleTap() }
         .onDrop(of: [.fileURL], isTargeted: $isTargetedForDrop) { providers in
             handleDrop(providers: providers)
+        }
+        .sheet(isPresented: $showPINEntry) {
+            LocalCastPINEntryView(
+                deviceName: device.name,
+                savedPassword: savedDevicePassword,
+                onConnect: { password in
+                    showPINEntry = false
+                    connectLocalCast(password: password)
+                },
+                onCancel: {
+                    showPINEntry = false
+                }
+            )
         }
     }
     
@@ -86,6 +101,46 @@ struct DeviceCardView: View {
             return nil
         }
         return creds.password.isEmpty ? nil : creds.password
+    }
+    
+    private func startLocalCast() {
+        // If saved credentials exist, auto-connect without showing the sheet
+        if let password = savedDevicePassword {
+            connectLocalCast(password: password)
+        } else {
+            showPINEntry = true
+        }
+    }
+    
+    private func connectLocalCast(password: String?) {
+        Task {
+            do {
+                let viewer = try await LocalCastService.shared.connect(to: device, password: password)
+                await MainActor.run {
+                    viewer.showWindow(nil)
+                }
+            } catch {
+                print("❌ LocalCast: Connection failed, falling back to VNC: \(error.localizedDescription)")
+                onTap() // Fallback to standard VNC
+            }
+        }
+    }
+    
+    /// System Screen Share + App Control: opens macOS Screen Sharing.app
+    /// for the video and a floating TidalDrift panel for app-level control.
+    private func startSystemScreenShare() {
+        Task {
+            do {
+                let panel = try await LocalCastService.shared.connectSystemScreenShare(to: device)
+                await MainActor.run {
+                    panel.showWindow(nil)
+                }
+            } catch {
+                print("❌ System Screen Share: \(error.localizedDescription)")
+                // Fallback to plain VNC
+                onTap()
+            }
+        }
     }
     
     private func handleDrop(providers: [NSItemProvider]) -> Bool {
@@ -383,19 +438,52 @@ struct DeviceCardView: View {
     
     private var actionButtonsSection: some View {
         VStack(spacing: 6) {
-            Button(action: { onTap() }) {
+            if device.supportsLocalCast {
+                // Two-button row for LocalCast-capable devices
                 HStack(spacing: 4) {
-                    Image(systemName: device.isTidalDriftPeer ? "macwindow.on.rectangle" : "link")
-                    Text(device.isTidalDriftPeer ? "SCREEN SHARE" : "CONNECT")
+                    Button(action: { startLocalCast() }) {
+                        HStack(spacing: 3) {
+                            Image(systemName: "bolt.fill")
+                            Text("LOCALCAST")
+                        }
+                        .font(.system(size: 9, weight: .bold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 6)
+                        .background(Capsule().fill(Color.yellow))
+                        .foregroundColor(.black)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Low-latency LocalCast streaming")
+                    
+                    Button(action: { startSystemScreenShare() }) {
+                        HStack(spacing: 3) {
+                            Image(systemName: "play.display")
+                            Text("SYS")
+                        }
+                        .font(.system(size: 9, weight: .bold))
+                        .frame(width: 52)
+                        .padding(.vertical, 6)
+                        .background(Capsule().fill(Color.tidalDriftPeer))
+                        .foregroundColor(.white)
+                    }
+                    .buttonStyle(.plain)
+                    .help("System Screen Share + App Control: Apple's VNC with TidalDrift app picker")
                 }
-                .font(.system(size: 9, weight: .bold))
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 6)
-                .background(Capsule().fill(device.isTidalDriftPeer ? Color.tidalDriftPeer : Color.accentColor))
-                .foregroundColor(.white)
+            } else {
+                Button(action: { onTap() }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: device.isTidalDriftPeer ? "macwindow.on.rectangle" : "link")
+                        Text(device.isTidalDriftPeer ? "SCREEN SHARE" : "CONNECT")
+                    }
+                    .font(.system(size: 9, weight: .bold))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 6)
+                    .background(Capsule().fill(device.isTidalDriftPeer ? Color.tidalDriftPeer : Color.accentColor))
+                    .foregroundColor(.white)
+                }
+                .buttonStyle(.plain)
+                .help("Standard screen sharing")
             }
-            .buttonStyle(.plain)
-            .help("Standard screen sharing")
             
             HStack(spacing: 6) {
                 if device.isTidalDriftPeer || device.services.contains(.ssh) {

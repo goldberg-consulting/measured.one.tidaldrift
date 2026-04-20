@@ -10,6 +10,11 @@ struct SettingsView: View {
                     Label("General", systemImage: "gear")
                 }
             
+            LocalCastSettingsView()
+                .tabItem {
+                    Label("LocalCast", systemImage: "bolt.fill")
+                }
+            
             NetworkSettingsView()
                 .tabItem {
                     Label("Network", systemImage: "network")
@@ -167,12 +172,35 @@ struct GeneralSettingsView: View {
                             .foregroundColor(.purple)
                         VStack(alignment: .leading) {
                             Text("Show Experimental Features")
-                            Text("Enable experimental features in sidebar")
+                            Text("Enable App Streaming and Clipboard Sync in sidebar")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                         }
                     }
                 }
+                
+                if appState.settings.showExperimentalFeatures {
+                    Toggle(isOn: Binding(
+                        get: { AppStreamingService.shared.isExperimentalEnabled },
+                        set: { AppStreamingService.shared.setExperimentalEnabled($0) }
+                    )) {
+                        HStack {
+                            Image(systemName: "app.connected.to.app.below.fill")
+                                .foregroundColor(.orange)
+                            VStack(alignment: .leading) {
+                                Text("App Streaming")
+                                Text("Stream individual windows instead of full desktop")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                    }
+                    .padding(.leading, 24)
+                }
+                
+                Text("⚠️ These features are experimental and may not work reliably. Enable at your own risk.")
+                    .font(.caption)
+                    .foregroundColor(.orange)
             }
             
             Section {

@@ -189,8 +189,8 @@ struct AddDeviceSheet: View {
                 NetworkDiscoveryService.shared.addManualDevice(
                     name: "Loopback (This Mac)",
                     ipAddress: "127.0.0.1",
-                    port: 5900,
-                    services: [.screenSharing]
+                    port: Int(LocalCastConfiguration.hostPort),
+                    services: [.screenSharing, .localCast]
                 )
                 dismiss()
             } label: {

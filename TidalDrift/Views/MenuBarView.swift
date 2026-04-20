@@ -2,8 +2,12 @@ import SwiftUI
 
 struct MenuBarView: View {
     @EnvironmentObject var appState: AppState
+    @ObservedObject private var localCast = LocalCastService.shared
     @ObservedObject private var discoveryService = NetworkDiscoveryService.shared
     @ObservedObject private var clipboardService = ClipboardSyncService.shared
+    @State private var isTogglingLocalCast = false
+    @State private var showPermissionAlert = false
+    @State private var permissionAlertMessage = ""
     @State private var isEditingName = false
     @State private var editingNameText = ""
     
@@ -19,6 +23,10 @@ struct MenuBarView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             headerSection
+            
+            Divider().padding(.vertical, 6)
+            
+            localCastSection
             
             Divider().padding(.vertical, 6)
             
@@ -122,6 +130,85 @@ struct MenuBarView: View {
         appState.settings.tidalDriftDisplayName = isDefault ? "" : trimmed
         isEditingName = false
         TidalDriftPeerService.shared.restartAdvertising()
+    }
+    
+    // MARK: - LocalCast
+    
+    private var localCastSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Image(systemName: "bolt.fill")
+                    .foregroundColor(localCast.isHosting ? .yellow : .secondary)
+                    .font(.system(size: 12))
+                Text("LocalCast Hosting")
+                    .font(.system(size: 12, weight: .medium))
+                Spacer()
+                
+                if isTogglingLocalCast {
+                    ProgressView().scaleEffect(0.6).frame(width: 36)
+                } else {
+                    Toggle("", isOn: Binding(
+                        get: { localCast.isHosting },
+                        set: { newValue in
+                            isTogglingLocalCast = true
+                            Task {
+                                if newValue {
+                                    do {
+                                        try await localCast.startHosting()
+                                    } catch let error as LocalCastError {
+                                        await MainActor.run {
+                                            permissionAlertMessage = error.errorDescription ?? "Failed to start LocalCast"
+                                            showPermissionAlert = true
+                                        }
+                                    } catch {
+                                        await MainActor.run {
+                                            permissionAlertMessage = error.localizedDescription
+                                            showPermissionAlert = true
+                                        }
+                                    }
+                                } else {
+                                    localCast.stopHosting()
+                                }
+                                await MainActor.run { isTogglingLocalCast = false }
+                            }
+                        }
+                    ))
+                    .toggleStyle(.switch)
+                    .scaleEffect(0.65)
+                    .labelsHidden()
+                }
+            }
+            .alert("LocalCast Permission Required", isPresented: $showPermissionAlert) {
+                Button("Open Screen Recording Settings") {
+                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
+                }
+                Button("Open Accessibility Settings") {
+                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+                }
+                Button("Cancel", role: .cancel) { }
+            } message: {
+                Text(permissionAlertMessage + "\n\nGrant Screen Recording to stream, and Accessibility for remote input control.")
+            }
+            
+            if localCast.isHosting {
+                if !localCast.activeConnections.isEmpty {
+                    ForEach(localCast.activeConnections) { conn in
+                        HStack(spacing: 4) {
+                            Image(systemName: "display").font(.system(size: 10))
+                            Text(conn.clientName).font(.system(size: 10))
+                        }
+                        .foregroundColor(.secondary)
+                        .padding(.leading, 20)
+                    }
+                } else {
+                    Text("Waiting for connections...")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                        .italic()
+                        .padding(.leading, 20)
+                }
+            }
+        }
     }
     
     // MARK: - Devices
@@ -300,8 +387,13 @@ struct MenuBarActionButton: View {
 
 struct MenuBarDeviceRow: View {
     let device: DiscoveredDevice
+    @ObservedObject private var localCast = LocalCastService.shared
     @State private var isHovering = false
+    @State private var showAppStreamError = false
     
+    private var showLocalCast: Bool {
+        device.services.contains(.localCast)
+    }
     private var showSSH: Bool {
         device.services.contains(.ssh) || device.isTidalDriftPeer
     }
@@ -354,6 +446,12 @@ struct MenuBarDeviceRow: View {
                             }
                         }
                         
+                        if showLocalCast {
+                            QuickActionIcon(icon: "app.connected.to.app.below.fill", color: .purple, tooltip: "Stream App") {
+                                startAppStreaming()
+                            }
+                        }
+                        
                         QuickActionIcon(icon: "folder", color: .orange, tooltip: "File Share") {
                             dismissPopoverAndRun {
                                 Task { try? await ScreenShareConnectionService.shared.connectToFileShare(device: device) }
@@ -396,6 +494,27 @@ struct MenuBarDeviceRow: View {
             .contentShape(Rectangle())
             .onHover { hovering in
                 withAnimation(.easeInOut(duration: 0.15)) { isHovering = hovering }
+            }
+        }
+        .alert("App Streaming Unavailable", isPresented: $showAppStreamError) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text("Could not connect to the remote TidalDrift control channel. Make sure TidalDrift is running on the remote Mac with LocalCast hosting enabled.")
+        }
+    }
+    
+    private func startAppStreaming() {
+        let password = savedDevicePassword
+        Task {
+            do {
+                let controller = try await LocalCastService.shared.connectSystemScreenShare(to: device, password: password)
+                await MainActor.run {
+                    NSApp.activate(ignoringOtherApps: true)
+                    controller.showWindow(nil)
+                }
+            } catch {
+                print("MenuBar App Streaming control channel failed: \(error)")
+                await MainActor.run { showAppStreamError = true }
             }
         }
     }

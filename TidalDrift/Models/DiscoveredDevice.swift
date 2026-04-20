@@ -11,6 +11,10 @@ struct DiscoveredDevice: Identifiable, Codable, Hashable {
     var savedCredentialRef: String?
     var port: Int
     
+    /// Advertised LocalCast auth requirement from Bonjour TXT (`auth=1/0`).
+    /// nil means unknown (older hosts or unresolved TXT).
+    var localCastAuthRequired: Bool?
+    
     // TidalDrift peer info (if running on remote machine)
     var isTidalDriftPeer: Bool
     var peerModelName: String?
@@ -44,6 +48,7 @@ struct DiscoveredDevice: Identifiable, Codable, Hashable {
          isTrusted: Bool = false,
          savedCredentialRef: String? = nil,
          port: Int = 5900,
+         localCastAuthRequired: Bool? = nil,
          isTidalDriftPeer: Bool = false,
          peerModelName: String? = nil,
          peerModelIdentifier: String? = nil,
@@ -62,6 +67,7 @@ struct DiscoveredDevice: Identifiable, Codable, Hashable {
         self.isTrusted = isTrusted
         self.savedCredentialRef = savedCredentialRef
         self.port = port
+        self.localCastAuthRequired = localCastAuthRequired
         self.isTidalDriftPeer = isTidalDriftPeer
         self.peerModelName = peerModelName
         self.peerModelIdentifier = peerModelIdentifier
@@ -80,6 +86,7 @@ struct DiscoveredDevice: Identifiable, Codable, Hashable {
         case ssh = "_ssh._tcp."
         case tidalDrift = "_tidaldrift._tcp."
         case tidalDrop = "_tidaldrop._tcp."
+        case localCast = "_tidaldrift-cast._udp."
         
         var displayName: String {
             switch self {
@@ -89,6 +96,7 @@ struct DiscoveredDevice: Identifiable, Codable, Hashable {
             case .ssh: return "SSH"
             case .tidalDrift: return "TidalDrift"
             case .tidalDrop: return "TidalDrop"
+            case .localCast: return "LocalCast"
             }
         }
         
@@ -100,6 +108,7 @@ struct DiscoveredDevice: Identifiable, Codable, Hashable {
             case .ssh: return "terminal"
             case .tidalDrift: return "wave.3.right"
             case .tidalDrop: return "arrow.down.doc"
+            case .localCast: return "bolt.fill"
             }
         }
     }

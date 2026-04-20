@@ -110,6 +110,9 @@ class DashboardViewModel: ObservableObject {
                 } else if device.services.contains(.afp) {
                     try await ScreenShareConnectionService.shared.connectToAFP(device: device)
                 }
+            case .localCast:
+                let viewer = try await LocalCastService.shared.connect(to: device)
+                await MainActor.run { viewer.showWindow(nil) }
             }
             
             let record = ConnectionRecord(
