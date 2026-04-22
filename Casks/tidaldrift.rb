@@ -1,6 +1,6 @@
 cask "tidaldrift" do
-  version "1.4.4"
-  sha256 "d18eb76ecd74ffa69c27874ec13789ed3cf134ec19ac27e92a9da76cb9ec056d"
+  version "1.5.0"
+  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
 
   url "https://github.com/goldberg-consulting/measured.one.tidaldrift/releases/download/v#{version}/TidalDrift-#{version}.dmg"
   name "TidalDrift"
@@ -10,6 +10,14 @@ cask "tidaldrift" do
   depends_on macos: ">= :ventura"
 
   app "TidalDrift.app"
+
+  # Strip Gatekeeper quarantine. Required while notarization is pending
+  # agreement renewal for team 97UY84BV45; the DMG is Developer ID signed
+  # but not yet notarized. Re-notarization will be restored in a follow-up.
+  postflight do
+    system_command "/usr/bin/xattr",
+                   args: ["-dr", "com.apple.quarantine", "#{appdir}/TidalDrift.app"]
+  end
 
   zap trash: [
     "~/Library/Preferences/com.goldbergconsulting.tidaldrift.plist",

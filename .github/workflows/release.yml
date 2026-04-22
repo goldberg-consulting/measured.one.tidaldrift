@@ -149,7 +149,6 @@ jobs:
       - name: Update Homebrew tap
         env:
           TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          IS_PRERELEASE: ${{ github.event.release.prerelease }}
         run: |
           if [ -z "$TAP_TOKEN" ]; then
             echo "HOMEBREW_TAP_TOKEN not set; skipping tap update."
@@ -162,24 +161,7 @@ jobs:
           git clone "https://x-access-token:${TAP_TOKEN}@github.com/goldberg-consulting/homebrew-tap.git" /tmp/tap
           cd /tmp/tap
 
-          # Pre-releases bump the experimental cask (tidaldrift-experimental);
-          # stable releases bump the main cask (tidaldrift). This lets the
-          # Metal-streaming pre-releases ship on their own brew channel:
-          #   brew install --cask goldberg-consulting/tap/tidaldrift-experimental
-          # without disturbing the stable tidaldrift cask that pinned users rely on.
-          if [ "$IS_PRERELEASE" = "true" ]; then
-            CASK="Casks/tidaldrift-experimental.rb"
-            if [ ! -f "$CASK" ]; then
-              echo "Experimental cask not present in tap; copying from source repo."
-              mkdir -p Casks
-              cp "${GITHUB_WORKSPACE}/Casks/tidaldrift-experimental.rb" "$CASK"
-            fi
-            CASK_NAME="tidaldrift-experimental"
-          else
-            CASK="Casks/tidaldrift.rb"
-            CASK_NAME="tidaldrift"
-          fi
-
+          CASK="Casks/tidaldrift.rb"
           sed -i '' "s/version \".*\"/version \"${APP_VERSION}\"/" "$CASK"
           sed -i '' "s/sha256 \".*\"/sha256 \"${SHA}\"/" "$CASK"
 
@@ -187,7 +169,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add "$CASK"
           git diff --cached --quiet && echo "No changes to tap" && exit 0
-          git commit -m "bump ${CASK_NAME} to ${APP_VERSION}"
+          git commit -m "bump tidaldrift to ${APP_VERSION}"
           git push origin main
 
       - name: Cleanup keychain

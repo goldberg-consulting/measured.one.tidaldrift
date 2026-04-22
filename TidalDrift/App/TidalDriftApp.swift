@@ -1,21 +1,12 @@
-import SwiftUI
+import Foundation
 
-@main
-struct TidalDriftApp: App {
-    @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
-    @StateObject private var appState = AppState.shared
-    
-    var body: some Scene {
-        MenuBarExtra {
-            MenuBarView()
-                .environmentObject(appState)
-        } label: {
-            Text("TD").font(.system(size: 11, weight: .bold, design: .rounded))
-                .help("TidalDrift")
-        }
-        .menuBarExtraStyle(.window)
-    }
-}
+// The app used to launch via `@main struct TidalDriftApp: App` with a
+// SwiftUI `MenuBarExtra(.window)` scene. That scene is broken on recent
+// macOS: the status item renders but clicks don't open its popover. The
+// entry point now lives on `AppDelegate` (see `@main` there), which owns
+// an NSStatusItem + NSPopover directly and hosts `MenuBarView` via
+// `NSHostingController`. This file is kept only for the cross-module
+// Notification.Name constants that the rest of the app uses.
 
 extension Notification.Name {
     static let scanNetwork = Notification.Name("scanNetwork")

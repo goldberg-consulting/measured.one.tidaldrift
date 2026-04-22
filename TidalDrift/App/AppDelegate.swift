@@ -1,18 +1,49 @@
 import SwiftUI
 import AppKit
+import OSLog
 import UserNotifications
 
+private let menuBarLogger = Logger(subsystem: "com.tidaldrift", category: "MenuBar")
+
+// Manual entry point. We used to launch via `@main struct TidalDriftApp: App`
+// with a SwiftUI `MenuBarExtra`, but `MenuBarExtra(.window)` has a bug on
+// macOS 14+/15+/26+ where the status item renders, is accessibility-enabled,
+// and reports `enabled: true`, yet clicks (both synthetic `AXPress` and real
+// CGEvent mouse-downs on the pixel coordinates of the item) never open the
+// popover. Reproduced on 26.3.1 and reported in the wild across 14.x/15.x.
+// Owning the NSStatusItem + NSPopover directly in AppDelegate bypasses the
+// broken SwiftUI path while keeping the rest of the UI (MenuBarView) fully
+// SwiftUI via NSHostingController.
+@main
 class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate, NSWindowDelegate {
-    
+
+    /// Traditional AppKit entry point. Equivalent to Info.plist
+    /// `LSUIElement=true` via `setActivationPolicy(.accessory)`, which keeps
+    /// the app out of the Dock and the global menu bar but allows NSStatusItem
+    /// registration. Invoked because of the `@main` attribute on the class.
+    static func main() {
+        let delegate = AppDelegate()
+        let app = NSApplication.shared
+        app.delegate = delegate
+        app.setActivationPolicy(.accessory)
+        app.run()
+    }
+
+    // MARK: - Status item + popover (manual, replaces SwiftUI MenuBarExtra)
+
+    private var statusItem: NSStatusItem?
+    private var popover: NSPopover?
+
     private var onboardingWindow: NSWindow?
     private var settingsWindow: NSWindow?
     
     func applicationDidFinishLaunching(_ notification: Notification) {
+        menuBarLogger.info("applicationDidFinishLaunching")
         configureAppearance()
-        installSettingsMenuItem()
-        
+        setupStatusItem()
+
         UNUserNotificationCenter.current().delegate = self
-        
+
         // Load initial data
         AppState.shared.loadTrustedDevices()
         AppState.shared.loadConnectionHistory()
@@ -181,18 +212,64 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         NSWindow.allowsAutomaticWindowTabbing = false
     }
     
-    /// Add Cmd+, for Settings since we removed the SwiftUI Settings scene.
-    private func installSettingsMenuItem() {
-        guard let appMenu = NSApp.mainMenu?.item(at: 0)?.submenu else { return }
-        let settingsItem = NSMenuItem(
-            title: "Settings\u{2026}",
-            action: #selector(showSettingsWindow(_:)),
-            keyEquivalent: ","
+    // MARK: - Status item + popover
+
+    /// Creates the menu-bar status item (the "TD" icon) and the popover that
+    /// hosts `MenuBarView`. Called once from `applicationDidFinishLaunching`.
+    private func setupStatusItem() {
+        menuBarLogger.info("setupStatusItem: starting")
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        if let button = item.button {
+            button.title = "TD"
+            button.font = NSFont.systemFont(ofSize: 11, weight: .bold)
+            button.toolTip = "TidalDrift"
+            button.target = self
+            button.action = #selector(toggleMenu(_:))
+            // Accept both primary clicks (toggle the popover) and, if we ever
+            // need it in the future, right-clicks for a context menu.
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+            menuBarLogger.info("setupStatusItem: button configured")
+        } else {
+            menuBarLogger.warning("setupStatusItem: no button on status item")
+        }
+        self.statusItem = item
+        menuBarLogger.info("setupStatusItem: done")
+
+        let popover = NSPopover()
+        popover.behavior = .transient  // auto-closes when the user clicks outside
+        popover.animates = true
+        popover.contentSize = NSSize(width: 360, height: 520)
+
+        let host = NSHostingController(
+            rootView: MenuBarView().environmentObject(AppState.shared)
         )
-        settingsItem.target = self
-        let insertIndex = appMenu.items.firstIndex(where: { $0.isSeparatorItem }) ?? appMenu.items.count
-        appMenu.insertItem(settingsItem, at: insertIndex)
-        appMenu.insertItem(.separator(), at: insertIndex)
+        host.view.frame = NSRect(x: 0, y: 0, width: 360, height: 520)
+        popover.contentViewController = host
+        self.popover = popover
+    }
+
+    /// Toggle the popover shown under the status item. When the popover
+    /// becomes key we also pin the app as an accessory so child windows
+    /// (onboarding, settings, the Metal viewer) can gain focus.
+    /// Toggle the popover shown under the status item. `.transient` behavior
+    /// handles dismissal when the user clicks anywhere outside the popover;
+    /// clicking the status item itself while the popover is visible is
+    /// routed to us by AppKit, which calls `toggleMenu` a second time — we
+    /// explicitly close in that case so the icon acts as an on/off toggle.
+    @objc func toggleMenu(_ sender: Any?) {
+        menuBarLogger.info("toggleMenu fired")
+        guard let button = statusItem?.button, let popover = popover else {
+            menuBarLogger.warning("toggleMenu: missing button or popover")
+            return
+        }
+        if popover.isShown {
+            menuBarLogger.info("toggleMenu: closing popover")
+            popover.performClose(sender)
+            return
+        }
+        menuBarLogger.info("toggleMenu: opening popover")
+        NSApp.activate(ignoringOtherApps: true)
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
     }
     
     // MARK: - UNUserNotificationCenterDelegate
