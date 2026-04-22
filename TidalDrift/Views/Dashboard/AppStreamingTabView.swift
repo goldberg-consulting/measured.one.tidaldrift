@@ -1,5 +1,9 @@
 import SwiftUI
 
+// Sidebar tab for per-app streaming. Dormant behind #if DEBUG alongside
+// AppStreamingService / StreamingNetworkService.
+#if DEBUG
+
 struct AppStreamingTabView: View {
     @ObservedObject private var streamingService = AppStreamingService.shared
     @ObservedObject private var networkService = StreamingNetworkService.shared
@@ -308,21 +312,6 @@ struct AppStreamingTabView: View {
     }
 }
 
-struct BulletPoint: View {
-    let text: String
-    let done: Bool
-    
-    var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: done ? "checkmark.circle.fill" : "circle.dashed")
-                .foregroundColor(done ? .green : .secondary)
-            Text(text)
-                .font(.subheadline)
-                .foregroundColor(done ? .primary : .secondary)
-        }
-    }
-}
-
 struct AppCard: View {
     let app: StreamableApp
     let isSelected: Bool
@@ -409,4 +398,6 @@ struct AppStreamingTabView_Previews: PreviewProvider {
         AppStreamingTabView()
     }
 }
+
+#endif
 

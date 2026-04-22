@@ -3,6 +3,10 @@ import Network
 import Combine
 import OSLog
 
+// Per-app streaming network service. Paired with AppStreamingService.
+// Dormant behind #if DEBUG for a future pass.
+#if DEBUG
+
 /// Represents a remote app available for streaming from another machine
 struct RemoteStreamableApp: Identifiable, Hashable, Codable {
     let id: String  // Unique ID: hostIP-bundleId
@@ -590,3 +594,4 @@ class StreamingNetworkService: ObservableObject, @unchecked Sendable {
 
 import AppKit
 
+#endif

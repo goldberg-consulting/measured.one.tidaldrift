@@ -110,13 +110,17 @@ class LocalCastService: ObservableObject {
         try await startHosting(target: .fullDisplay)
     }
 
+    #if DEBUG
+    /// Per-window hosting. Dormant — surfaced for future per-app pass.
     func startHostingWindow(windowID: CGWindowID, windowTitle: String) async throws {
         try await startHosting(target: .window(windowID, title: windowTitle))
     }
 
+    /// Per-app hosting. Dormant — surfaced for future per-app pass.
     func startHostingApp(processID: pid_t, appName: String) async throws {
         try await startHosting(target: .app(processID, name: appName))
     }
+    #endif
 
     private func startHosting(target: HostCaptureTarget) async throws {
         let permissions = LocalCastPermissions()
@@ -253,57 +257,21 @@ class LocalCastService: ObservableObject {
         return controller
     }
 
-    // MARK: - System Screen Share + App Control
-    
-    /// Strong references to active app control panels.
+    // MARK: - System Screen Share + App Control (dormant)
+    //
+    // The previous `connectSystemScreenShare(to:)` opened macOS Screen
+    // Sharing.app AND a TidalDrift control channel for per-app enumeration.
+    // That two-tier hybrid produced most of the race conditions and
+    // misleading "firewall blocked" errors we saw in practice. The new
+    // design keeps VNC (via ScreenShareConnectionService.connect) and the
+    // Metal viewer (via connect(to:)) as two independent entry points;
+    // there is no longer a combined mode.
+
+    #if DEBUG
+    /// Strong references to active app control panels (dormant per-app path).
     private var activeControlPanels: [AppControlPanelController] = []
-    
-    /// Opens macOS Screen Sharing.app (VNC) for the video stream AND
-    /// attempts to establish a TidalDrift control channel for remote app
-    /// management. VNC always opens; the App Control panel is shown only
-    /// if the control channel connects successfully.
-    func connectSystemScreenShare(to device: DiscoveredDevice, password: String? = nil) async throws -> AppControlPanelController {
-        logger.info("System Screen Share + App Control for \(device.name)")
-        
-        // 1. Always open macOS Screen Sharing.app via VNC (Tier 1)
-        do {
-            try await ScreenShareConnectionService.shared.connect(to: device)
-            logger.info("Opened Screen Sharing.app for \(device.name)")
-        } catch {
-            logger.warning("VNC connection failed: \(error.localizedDescription)")
-        }
-        
-        // If the host is not advertising LocalCast, fail fast with a clear
-        // message instead of timing out and implying a firewall block.
-        guard device.supportsLocalCast else {
-            let reason = "Remote Mac is not advertising LocalCast on port \(LocalCastConfiguration.hostPort). Enable LocalCast Hosting on the host Mac first."
-            logger.warning("App Control unavailable for \(device.name): \(reason)")
-            throw LocalCastError.connectionFailed(reason)
-        }
-        
-        // 2. Establish a TidalDrift control channel for app enumeration (Tier 2)
-        var resolvedPassword = password
-        if resolvedPassword == nil || resolvedPassword?.isEmpty == true {
-            if let creds = try? KeychainService.shared.getCredential(for: device.stableId) {
-                resolvedPassword = creds.password
-                logger.info("🔐 Using saved credentials for control channel to \(device.name)")
-            }
-        }
-        
-        let session = ClientSession(device: device)
-        try await session.connect(password: resolvedPassword)
-        
-        // 3. Show the floating app control panel
-        let controller = AppControlPanelController(device: device, session: session)
-        
-        activeControlPanels.append(controller)
-        controller.onClose = { [weak self] closed in
-            self?.activeControlPanels.removeAll { $0 === closed }
-        }
-        
-        return controller
-    }
-    
+    #endif
+
     func disconnect(from device: DiscoveredDevice) {
         activeConnections.removeAll { $0.device.id == device.id }
     }

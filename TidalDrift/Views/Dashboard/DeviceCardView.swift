@@ -126,22 +126,6 @@ struct DeviceCardView: View {
         }
     }
     
-    /// System Screen Share + App Control: opens macOS Screen Sharing.app
-    /// for the video and a floating TidalDrift panel for app-level control.
-    private func startSystemScreenShare() {
-        Task {
-            do {
-                let panel = try await LocalCastService.shared.connectSystemScreenShare(to: device)
-                await MainActor.run {
-                    panel.showWindow(nil)
-                }
-            } catch {
-                print("❌ System Screen Share: \(error.localizedDescription)")
-                // Fallback to plain VNC
-                onTap()
-            }
-        }
-    }
     
     private func handleDrop(providers: [NSItemProvider]) -> Bool {
         let targetDevice = device
@@ -439,35 +423,20 @@ struct DeviceCardView: View {
     private var actionButtonsSection: some View {
         VStack(spacing: 6) {
             if device.supportsLocalCast {
-                // Two-button row for LocalCast-capable devices
                 HStack(spacing: 4) {
                     Button(action: { startLocalCast() }) {
                         HStack(spacing: 3) {
                             Image(systemName: "bolt.fill")
-                            Text("LOCALCAST")
+                            Text("METAL STREAM")
                         }
                         .font(.system(size: 9, weight: .bold))
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 6)
-                        .background(Capsule().fill(Color.yellow))
-                        .foregroundColor(.black)
-                    }
-                    .buttonStyle(.plain)
-                    .help("Low-latency LocalCast streaming")
-                    
-                    Button(action: { startSystemScreenShare() }) {
-                        HStack(spacing: 3) {
-                            Image(systemName: "play.display")
-                            Text("SYS")
-                        }
-                        .font(.system(size: 9, weight: .bold))
-                        .frame(width: 52)
-                        .padding(.vertical, 6)
-                        .background(Capsule().fill(Color.tidalDriftPeer))
+                        .background(Capsule().fill(Color.purple))
                         .foregroundColor(.white)
                     }
                     .buttonStyle(.plain)
-                    .help("System Screen Share + App Control: Apple's VNC with TidalDrift app picker")
+                    .help("Metal-accelerated full-desktop streaming")
                 }
             } else {
                 Button(action: { onTap() }) {

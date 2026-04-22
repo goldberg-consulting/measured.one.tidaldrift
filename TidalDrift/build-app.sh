@@ -14,7 +14,7 @@ VERSION_FILE="$SCRIPT_DIR/version.env"
 VERSION="${APP_VERSION:-1.4.3}"
 BUILD_NUMBER="${BUILD_NUMBER:-1}"
 
-RUN_APP=true; [[ "$1" == "--no-run" ]] && RUN_APP=false
+RUN_APP=true; [[ "${1:-}" == "--no-run" ]] && RUN_APP=false
 
 echo ""
 echo -e "${BLUE}╔══════════════════════════════════════════════════════════╗${NC}"

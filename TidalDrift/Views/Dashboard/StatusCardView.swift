@@ -97,7 +97,7 @@ struct StatusCardView: View {
             }
 
             HStack {
-                Text("Screen Streaming")
+                Text("Metal Streaming Host")
                     .font(.caption)
                 Spacer()
 

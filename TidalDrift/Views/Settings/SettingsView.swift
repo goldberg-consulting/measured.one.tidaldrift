@@ -12,7 +12,7 @@ struct SettingsView: View {
             
             LocalCastSettingsView()
                 .tabItem {
-                    Label("LocalCast", systemImage: "bolt.fill")
+                    Label("Metal Streaming", systemImage: "bolt.fill")
                 }
             
             NetworkSettingsView()
@@ -172,13 +172,14 @@ struct GeneralSettingsView: View {
                             .foregroundColor(.purple)
                         VStack(alignment: .leading) {
                             Text("Show Experimental Features")
-                            Text("Enable App Streaming and Clipboard Sync in sidebar")
+                            Text("Enable Clipboard Sync in sidebar")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                         }
                     }
                 }
-                
+
+                #if DEBUG
                 if appState.settings.showExperimentalFeatures {
                     Toggle(isOn: Binding(
                         get: { AppStreamingService.shared.isExperimentalEnabled },
@@ -188,8 +189,8 @@ struct GeneralSettingsView: View {
                             Image(systemName: "app.connected.to.app.below.fill")
                                 .foregroundColor(.orange)
                             VStack(alignment: .leading) {
-                                Text("App Streaming")
-                                Text("Stream individual windows instead of full desktop")
+                                Text("App Streaming (debug)")
+                                Text("Per-window streaming — dormant pipeline, debug builds only")
                                     .font(.caption)
                                     .foregroundColor(.secondary)
                             }
@@ -197,11 +198,13 @@ struct GeneralSettingsView: View {
                     }
                     .padding(.leading, 24)
                 }
-                
+                #endif
+
                 Text("⚠️ These features are experimental and may not work reliably. Enable at your own risk.")
                     .font(.caption)
                     .foregroundColor(.orange)
             }
+
             
             Section {
                 Picker("Appearance", selection: $appState.settings.theme) {

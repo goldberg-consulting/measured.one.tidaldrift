@@ -1,6 +1,10 @@
 import SwiftUI
 import AppKit
 
+// Floating per-app control panel. Dormant behind #if DEBUG while the
+// full-desktop Metal pipeline is the priority.
+#if DEBUG
+
 // MARK: - Floating App Control Panel (NSPanel)
 
 /// A floating utility panel that provides remote app control alongside
@@ -426,3 +430,5 @@ struct AppControlPanelView: View {
         }
     }
 }
+
+#endif

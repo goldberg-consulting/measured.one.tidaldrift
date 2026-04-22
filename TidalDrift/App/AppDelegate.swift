@@ -113,13 +113,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     }
     
     // MARK: - Settings Window
-    
-    /// Responder-chain target used by MenuBarView via `NSApp.sendAction`.
+
+    /// Entry point for the in-app Settings button and the Cmd+, menu item.
+    /// Dispatched directly (MenuBarView calls `(NSApp.delegate as? AppDelegate)?.showSettingsWindow(nil)`)
+    /// rather than via `NSApp.sendAction` so SwiftUI can't intercept
+    /// `showSettingsWindow:` and open a phantom Settings scene on macOS
+    /// Sonoma+ — that phantom window becomes key and silently blocks all
+    /// subsequent menu-bar clicks, making the app appear frozen.
     @objc func showSettingsWindow(_ sender: Any?) {
         showSettings()
     }
-    
-    /// Legacy alias used on older macOS selectors.
+
+    /// Legacy alias kept for older macOS selector dispatch (Cmd+, on macOS
+    /// versions that still look up `showPreferencesWindow:` first).
     @objc func showPreferencesWindow(_ sender: Any?) {
         showSettings()
     }

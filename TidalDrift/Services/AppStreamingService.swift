@@ -3,6 +3,12 @@ import AppKit
 import ScreenCaptureKit
 import Combine
 
+// Per-app / per-window streaming surface. The full-desktop Metal streaming
+// pipeline (LocalCast/*) does not depend on anything in this file. Kept
+// behind #if DEBUG so the dormant app-streaming UX can be revisited later
+// without re-implementing the capture and enumeration code from scratch.
+#if DEBUG
+
 /// Represents a running application that can be streamed
 struct StreamableApp: Identifiable, Hashable {
     let id: pid_t
@@ -316,3 +322,4 @@ enum StreamingError: LocalizedError {
     }
 }
 
+#endif

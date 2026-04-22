@@ -135,14 +135,20 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             switch target {
             case .fullDisplay:
                 try await startFullDisplayCapture()
-                
+
+            #if DEBUG
             case .window(let windowID, let title):
                 logger.info("🪟 Starting window capture: '\(title)' (ID: \(windowID))")
                 try await startWindowCapture(windowID: windowID)
-                
+
             case .app(let processID, let name):
                 logger.info("📱 Starting app capture: '\(name)' (PID: \(processID))")
                 try await startAppCapture(processID: processID)
+            #else
+            case .window, .app:
+                logger.error("Per-app/per-window capture is only available in debug builds")
+                throw LocalCastError.noDisplayAvailable
+            #endif
             }
             
             // Update input injector with capture bounds for proper coordinate mapping
@@ -214,6 +220,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         )
     }
     
+    #if DEBUG
     /// Start window-specific capture
     private func startWindowCapture(windowID: CGWindowID) async throws {
         // Look up the owning PID so we can resize the window later via Accessibility
@@ -266,7 +273,8 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             maxDimension: configuration.maxCaptureDimension
         )
     }
-    
+    #endif
+
     // MARK: - Live Quality Tuning
     
     /// Apply live streaming quality changes from a `StreamingTuning` snapshot.
@@ -334,7 +342,13 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     func videoEncoder(_ encoder: VideoEncoder, didOutput packet: Data, isKeyFrame: Bool, timestamp: CMTime) {
         // Prefer using the stored connection for reliable delivery
         guard clientConnection != nil || clientEndpoint != nil else { return }
-        
+
+        // Auth gate: never send encoded video to an unauthenticated client.
+        // Without this, frames start flowing the moment the client's first
+        // UDP packet arrives (authRequest) and the host burns bandwidth
+        // encrypting + transmitting frames the client cannot decrypt.
+        guard authState == .authenticated else { return }
+
         sequenceNumber += 1
         let castPacket = LocalCastPacket(
             type: .videoFrame,
@@ -342,7 +356,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             timestamp: CFAbsoluteTimeGetCurrent() + kCFAbsoluteTimeIntervalSince1970,
             payload: packet
         )
-        
+
         // Use the connection directly if available, otherwise fall back to endpoint
         if let connection = clientConnection {
             transport.send(packet: castPacket, on: connection)
@@ -357,10 +371,10 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         // Store the connection from the client for reliable bidirectional communication
         clientConnection = connection
         clientEndpoint = endpoint
-        
+
         // Detect loopback: check if client IP is localhost or our own IP
         isLoopbackConnection = Self.isLocalEndpoint(endpoint)
-        
+
         let localIP = NetworkUtils.getLocalIPAddress() ?? "unknown"
         logger.info("LocalCast: Client connected from \(String(describing: endpoint)) (loopback: \(self.isLoopbackConnection))")
         print("[INPUT-DIAG] 🔌 CLIENT CONNECTED from \(endpoint)")
@@ -369,17 +383,31 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         if isLoopbackConnection {
             print("[INPUT-DIAG] ⚠️ LOOPBACK DETECTED — all input injection will be SKIPPED")
         }
-        
-        // Force an initial keyframe immediately so the client decoder can sync.
-        // On cross-machine networks, large keyframes may not survive UDP fragmentation
-        // on the first attempt. Send multiple keyframe requests with delays to increase
-        // the probability of at least one arriving intact.
+
+        // If auth is still pending, don't prime any keyframes. The encoder
+        // delegate already drops frames while waiting for auth; forcing a
+        // keyframe here would just burn a VT session encode cycle for
+        // nothing. forceInitialKeyframes() is invoked from handleAuthComplete
+        // once the session is authenticated.
+        guard authState == .authenticated else {
+            logger.info("🔐 Deferring initial keyframe burst until auth completes")
+            return
+        }
+
+        forceInitialKeyframes()
+    }
+
+    /// Force an initial keyframe and schedule three follow-ups over the next
+    /// ~3 seconds. Called when a client connects without auth, or immediately
+    /// after auth completes in the auth-required path. Large keyframes may
+    /// not survive UDP fragmentation on the first attempt, so we stagger a
+    /// few retries.
+    private func forceInitialKeyframes() {
         encoder.forceKeyFrame()
-        
-        // Stagger additional keyframe requests
         for delay in [0.3, 0.8, 1.5, 3.0] {
             DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + delay) { [weak self] in
                 guard let self = self, self.isRunning else { return }
+                guard self.authState == .authenticated else { return }
                 self.encoder.forceKeyFrame()
                 self.logger.info("🔑 Sending retry keyframe at +\(delay)s")
             }
@@ -483,32 +511,34 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             print("🔑 HostSession: Received keyframe request")
             encoder.forceKeyFrame()
             
+        #if DEBUG
         case .appListRequest:
-            // Client wants to know what apps are available to stream
+            // Client wants to know what apps are available to stream (dormant)
             print("📋 HostSession: Received app list request from client")
             Task {
                 await handleAppListRequest(replyTo: endpoint)
             }
-            
+
         case .streamAppRequest:
-            // Client wants to stream a specific app/window
+            // Client wants to stream a specific app/window (dormant)
             print("🎬 HostSession: Received stream request from client")
             Task {
                 await handleStreamRequest(payload: packet.payload, replyTo: endpoint)
             }
-            
+
         case .windowResize:
             handleWindowResize(payload: packet.payload)
-            
+
         case .focusAppRequest:
             handleFocusAppRequest(payload: packet.payload)
-            
+
         case .isolateAppRequest:
             handleIsolateAppRequest(payload: packet.payload)
-            
+
         case .restoreAppsRequest:
             handleRestoreAppsRequest()
-            
+        #endif
+
         case .qualityUpdate:
             handleQualityUpdate(payload: packet.payload)
             
@@ -517,8 +547,14 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         }
     }
     
-    // MARK: - App List & Stream Request Handling
-    
+    // MARK: - App List & Stream Request Handling (dormant)
+    //
+    // Per-app / per-window enumeration and retargeting. The full-desktop
+    // Metal pipeline never invokes any of this; kept behind #if DEBUG so
+    // the dormant path can be finished in a later pass without having to
+    // re-derive the SCShareableContent filtering rules.
+
+    #if DEBUG
     /// Gather available apps and send to client
     private func handleAppListRequest(replyTo endpoint: NWEndpoint) async {
         print("📋 HostSession: Gathering available apps...")
@@ -753,7 +789,8 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             }
         }
     }
-    
+    #endif
+
     // MARK: - Auth Handshake (Host Side)
     
     /// Handle authRequest from client: generate hostNonce, derive pairingKey, encrypt sessionKey, reply with authChallenge.
@@ -827,13 +864,17 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             payload: Data("AUTH-SUCCESS".utf8)
         )
         transport.send(packet: successPacket, to: endpoint)
-        
-        // Force a keyframe so the client can start decoding
-        encoder.forceKeyFrame()
+
+        // Now that the client is authenticated, run the initial keyframe
+        // burst. This is the symmetrical path to the no-auth flow in
+        // udpTransport(clientDidConnect:), which bursts keyframes as soon
+        // as the client first appears.
+        forceInitialKeyframes()
     }
     
-    // MARK: - Window Resize
-    
+    // MARK: - Window Resize (dormant per-app)
+
+    #if DEBUG
     private func handleWindowResize(payload: Data) {
         guard payload.count >= 16 else { return }
         
@@ -902,7 +943,8 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         logger.info("🔓 Restore apps request")
         inputInjector.restoreApps()
     }
-    
+    #endif
+
     private func handleQualityUpdate(payload: Data) {
         guard let update = try? JSONDecoder().decode(QualityUpdatePayload.self, from: payload) else {
             logger.warning("qualityUpdate: could not decode payload")

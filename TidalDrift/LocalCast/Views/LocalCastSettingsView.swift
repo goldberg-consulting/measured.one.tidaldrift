@@ -17,8 +17,38 @@ struct LocalCastSettingsView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                Text("LocalCast Screen Sharing")
+                Text("Metal Streaming")
                     .font(.headline)
+
+                Text("High-resolution, high-framerate screen streaming over UDP. Uses ScreenCaptureKit, VideoToolbox (H.264/HEVC), and a Metal renderer on the client.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                // Host toggle — same action as the menu bar LocalCast toggle,
+                // surfaced here for discoverability since the Settings pane
+                // is where most users configure the service.
+                HStack {
+                    Image(systemName: "bolt.fill")
+                        .foregroundColor(service.isHosting ? .yellow : .secondary)
+                    Text("Host this Mac")
+                        .font(.body)
+                    Spacer()
+                    Toggle("", isOn: Binding(
+                        get: { service.isHosting },
+                        set: { newValue in
+                            Task {
+                                if newValue {
+                                    try? await service.startHosting()
+                                } else {
+                                    service.stopHosting()
+                                }
+                            }
+                        }
+                    ))
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+                }
+                .padding(.vertical, 4)
                 
                 // Live quality controls (always visible, marked "LIVE" when hosting)
                 StreamingQualityControlView(

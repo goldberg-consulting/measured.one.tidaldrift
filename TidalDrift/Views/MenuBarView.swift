@@ -140,7 +140,7 @@ struct MenuBarView: View {
                 Image(systemName: "bolt.fill")
                     .foregroundColor(localCast.isHosting ? .yellow : .secondary)
                     .font(.system(size: 12))
-                Text("LocalCast Hosting")
+                Text("Metal Streaming Host")
                     .font(.system(size: 12, weight: .medium))
                 Spacer()
                 
@@ -178,7 +178,7 @@ struct MenuBarView: View {
                     .labelsHidden()
                 }
             }
-            .alert("LocalCast Permission Required", isPresented: $showPermissionAlert) {
+            .alert("Metal Streaming Permission Required", isPresented: $showPermissionAlert) {
                 Button("Open Screen Recording Settings") {
                     NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
                 }
@@ -187,7 +187,7 @@ struct MenuBarView: View {
                 }
                 Button("Cancel", role: .cancel) { }
             } message: {
-                Text(permissionAlertMessage + "\n\nGrant Screen Recording to stream, and Accessibility for remote input control.")
+                Text(permissionAlertMessage + "\n\nGrant Screen Recording to host Metal streams, and Accessibility to accept remote input control from clients.")
             }
             
             if localCast.isHosting {
@@ -316,7 +316,17 @@ struct MenuBarView: View {
             
             MenuBarActionButton(icon: "gearshape", label: "Settings...") {
                 dismissPopoverAndRun {
-                    NSApp.sendAction(#selector(AppDelegate.showSettingsWindow(_:)), to: nil, from: nil)
+                    // Route directly to the AppDelegate instead of walking the
+                    // responder chain via NSApp.sendAction. On macOS Sonoma+,
+                    // SwiftUI synthesises a hidden handler for
+                    // `showSettingsWindow:` and pops up a phantom Settings
+                    // scene (this app deliberately doesn't declare a SwiftUI
+                    // `Settings` scene — we manage the window manually).
+                    // That phantom window becomes key and silently absorbs
+                    // every subsequent menu-bar click, making the app look
+                    // frozen. Direct delegate dispatch bypasses SwiftUI's
+                    // interception and always reaches our showSettings().
+                    (NSApp.delegate as? AppDelegate)?.showSettingsWindow(nil)
                 }
             }
             
@@ -447,8 +457,8 @@ struct MenuBarDeviceRow: View {
                         }
                         
                         if showLocalCast {
-                            QuickActionIcon(icon: "app.connected.to.app.below.fill", color: .purple, tooltip: "Stream App") {
-                                startAppStreaming()
+                            QuickActionIcon(icon: "bolt.fill", color: .purple, tooltip: "Metal Stream (high-fps)") {
+                                dismissPopoverAndRun { startMetalStreaming() }
                             }
                         }
                         
@@ -496,24 +506,28 @@ struct MenuBarDeviceRow: View {
                 withAnimation(.easeInOut(duration: 0.15)) { isHovering = hovering }
             }
         }
-        .alert("App Streaming Unavailable", isPresented: $showAppStreamError) {
+        .alert("Metal Stream Unavailable", isPresented: $showAppStreamError) {
             Button("OK", role: .cancel) { }
         } message: {
-            Text("Could not connect to the remote TidalDrift control channel. Make sure TidalDrift is running on the remote Mac with LocalCast hosting enabled.")
+            Text("Could not connect to the remote Metal streaming host. Make sure TidalDrift is running on the remote Mac with Metal Streaming hosting enabled.")
         }
     }
-    
-    private func startAppStreaming() {
+
+    /// Opens the TidalDrift Metal-accelerated streaming viewer for the given
+    /// device. Uses the keychain password if one is saved; otherwise the
+    /// session connects without a password and the host auth flow decides
+    /// whether to reject it.
+    private func startMetalStreaming() {
         let password = savedDevicePassword
         Task {
             do {
-                let controller = try await LocalCastService.shared.connectSystemScreenShare(to: device, password: password)
+                let controller = try await LocalCastService.shared.connect(to: device, password: password)
                 await MainActor.run {
                     NSApp.activate(ignoringOtherApps: true)
                     controller.showWindow(nil)
                 }
             } catch {
-                print("MenuBar App Streaming control channel failed: \(error)")
+                print("MenuBar Metal streaming failed: \(error)")
                 await MainActor.run { showAppStreamError = true }
             }
         }

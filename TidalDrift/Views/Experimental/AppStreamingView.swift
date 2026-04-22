@@ -1,5 +1,9 @@
 import SwiftUI
 
+// Experimental per-app streaming UI. Dormant behind #if DEBUG while the
+// full-desktop Metal pipeline takes priority.
+#if DEBUG
+
 /// Experimental view for app-specific streaming
 struct AppStreamingView: View {
     @ObservedObject private var service = AppStreamingService.shared
@@ -884,3 +888,5 @@ struct AppStreamingView_Previews: PreviewProvider {
         AppStreamingView()
     }
 }
+
+#endif

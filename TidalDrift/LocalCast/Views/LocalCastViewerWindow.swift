@@ -271,9 +271,11 @@ struct LocalCastContentView: View {
     @ObservedObject var tuning: StreamingTuning
     @AppStorage("showLatencyOverlay") var showOverlay = false
     @State private var toolbarExpanded = false
-    @State private var showAppPicker = false
     @State private var showQualityPanel = false
+    #if DEBUG
+    @State private var showAppPicker = false
     @State private var selectedRemoteApp: RemoteAppInfo?
+    #endif
     
     var body: some View {
         ZStack {
@@ -287,6 +289,7 @@ struct LocalCastContentView: View {
             VStack(spacing: 0) {
                 if toolbarExpanded {
                     HStack {
+                        #if DEBUG
                         Button {
                             if session.remoteApps.isEmpty {
                                 session.requestAppList()
@@ -301,7 +304,8 @@ struct LocalCastContentView: View {
                             .padding(.vertical, 4)
                         }
                         .buttonStyle(.bordered)
-                        
+                        #endif
+
                         CompactQualitySlider(tuning: tuning, isLive: true)
                         
                         Button {
@@ -346,9 +350,11 @@ struct LocalCastContentView: View {
                     withAnimation(.easeInOut(duration: 0.2)) {
                         toolbarExpanded.toggle()
                     }
+                    #if DEBUG
                     if !toolbarExpanded {
                         showAppPicker = false
                     }
+                    #endif
                 } label: {
                     HStack(spacing: 4) {
                         Image(systemName: toolbarExpanded ? "chevron.up" : "chevron.down")
@@ -373,7 +379,8 @@ struct LocalCastContentView: View {
                 }
             }
             
-            // App picker panel
+            // App picker panel (dormant per-app surface)
+            #if DEBUG
             if showAppPicker {
                 RemoteAppPickerView(
                     session: session,
@@ -381,6 +388,8 @@ struct LocalCastContentView: View {
                     selectedApp: $selectedRemoteApp
                 )
             }
+            #endif
+
             
             // Quality control panel
             if showQualityPanel {
@@ -419,7 +428,9 @@ struct LocalCastContentView: View {
                 bottomStatusBar
             }
         }
+        #if DEBUG
         .onChange(of: showAppPicker) { _ in syncOverlayState() }
+        #endif
         .onChange(of: showQualityPanel) { _ in syncOverlayState() }
         .onReceive(tuning.objectWillChange.debounce(for: .milliseconds(200), scheduler: DispatchQueue.main)) { _ in
             DispatchQueue.main.async {
@@ -429,12 +440,17 @@ struct LocalCastContentView: View {
     }
     
     private func syncOverlayState() {
+        #if DEBUG
         session.isOverlayActive = showAppPicker || showQualityPanel
+        #else
+        session.isOverlayActive = showQualityPanel
+        #endif
     }
     
     @ViewBuilder
     private var bottomStatusBar: some View {
         HStack(spacing: 10) {
+            #if DEBUG
             Button {
                 if session.remoteApps.isEmpty {
                     session.requestAppList()
@@ -451,6 +467,16 @@ struct LocalCastContentView: View {
                 .foregroundStyle(.white.opacity(0.9))
             }
             .buttonStyle(.plain)
+            #else
+            HStack(spacing: 4) {
+                Image(systemName: "display")
+                    .font(.caption)
+                Text(session.streamingTargetName)
+                    .font(.system(size: 11, weight: .medium))
+                    .lineLimit(1)
+            }
+            .foregroundStyle(.white.opacity(0.9))
+            #endif
             
             Rectangle()
                 .fill(.white.opacity(0.3))
@@ -479,6 +505,10 @@ struct LocalCastContentView: View {
         .padding(.bottom, 8)
     }
 }
+
+// Remote app picker + per-app row. Dormant behind #if DEBUG while the
+// full-desktop Metal pipeline is the priority.
+#if DEBUG
 
 /// View for picking which remote app to stream
 struct RemoteAppPickerView: View {
@@ -701,6 +731,8 @@ struct RemoteAppRowView: View {
         }
     }
 }
+
+#endif
 
 extension LocalCastContentView {
     @ViewBuilder

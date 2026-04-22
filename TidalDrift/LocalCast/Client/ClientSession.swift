@@ -9,14 +9,19 @@ import CoreVideo
 protocol ClientSessionDelegate: AnyObject {
     func clientSession(_ session: ClientSession, didDisconnectWithReason reason: String)
     func clientSession(_ session: ClientSession, didUpdateResolution size: CGSize)
+    #if DEBUG
+    /// Per-app streaming — dormant. The host no longer enumerates apps.
     func clientSession(_ session: ClientSession, didReceiveAppList apps: [RemoteAppInfo])
     func clientSession(_ session: ClientSession, didReceiveStreamResponse response: StreamResponse)
+    #endif
 }
 
 // Default implementations for optional delegate methods
 extension ClientSessionDelegate {
+    #if DEBUG
     func clientSession(_ session: ClientSession, didReceiveAppList apps: [RemoteAppInfo]) {}
     func clientSession(_ session: ClientSession, didReceiveStreamResponse response: StreamResponse) {}
+    #endif
 }
 
     /// Connection phase for diagnostics
@@ -47,21 +52,21 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
     @Published var isConnected = false
     @Published var connectionStatus: String = "Connecting..."
     @Published var connectionPhase: ConnectionPhase = .connecting
-    @Published var remoteApps: [RemoteAppInfo] = []
-    @Published var isLoadingApps = false
-    
+
     /// When true, mouse/keyboard events in the viewer are forwarded to the host
     /// and consumed locally. When false, the viewer is view-only.
     @Published var inputCaptureEnabled: Bool = true
-    
-    /// Set by the viewer's SwiftUI layer when an overlay panel (app picker,
-    /// quality controls) is open. Event monitors pass through events to SwiftUI
-    /// instead of forwarding them to the remote host.
+
+    /// Set by the viewer's SwiftUI layer when an overlay panel (quality controls)
+    /// is open. Event monitors pass through events to SwiftUI instead of
+    /// forwarding them to the remote host.
     @Published var isOverlayActive: Bool = false
-    
-    /// Human-readable name of the current streaming target.
+
+    /// Human-readable name of the current streaming target. Always "Full Display"
+    /// in the full-desktop-only path; retained so the viewer can keep a single
+    /// title surface if per-app streaming returns.
     @Published var streamingTargetName: String = "Full Display"
-    
+
     private let device: DiscoveredDevice
     private var hostEndpoint: NWEndpoint?
     private var heartbeatTimer: Timer?
@@ -72,18 +77,18 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
     private var diagnosticTimer: Timer?
     private var heartbeatsSent: Int = 0
     private var heartbeatsReceived: Int = 0
-    
-    /// Timeout for app list request; cancelled when response received.
-    private var appListTimeoutWorkItem: DispatchWorkItem?
-    
-    /// True after an app list request timed out (control channel unreachable or host not responding).
+
+    #if DEBUG
+    // App list surface — dormant. Previously races against the auth handshake
+    // produced most of the misleading "firewall blocked / auth required" UI
+    // state. With per-app streaming off, none of this is reachable.
+    @Published var remoteApps: [RemoteAppInfo] = []
+    @Published var isLoadingApps = false
     @Published var appListLoadFailed: Bool = false
-    
-    /// True when timeout likely indicates host-side auth is required (not a blocked port).
     @Published var appListAuthRequiredHint: Bool = false
-    
-    /// True when we received at least one app list response (even if empty). Lets UI distinguish "port blocked" from "host sent 0 apps".
     @Published var appListResponseReceived: Bool = false
+    private var appListTimeoutWorkItem: DispatchWorkItem?
+    #endif
     
     // MARK: - Auth
     
@@ -115,14 +120,18 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             self.connectionStatus = "Resolving \(self.device.name)..."
         }
         
-        // Use ConnectionResolver to get the best address (hostname-first strategy)
-        // This handles stale IPs and DHCP changes automatically
+        // Use ConnectionResolver with the ipFirst strategy + short timeout
+        // (matches the fix in main for the VNC path, c8d9a7f). The previous
+        // hostnameFirst / 8-second config ran three sequential getaddrinfo
+        // calls on .local hostnames, which block the full timeout on
+        // congested LANs or VPNs — the number one reason LocalCast connects
+        // appeared to "hang forever" before any packets flowed.
         let resolvedAddress: String
         do {
             let resolved = try await ConnectionResolver.shared.resolve(
                 device: device,
-                strategy: .hostnameFirst,
-                timeout: 8.0
+                strategy: .ipFirst,
+                timeout: 5.0
             )
             resolvedAddress = resolved.address
             logger.info("LocalCast: Resolved to \(resolved.address) via \(resolved.method.rawValue)")
@@ -167,15 +176,20 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
     }
     
     /// Begin the normal post-auth flow: heartbeat + keyframe requests.
+    ///
+    /// With the auth gate properly enforced on the host side, three staggered
+    /// keyframe requests ([0, 0.5, 1.5]s) are enough to survive the usual
+    /// couple of dropped UDP fragments on a LAN. The previous schedule of
+    /// six requests over five seconds was actively harmful on slow links —
+    /// large keyframes (300KB+) fragment into ~250 UDP packets, and bursting
+    /// the host with "give me another keyframe" every 500ms can saturate
+    /// the uplink right when the first keyframe is in flight.
     private func startPostAuthFlow() {
         DispatchQueue.main.async { [weak self] in
             self?.startHeartbeat()
         }
-        
-        // Request keyframes aggressively to ensure host receives one and the
-        // initial keyframe (with SPS/PPS) arrives at the client intact.
-        // Stagger requests to survive transient packet loss.
-        for delay in [0.1, 0.5, 1.0, 2.0, 3.0, 5.0] {
+
+        for delay in [0.0, 0.5, 1.5] {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
                 guard let self = self, !self.isConnected else { return }
                 self.requestKeyFrame()
@@ -404,28 +418,29 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         logger.info("Requested keyframe from host")
     }
     
-    // MARK: - Remote App Streaming
-    
+    // MARK: - Remote App Streaming (dormant)
+
+    #if DEBUG
     private static let appListTimeoutSeconds: TimeInterval = 8
-    
-    /// Request list of available apps from the host. If no response within timeout, clears loading and sets appListLoadFailed.
+
+    /// Request list of available apps from the host. Dormant — per-app
+    /// streaming is not part of the full-desktop Metal path.
     func requestAppList() {
         guard let endpoint = hostEndpoint else {
             print("❌ ClientSession: Cannot request app list - no host endpoint")
             return
         }
-        
+
         appListTimeoutWorkItem?.cancel()
         appListLoadFailed = false
         appListAuthRequiredHint = false
-        // appListResponseReceived stays true so we can show "host sent 0 apps" vs "no response" until next request
-        
+
         print("📋 ClientSession: Requesting app list from host...")
-        
+
         DispatchQueue.main.async { [weak self] in
             self?.isLoadingApps = true
         }
-        
+
         let packet = LocalCastPacket(
             type: .appListRequest,
             sequenceNumber: 0,
@@ -433,7 +448,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             payload: Data()
         )
         transport.send(packet: packet, to: endpoint)
-        
+
         let work = DispatchWorkItem { [weak self] in
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
@@ -457,80 +472,43 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         appListTimeoutWorkItem = work
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.appListTimeoutSeconds, execute: work)
     }
-    
-    /// Request to stream a specific window
+
+    /// Request to stream a specific window. Dormant.
     func requestStreamWindow(windowID: UInt32, windowTitle: String) {
-        guard let endpoint = hostEndpoint else {
-            print("❌ ClientSession: Cannot request stream - no host endpoint")
-            return
-        }
-        
+        guard let endpoint = hostEndpoint else { return }
         print("🎬 ClientSession: Requesting window stream: '\(windowTitle)' (ID: \(windowID))")
         streamingTargetName = windowTitle
-        
-        let request = StreamRequest(
-            type: .window,
-            processID: nil,
-            windowID: windowID,
-            appName: windowTitle
-        )
-        
+        let request = StreamRequest(type: .window, processID: nil, windowID: windowID, appName: windowTitle)
         sendStreamRequest(request, to: endpoint)
     }
-    
-    /// Request to stream a specific app (all its windows)
+
+    /// Request to stream a specific app. Dormant.
     func requestStreamApp(processID: Int32, appName: String) {
-        guard let endpoint = hostEndpoint else {
-            print("❌ ClientSession: Cannot request stream - no host endpoint")
-            return
-        }
-        
+        guard let endpoint = hostEndpoint else { return }
         print("🎬 ClientSession: Requesting app stream: '\(appName)' (PID: \(processID))")
         streamingTargetName = appName
-        
-        let request = StreamRequest(
-            type: .app,
-            processID: processID,
-            windowID: nil,
-            appName: appName
-        )
-        
+        let request = StreamRequest(type: .app, processID: processID, windowID: nil, appName: appName)
         sendStreamRequest(request, to: endpoint)
     }
-    
-    /// Request to stream the full display
+
+    /// Request to stream the full display explicitly. Redundant on the
+    /// full-desktop-only path (host already captures full display by default),
+    /// kept for symmetry with per-app request methods.
     func requestStreamFullDisplay() {
-        guard let endpoint = hostEndpoint else {
-            print("❌ ClientSession: Cannot request stream - no host endpoint")
-            return
-        }
-        
+        guard let endpoint = hostEndpoint else { return }
         print("🎬 ClientSession: Requesting full display stream")
         streamingTargetName = "Full Display"
-        
-        let request = StreamRequest(
-            type: .fullDisplay,
-            processID: nil,
-            windowID: nil,
-            appName: "Full Display"
-        )
-        
+        let request = StreamRequest(type: .fullDisplay, processID: nil, windowID: nil, appName: "Full Display")
         sendStreamRequest(request, to: endpoint)
     }
-    
-    /// Ask the host to bring a specific app to the foreground (without switching capture).
-    /// Used in System Screen Share mode so the VNC view shows the desired app.
+
+    /// Ask the host to bring a specific app to the foreground. Dormant.
     func requestFocusApp(processID: pid_t, appName: String) {
-        guard let endpoint = hostEndpoint else {
-            print("❌ ClientSession: Cannot focus app - no host endpoint")
-            return
-        }
-        
+        guard let endpoint = hostEndpoint else { return }
         struct FocusRequest: Encodable {
             let processID: pid_t
             let appName: String?
         }
-        
         do {
             let payload = try JSONEncoder().encode(FocusRequest(processID: processID, appName: appName))
             let packet = LocalCastPacket(
@@ -540,26 +518,18 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
                 payload: payload
             )
             transport.send(packet: packet, to: endpoint)
-            print("🎯 ClientSession: Sent focus request for '\(appName)' (PID \(processID))")
         } catch {
             print("❌ ClientSession: Failed to encode focus request: \(error)")
         }
     }
-    
-    // MARK: - App Isolation (VNC single-app mode)
-    
-    /// Ask the host to hide all apps except one, so VNC shows a single-app view.
+
+    /// Ask the host to hide all apps except one. Dormant.
     func requestIsolateApp(processID: pid_t, appName: String) {
-        guard let endpoint = hostEndpoint else {
-            print("❌ ClientSession: Cannot isolate app - no host endpoint")
-            return
-        }
-        
+        guard let endpoint = hostEndpoint else { return }
         struct IsolateRequest: Encodable {
             let processID: pid_t
             let appName: String?
         }
-        
         do {
             let payload = try JSONEncoder().encode(IsolateRequest(processID: processID, appName: appName))
             let packet = LocalCastPacket(
@@ -569,19 +539,14 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
                 payload: payload
             )
             transport.send(packet: packet, to: endpoint)
-            print("🔒 ClientSession: Sent isolate request for '\(appName)' (PID \(processID))")
         } catch {
             print("❌ ClientSession: Failed to encode isolate request: \(error)")
         }
     }
-    
-    /// Ask the host to unhide all apps that were hidden by a previous isolate request.
+
+    /// Ask the host to unhide apps hidden by a previous isolate request. Dormant.
     func requestRestoreApps() {
-        guard let endpoint = hostEndpoint else {
-            print("❌ ClientSession: Cannot restore apps - no host endpoint")
-            return
-        }
-        
+        guard let endpoint = hostEndpoint else { return }
         let packet = LocalCastPacket(
             type: .restoreAppsRequest,
             sequenceNumber: 0,
@@ -589,8 +554,23 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             payload: Data()
         )
         transport.send(packet: packet, to: endpoint)
-        print("🔓 ClientSession: Sent restore apps request")
     }
+
+    private func sendStreamRequest(_ request: StreamRequest, to endpoint: NWEndpoint) {
+        do {
+            let payload = try JSONEncoder().encode(request)
+            let packet = LocalCastPacket(
+                type: .streamAppRequest,
+                sequenceNumber: 0,
+                timestamp: CFAbsoluteTimeGetCurrent() + kCFAbsoluteTimeIntervalSince1970,
+                payload: payload
+            )
+            transport.send(packet: packet, to: endpoint)
+        } catch {
+            print("❌ ClientSession: Failed to encode stream request: \(error)")
+        }
+    }
+    #endif
     
     /// Send streaming quality tuning to the host so it can adjust encoder/capture.
     func sendQualityUpdate(_ tuning: StreamingTuning) {
@@ -609,29 +589,6 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         }
     }
     
-    private func sendStreamRequest(_ request: StreamRequest, to endpoint: NWEndpoint) {
-        do {
-            let payload = try JSONEncoder().encode(request)
-            print("🎬 ClientSession: Sending stream request packet")
-            print("   Type: \(request.type)")
-            print("   ProcessID: \(request.processID ?? -1)")
-            print("   WindowID: \(request.windowID ?? 0)")
-            print("   AppName: \(request.appName ?? "nil")")
-            print("   Payload size: \(payload.count) bytes")
-            print("   Endpoint: \(endpoint)")
-            
-            let packet = LocalCastPacket(
-                type: .streamAppRequest,
-                sequenceNumber: 0,
-                timestamp: CFAbsoluteTimeGetCurrent() + kCFAbsoluteTimeIntervalSince1970,
-                payload: payload
-            )
-            transport.send(packet: packet, to: endpoint)
-            print("🎬 ClientSession: Stream request packet sent ✓")
-        } catch {
-            print("❌ ClientSession: Failed to encode stream request: \(error)")
-        }
-    }
     
     @MainActor
     private func startHeartbeat() {
@@ -711,16 +668,18 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             // Update UI stats from host
             break
             
+        #if DEBUG
         case .appListResponse:
-            // Host sent us a list of available apps
+            // Host sent us a list of available apps (per-app, dormant)
             print("📋 ClientSession: Received app list response (\(packet.payload.count) bytes)")
             handleAppListResponse(packet.payload)
-            
+
         case .streamAppResponse:
-            // Host confirmed stream started (or failed)
+            // Host confirmed stream started (or failed) (per-app, dormant)
             print("🎬 ClientSession: Received stream response")
             handleStreamResponse(packet.payload)
-            
+        #endif
+
         case .authChallenge:
             handleAuthChallenge(payload: packet.payload)
             
@@ -732,10 +691,11 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         }
     }
     
+    #if DEBUG
     private func handleAppListResponse(_ payload: Data) {
         appListTimeoutWorkItem?.cancel()
         appListTimeoutWorkItem = nil
-        
+
         guard payload.count < 512_000 else {
             print("❌ ClientSession: App list payload too large (\(payload.count) bytes), ignoring")
             DispatchQueue.main.async { [weak self] in
@@ -745,8 +705,6 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         }
         do {
             let apps = try JSONDecoder().decode([RemoteAppInfo].self, from: payload)
-            print("📋 ClientSession: Decoded \(apps.count) remote apps")
-            
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.remoteApps = apps
@@ -765,26 +723,17 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             }
         }
     }
-    
+
     private func handleStreamResponse(_ payload: Data) {
         do {
             let response = try JSONDecoder().decode(StreamResponse.self, from: payload)
-            print("🎬 ClientSession: Stream response - success: \(response.success), target: \(response.streamingTarget ?? "none")")
-            
             if response.success {
-                // Reset decoder state so it picks up the new SPS/PPS from the switched stream.
-                // Without this, stale parameter sets can cause decode failures or green frames.
-                print("🎬 ClientSession: Resetting decoder for new stream")
                 decoder.invalidate()
-                
-                // Request a keyframe to ensure we get fresh SPS/PPS + IDR
                 requestKeyFrame()
             }
-            
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.delegate?.clientSession(self, didReceiveStreamResponse: response)
-                
                 if response.success {
                     self.streamingTargetName = response.streamingTarget ?? "Full Display"
                     self.connectionStatus = "Streaming: \(self.streamingTargetName)"
@@ -794,6 +743,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             print("❌ ClientSession: Failed to decode stream response: \(error)")
         }
     }
+    #endif
     
     func udpTransport(_ transport: UDPTransport, clientDidConnect endpoint: NWEndpoint, connection: NWConnection) {
         // Not used on client side
