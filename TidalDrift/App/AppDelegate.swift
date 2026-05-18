@@ -58,6 +58,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
     private var onboardingWindow: NSWindow?
     private var settingsWindow: NSWindow?
+    private var permissionRepairWindow: NSWindow?
+    private let lastPermissionHelperBuildKey = "lastPermissionHelperBuild"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         menuBarLogger.info("applicationDidFinishLaunching")
@@ -70,24 +72,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         AppState.shared.loadTrustedDevices()
         AppState.shared.loadConnectionHistory()
 
-        // Defer network operations to avoid blocking app launch
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            NetworkDiscoveryService.shared.startBrowsing()
-            TidalDriftPeerService.shared.startAdvertising()
-            TidalDriftPeerService.shared.startDiscovery()
-
-            _ = TidalDropService.shared
-
-            if UserDefaults.standard.bool(forKey: "localCastAutoHost") {
-                Task {
-                    do {
-                        try await LocalCastService.shared.startHosting()
-                    } catch {
-                        print("LocalCast: Auto-host failed: \(error.localizedDescription)")
-                    }
-                }
-            }
-        }
+        runPermissionRepairThenStartServices()
 
         // Show onboarding on first launch
         if !AppState.shared.hasCompletedOnboarding {
@@ -229,6 +214,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                 onboardingWindow = nil
             } else if window === settingsWindow {
                 settingsWindow = nil
+            } else if window === permissionRepairWindow {
+                permissionRepairWindow = nil
             } else if window === menuPanel {
                 removeOutsideClickMonitor()
             }
@@ -464,6 +451,88 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             NSEvent.removeMonitor(monitor)
             globalMenuPanelMonitor = nil
         }
+    }
+
+    private func runPermissionRepairThenStartServices() {
+        Task { @MainActor in
+            if let result = await PermissionHealthService.shared.resetTCCPermissionsForCurrentBuildIfNeeded() {
+                self.showPermissionRepairWindow(message: result.message)
+            } else if !CGPreflightScreenCaptureAccess(), self.shouldShowPermissionHelperForCurrentBuild() {
+                self.showPermissionRepairWindow(message: "Screen Recording permission is required for Metal Streaming.")
+            }
+            self.startNetworkServices()
+        }
+    }
+
+    private func startNetworkServices() {
+        NetworkDiscoveryService.shared.startBrowsing()
+        TidalDriftPeerService.shared.startAdvertising()
+        TidalDriftPeerService.shared.startDiscovery()
+        _ = TidalDropService.shared
+
+        if UserDefaults.standard.bool(forKey: "localCastAutoHost") {
+            Task {
+                do {
+                    try await LocalCastService.shared.startHosting()
+                } catch {
+                    print("LocalCast: Auto-host failed: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    private func shouldShowPermissionHelperForCurrentBuild() -> Bool {
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown"
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "unknown"
+        let buildKey = "\(version)-\(build)"
+        guard UserDefaults.standard.string(forKey: lastPermissionHelperBuildKey) != buildKey else {
+            return false
+        }
+        UserDefaults.standard.set(buildKey, forKey: lastPermissionHelperBuildKey)
+        return true
+    }
+
+    private func showPermissionRepairWindow(message: String? = nil) {
+        if let existing = permissionRepairWindow {
+            existing.orderFrontRegardless()
+            existing.makeKeyAndOrderFront(nil)
+            return
+        }
+
+        let view = VStack(alignment: .leading, spacing: 12) {
+            Text("TidalDrift Permissions")
+                .font(.title2)
+                .fontWeight(.bold)
+            Text("This build reset TidalDrift’s macOS permissions so Screen Recording, Local Network, Accessibility, and Input Monitoring can be granted to the installed app.")
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let message {
+                Text(message)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            PermissionDiagnosticView()
+        }
+        .padding(20)
+        .frame(width: 620, height: 680)
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 620, height: 680),
+            styleMask: [.titled, .closable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "TidalDrift Permissions"
+        window.contentView = NSHostingView(rootView: view)
+        window.center()
+        window.isReleasedWhenClosed = false
+        window.level = .floating
+        window.delegate = self
+        window.orderFrontRegardless()
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        permissionRepairWindow = window
     }
 
     // MARK: - UNUserNotificationCenterDelegate
