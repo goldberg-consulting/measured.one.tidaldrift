@@ -233,9 +233,12 @@ class LocalCastService: ObservableObject {
     func connect(to device: DiscoveredDevice, password: String? = nil) async throws -> LocalCastViewerWindowController {
         logger.info("Connecting to \(device.name)")
         
-        // If no password was provided, try to auto-fill from saved credentials
-        var resolvedPassword = password
-        if resolvedPassword == nil || resolvedPassword?.isEmpty == true {
+        // Only send a password when the host advertises LocalCast auth. Saved
+        // VNC credentials are not necessarily the LocalCast host password, and
+        // sending them to an auth-disabled host makes the client wait forever
+        // for an auth challenge that will never arrive.
+        var resolvedPassword = device.localCastAuthRequired == false ? nil : password
+        if device.localCastAuthRequired == true && (resolvedPassword == nil || resolvedPassword?.isEmpty == true) {
             if let creds = try? KeychainService.shared.getCredential(for: device) {
                 resolvedPassword = creds.password
                 logger.info("🔐 Using saved credentials for \(device.name)")

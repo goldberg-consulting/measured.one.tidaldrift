@@ -8,6 +8,7 @@ struct DeviceCardView: View {
     @State private var isPressed = false
     @State private var isTargetedForDrop = false
     @State private var showPINEntry = false
+    @State private var showLocalCastError = false
     
     @ObservedObject private var dropService = TidalDropService.shared
     
@@ -54,6 +55,11 @@ struct DeviceCardView: View {
                     showPINEntry = false
                 }
             )
+        }
+        .alert("Metal Stream Unavailable", isPresented: $showLocalCastError) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text("Could not connect to the remote Metal streaming host. Make sure TidalDrift is running on the remote Mac with Metal Streaming hosting enabled.")
         }
     }
     
@@ -105,10 +111,12 @@ struct DeviceCardView: View {
     
     private func startLocalCast() {
         // If saved credentials exist, auto-connect without showing the sheet
-        if let password = savedDevicePassword {
+        if device.localCastAuthRequired == true, let password = savedDevicePassword {
             connectLocalCast(password: password)
-        } else {
+        } else if device.localCastAuthRequired == true {
             showPINEntry = true
+        } else {
+            connectLocalCast(password: nil)
         }
     }
     
@@ -121,8 +129,8 @@ struct DeviceCardView: View {
                     viewer.showWindow(nil)
                 }
             } catch {
-                print("❌ LocalCast: Connection failed, falling back to VNC: \(error.localizedDescription)")
-                onTap() // Fallback to standard VNC
+                print("❌ LocalCast: Connection failed: \(error.localizedDescription)")
+                await MainActor.run { showLocalCastError = true }
             }
         }
     }

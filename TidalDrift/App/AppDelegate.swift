@@ -29,14 +29,31 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         app.run()
     }
 
-    // MARK: - Status item + popover (manual, replaces SwiftUI MenuBarExtra)
+    // MARK: - Status item + panel (manual, replaces SwiftUI MenuBarExtra)
+    //
+    // We went through a few iterations here:
+    //   1. SwiftUI `MenuBarExtra(.window)` — broken on macOS 14+, clicks
+    //      never opened the popover.
+    //   2. Manual NSStatusItem + NSPopover — clicks worked, but NSPopover's
+    //      preferredEdge is a preference, not a mandate. On multi-monitor
+    //      setups and occasionally when NSHostingController reports a bogus
+    //      fitting size on first render, AppKit falls back to `.maxY` and
+    //      the popover appears *above* the status item — off-screen, since
+    //      the status item is at the top of the screen. The symptom the
+    //      user sees is "the top of the dropdown is above the menu bar and
+    //      I can't see it."
+    //   3. Manual NSStatusItem + borderless NSPanel (current). Full control
+    //      over positioning; the window never flips to above the anchor.
 
     private var statusItem: NSStatusItem?
-    private var popover: NSPopover?
+    private var menuPanel: NSPanel?
+    private var localMenuPanelMonitor: Any?
+    private var globalMenuPanelMonitor: Any?
+    private var ignoreNextStatusItemClick = false
 
     private var onboardingWindow: NSWindow?
     private var settingsWindow: NSWindow?
-    
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         menuBarLogger.info("applicationDidFinishLaunching")
         configureAppearance()
@@ -47,15 +64,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         // Load initial data
         AppState.shared.loadTrustedDevices()
         AppState.shared.loadConnectionHistory()
-        
+
         // Defer network operations to avoid blocking app launch
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             NetworkDiscoveryService.shared.startBrowsing()
             TidalDriftPeerService.shared.startAdvertising()
             TidalDriftPeerService.shared.startDiscovery()
-            
+
             _ = TidalDropService.shared
-            
+
             if UserDefaults.standard.bool(forKey: "localCastAutoHost") {
                 Task {
                     do {
@@ -66,52 +83,54 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                 }
             }
         }
-        
+
         // Show onboarding on first launch
         if !AppState.shared.hasCompletedOnboarding {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
                 self.showOnboarding()
             }
         }
-        
+
         NotificationCenter.default.addObserver(
             self, selector: #selector(handleShowOnboarding),
             name: .showOnboarding, object: nil
         )
     }
-    
+
     func applicationWillTerminate(_ notification: Notification) {
+        hideMenuPanel()
         NetworkDiscoveryService.shared.stopBrowsing()
         TidalDriftPeerService.shared.stopAdvertising()
         TidalDriftPeerService.shared.stopDiscovery()
+        LocalCastService.shared.stopHosting()
         DeviceDetailWindowManager.shared.closeAll()
     }
-    
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         return false
     }
-    
+
     /// Dock icon clicked -- no main window to show, just activate the app.
     /// The menu bar popover is the primary UI.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         NSApp.activate(ignoringOtherApps: true)
         return false
     }
-    
+
     // MARK: - Dock Drop (files dragged onto Dock icon)
-    
+
     func application(_ sender: NSApplication, open urls: [URL]) {
         let fileURLs = urls.filter { $0.isFileURL }
         guard !fileURLs.isEmpty else { return }
         DropPickerWindowManager.shared.show(fileURLs: fileURLs)
     }
-    
+
     // MARK: - Onboarding
-    
+
     @objc private func handleShowOnboarding() {
         showOnboarding()
     }
-    
+
     func showOnboarding() {
         NSApp.activate(ignoringOtherApps: true)
         if let existing = onboardingWindow {
@@ -119,12 +138,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             existing.makeKeyAndOrderFront(nil)
             return
         }
-        
+
         let onboardingView = OnboardingContainerView()
             .environmentObject(AppState.shared)
-        
+
         let hostingView = NSHostingView(rootView: onboardingView)
-        
+
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 700, height: 520),
             styleMask: [.titled, .closable],
@@ -137,12 +156,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         window.isReleasedWhenClosed = false
         window.delegate = self
         window.makeKeyAndOrderFront(nil)
-        
+
         NSApp.activate(ignoringOtherApps: true)
-        
+
         onboardingWindow = window
     }
-    
+
     // MARK: - Settings Window
 
     /// Entry point for the in-app Settings button and the Cmd+, menu item.
@@ -160,7 +179,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     @objc func showPreferencesWindow(_ sender: Any?) {
         showSettings()
     }
-    
+
     private func showSettings() {
         NSApp.activate(ignoringOtherApps: true)
         if let existing = settingsWindow {
@@ -172,12 +191,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             existing.makeKeyAndOrderFront(nil)
             return
         }
-        
+
         let settingsView = SettingsView()
             .environmentObject(AppState.shared)
-        
+
         let hostingView = NSHostingView(rootView: settingsView)
-        
+
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 760, height: 560),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
@@ -193,11 +212,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         window.delegate = self
         window.orderFrontRegardless()
         window.makeKeyAndOrderFront(nil)
-        
+
         NSApp.activate(ignoringOtherApps: true)
         settingsWindow = window
     }
-    
+
     func windowWillClose(_ notification: Notification) {
         if let window = notification.object as? NSWindow {
             if window === onboardingWindow {
@@ -207,14 +226,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             }
         }
     }
-    
+
     private func configureAppearance() {
         NSWindow.allowsAutomaticWindowTabbing = false
     }
-    
-    // MARK: - Status item + popover
 
-    /// Creates the menu-bar status item (the "TD" icon) and the popover that
+    // MARK: - Status item + panel
+
+    /// Content size of the menu panel. Matches the SwiftUI view's natural
+    /// bounds; the popover mis-sized when we let NSHostingController
+    /// compute it, so we just pin it.
+    private static let menuPanelSize = NSSize(width: 360, height: 520)
+
+    /// Creates the menu-bar status item (the "TD" icon) and the panel that
     /// hosts `MenuBarView`. Called once from `applicationDidFinishLaunching`.
     private func setupStatusItem() {
         menuBarLogger.info("setupStatusItem: starting")
@@ -225,55 +249,202 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             button.toolTip = "TidalDrift"
             button.target = self
             button.action = #selector(toggleMenu(_:))
-            // Accept both primary clicks (toggle the popover) and, if we ever
-            // need it in the future, right-clicks for a context menu.
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
             menuBarLogger.info("setupStatusItem: button configured")
         } else {
             menuBarLogger.warning("setupStatusItem: no button on status item")
         }
         self.statusItem = item
-        menuBarLogger.info("setupStatusItem: done")
 
-        let popover = NSPopover()
-        popover.behavior = .transient  // auto-closes when the user clicks outside
-        popover.animates = true
-        popover.contentSize = NSSize(width: 360, height: 520)
-
-        let host = NSHostingController(
-            rootView: MenuBarView().environmentObject(AppState.shared)
+        // Borderless floating panel to host MenuBarView. We deliberately
+        // build this up front (not lazily on first click) so the SwiftUI
+        // content view has time to layout before the first show.
+        let panel = NSPanel(
+            contentRect: NSRect(origin: .zero, size: Self.menuPanelSize),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
         )
-        host.view.frame = NSRect(x: 0, y: 0, width: 360, height: 520)
-        popover.contentViewController = host
-        self.popover = popover
+        panel.isReleasedWhenClosed = false
+        panel.hidesOnDeactivate = false
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.level = .statusBar
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.animationBehavior = .utilityWindow
+
+        // Rounded corners on the panel's content background so the SwiftUI
+        // view's edges don't look square against the transparent panel.
+        let host = NSHostingController(
+            rootView: MenuBarView()
+                .environmentObject(AppState.shared)
+                .frame(width: Self.menuPanelSize.width, height: Self.menuPanelSize.height)
+                .background(.background)
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        )
+        host.view.frame = NSRect(origin: .zero, size: Self.menuPanelSize)
+        panel.contentViewController = host
+
+        self.menuPanel = panel
+        menuBarLogger.info("setupStatusItem: done")
     }
 
-    /// Toggle the popover shown under the status item. When the popover
-    /// becomes key we also pin the app as an accessory so child windows
-    /// (onboarding, settings, the Metal viewer) can gain focus.
-    /// Toggle the popover shown under the status item. `.transient` behavior
-    /// handles dismissal when the user clicks anywhere outside the popover;
-    /// clicking the status item itself while the popover is visible is
-    /// routed to us by AppKit, which calls `toggleMenu` a second time — we
-    /// explicitly close in that case so the icon acts as an on/off toggle.
+    /// Primary click handler for the status item. Acts as an on/off toggle
+    /// for the menu panel. Dismissal when the user clicks outside is handled
+    /// by a local/global event monitor installed while the panel is visible.
     @objc func toggleMenu(_ sender: Any?) {
         menuBarLogger.info("toggleMenu fired")
-        guard let button = statusItem?.button, let popover = popover else {
-            menuBarLogger.warning("toggleMenu: missing button or popover")
+        guard let panel = menuPanel, let button = statusItem?.button else {
+            menuBarLogger.warning("toggleMenu: missing panel or button")
             return
         }
-        if popover.isShown {
-            menuBarLogger.info("toggleMenu: closing popover")
-            popover.performClose(sender)
+        if ignoreNextStatusItemClick {
+            ignoreNextStatusItemClick = false
             return
         }
-        menuBarLogger.info("toggleMenu: opening popover")
+        if NSApp.currentEvent?.type == .rightMouseUp {
+            showStatusContextMenu()
+            return
+        }
+        if panel.isVisible {
+            menuBarLogger.info("toggleMenu: closing panel")
+            hideMenuPanel()
+            return
+        }
+        menuBarLogger.info("toggleMenu: opening panel")
+        positionMenuPanel(panel, below: button)
+        panel.alphaValue = 0
+        panel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
-        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.08
+            panel.animator().alphaValue = 1
+        }
+        installOutsideClickMonitor()
     }
-    
+
+    private func showStatusContextMenu() {
+        let menu = NSMenu()
+        menu.addItem(NSMenuItem(title: "Open TidalDrift", action: #selector(openMenuFromContextMenu(_:)), keyEquivalent: ""))
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "Quit TidalDrift", action: #selector(requestQuit(_:)), keyEquivalent: "q"))
+        menu.items.forEach { $0.target = self }
+        statusItem?.menu = menu
+        statusItem?.button?.performClick(nil)
+        statusItem?.menu = nil
+    }
+
+    @objc private func openMenuFromContextMenu(_ sender: Any?) {
+        guard let panel = menuPanel, let button = statusItem?.button else { return }
+        positionMenuPanel(panel, below: button)
+        panel.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        installOutsideClickMonitor()
+    }
+
+    @objc func requestQuit(_ sender: Any?) {
+        hideMenuPanel()
+        DispatchQueue.main.async {
+            NSApp.terminate(sender)
+        }
+    }
+
+    /// Position the panel directly below the status item, horizontally
+    /// centered under it, clamped to the screen's visible frame so the
+    /// right edge never falls off-screen. This is the whole point of
+    /// going from NSPopover → NSPanel: AppKit will never flip us above.
+    private func positionMenuPanel(_ panel: NSWindow, below button: NSStatusBarButton) {
+        guard let buttonWindow = button.window else { return }
+        let buttonFrameInScreen = buttonWindow.convertToScreen(button.frame)
+        let screenFrame = (buttonWindow.screen ?? NSScreen.main ?? NSScreen.screens.first!).visibleFrame
+
+        let panelHeight = min(Self.menuPanelSize.height, max(240, screenFrame.height - 16))
+        let panelSize = NSSize(width: Self.menuPanelSize.width, height: panelHeight)
+        if panel.frame.size != panelSize {
+            panel.setContentSize(panelSize)
+        }
+        var origin = NSPoint(
+            x: buttonFrameInScreen.midX - panelSize.width / 2,
+            // In AppKit coords (origin bottom-left), "below" the button is
+            // a SMALLER y. The button is at the top of the screen, so we
+            // subtract the panel height from the button's bottom edge.
+            y: buttonFrameInScreen.minY - panelSize.height - 4
+        )
+        // Clamp so we don't overrun the right edge of the screen.
+        let maxX = screenFrame.maxX - panelSize.width - 8
+        if origin.x > maxX { origin.x = maxX }
+        let minX = screenFrame.minX + 8
+        if origin.x < minX { origin.x = minX }
+        let maxY = screenFrame.maxY - panelSize.height - 8
+        if origin.y > maxY { origin.y = maxY }
+        let minY = screenFrame.minY + 8
+        if origin.y < minY { origin.y = minY }
+
+        panel.setFrameOrigin(origin)
+    }
+
+    @objc func hideMenuPanel() {
+        menuPanel?.orderOut(nil)
+        removeOutsideClickMonitor()
+    }
+
+    /// Close the panel when the user clicks anywhere outside it — including
+    /// on the status item itself (which AppKit would otherwise route back
+    /// through `toggleMenu`, giving us a close-then-immediately-reopen
+    /// flicker). Install only while the panel is visible to minimize
+    /// background event monitoring.
+    private func installOutsideClickMonitor() {
+        removeOutsideClickMonitor()
+        localMenuPanelMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown]
+        ) { [weak self] event in
+            guard let self else { return event }
+            if self.eventIsInsideMenuPanel(event) {
+                return event
+            }
+            if self.eventIsInsideStatusItem(event) {
+                self.ignoreNextStatusItemClick = true
+            }
+            self.hideMenuPanel()
+            return event
+        }
+        globalMenuPanelMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown]
+        ) { [weak self] _ in
+            self?.hideMenuPanel()
+        }
+    }
+
+    private func eventIsInsideMenuPanel(_ event: NSEvent) -> Bool {
+        guard let panel = menuPanel, panel.isVisible else { return false }
+        if event.window === panel {
+            return true
+        }
+        let screenPoint = event.window?.convertPoint(toScreen: event.locationInWindow) ?? NSEvent.mouseLocation
+        return panel.frame.contains(screenPoint)
+    }
+
+    private func eventIsInsideStatusItem(_ event: NSEvent) -> Bool {
+        guard let button = statusItem?.button, let buttonWindow = button.window else { return false }
+        let screenPoint = event.window?.convertPoint(toScreen: event.locationInWindow) ?? NSEvent.mouseLocation
+        let buttonFrame = buttonWindow.convertToScreen(button.frame)
+        return buttonFrame.contains(screenPoint)
+    }
+
+    private func removeOutsideClickMonitor() {
+        if let monitor = localMenuPanelMonitor {
+            NSEvent.removeMonitor(monitor)
+            localMenuPanelMonitor = nil
+        }
+        if let monitor = globalMenuPanelMonitor {
+            NSEvent.removeMonitor(monitor)
+            globalMenuPanelMonitor = nil
+        }
+    }
+
     // MARK: - UNUserNotificationCenterDelegate
-    
+
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
         completionHandler([.banner, .list, .sound])
     }

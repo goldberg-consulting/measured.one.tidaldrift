@@ -47,14 +47,7 @@ struct MenuBarView: View {
     /// Close the menu bar popover, then run an action on the next run loop
     /// so the target window can become key without competing for focus.
     private func dismissPopoverAndRun(_ action: @escaping () -> Void) {
-        if let popover = NSApp.windows.first(where: {
-            $0.isVisible
-                && ($0.level == .statusBar
-                    || $0.styleMask.contains(.nonactivatingPanel)
-                    || $0.className.contains("StatusBar"))
-        }) {
-            popover.close()
-        }
+        (NSApp.delegate as? AppDelegate)?.hideMenuPanel()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
             NSApp.activate(ignoringOtherApps: true)
             action()
@@ -339,7 +332,7 @@ struct MenuBarView: View {
             Divider().padding(.vertical, 2)
             
             MenuBarActionButton(icon: "power", label: "Quit TidalDrift") {
-                NSApplication.shared.terminate(nil)
+                (NSApp.delegate as? AppDelegate)?.requestQuit(nil)
             }
         }
     }
@@ -417,10 +410,7 @@ struct MenuBarDeviceRow: View {
     
     /// Close the status-bar popover before opening external apps/URLs.
     private func dismissPopoverAndRun(_ action: @escaping () -> Void) {
-        if let popover = NSApp.keyWindow,
-           popover.level == .statusBar || popover.styleMask.contains(.nonactivatingPanel) || popover.className.contains("StatusBar") {
-            popover.close()
-        }
+        (NSApp.delegate as? AppDelegate)?.hideMenuPanel()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
             NSApp.activate(ignoringOtherApps: true)
             action()
@@ -527,7 +517,7 @@ struct MenuBarDeviceRow: View {
     /// session connects without a password and the host auth flow decides
     /// whether to reject it.
     private func startMetalStreaming() {
-        let password = savedDevicePassword
+        let password = device.localCastAuthRequired == true ? savedDevicePassword : nil
         Task {
             do {
                 await WakeOnLANService.shared.prepareForConnection(to: device, service: .localCast)

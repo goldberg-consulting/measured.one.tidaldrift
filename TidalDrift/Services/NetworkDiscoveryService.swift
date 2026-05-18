@@ -3,6 +3,52 @@ import Network
 import Combine
 import OSLog
 
+private func runDnsSdLookup(name: String, type: String, domain: String, timeout: TimeInterval, maxLines: Int, logger: Logger) -> String {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/dns-sd")
+    process.arguments = ["-L", name, type, domain]
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = pipe
+    let outputLock = NSLock()
+    var outputData = Data()
+    let finished = DispatchSemaphore(value: 0)
+    pipe.fileHandleForReading.readabilityHandler = { handle in
+        let data = handle.availableData
+        guard !data.isEmpty else { return }
+        outputLock.lock()
+        outputData.append(data)
+        outputLock.unlock()
+    }
+    process.terminationHandler = { _ in
+        finished.signal()
+    }
+    do {
+        try process.run()
+    } catch {
+        logger.warning("dns-sd -L failed to start for \(name): \(error.localizedDescription)")
+        return ""
+    }
+    if finished.wait(timeout: .now() + timeout) == .timedOut {
+        process.terminate()
+        if finished.wait(timeout: .now() + 0.5) == .timedOut {
+            kill(process.processIdentifier, SIGKILL)
+            _ = finished.wait(timeout: .now() + 0.5)
+        }
+    }
+    pipe.fileHandleForReading.readabilityHandler = nil
+    let remaining = pipe.fileHandleForReading.availableData
+    outputLock.lock()
+    outputData.append(remaining)
+    let data = outputData
+    outputLock.unlock()
+    let output = String(data: data, encoding: .utf8) ?? ""
+    return output
+        .split(separator: "\n")
+        .prefix(maxLines)
+        .joined(separator: "\n")
+}
+
 class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDelegate, NetServiceDelegate {
     private let logger = Logger(subsystem: "com.tidaldrift", category: "Discovery")
     static let shared = NetworkDiscoveryService()
@@ -342,14 +388,19 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         queue.async { [weak self] in
             guard let self = self else { return }
 
-            // Sanitize name to prevent shell injection from Bonjour advertisements
-            let safeName = name.replacingOccurrences(of: "'", with: "").replacingOccurrences(of: "\\", with: "")
-            let result = ShellExecutor.execute("timeout 5 dns-sd -L '\(safeName)' _tidaldrift-cast._udp local. 2>&1 | head -20")
+            let output = runDnsSdLookup(
+                name: name,
+                type: "_tidaldrift-cast._udp",
+                domain: "local.",
+                timeout: 5,
+                maxLines: 20,
+                logger: self.logger
+            )
 
-            self.logger.debug("dns-sd -L output for '\(name)': \(result.output)")
+            self.logger.debug("dns-sd -L output for '\(name)': \(output)")
 
             // Parse output for hostname - look for "can be reached at" or hostname.local.:port
-            let lines = result.output.split(separator: "\n")
+            let lines = output.split(separator: "\n")
             for line in lines {
                 let lineStr = String(line)
 
@@ -517,17 +568,24 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         queue.async { [weak self] in
             guard let self = self else { return }
 
-            // Sanitize inputs to prevent shell injection from Bonjour advertisements
-            let safeName = name.replacingOccurrences(of: "'", with: "").replacingOccurrences(of: "\\", with: "")
+            // Service type/domain are constrained, but the service name is passed
+            // as a Process argument so apostrophes in Bonjour names are safe.
             let safeType2 = type.replacingOccurrences(of: "'", with: "").replacingOccurrences(of: "\\", with: "")
             let safeDomain = domain.replacingOccurrences(of: "'", with: "").replacingOccurrences(of: "\\", with: "")
-            let result = ShellExecutor.execute("timeout 3 dns-sd -L '\(safeName)' '\(safeType2)' '\(safeDomain)' 2>&1 | head -10")
+            let output = runDnsSdLookup(
+                name: name,
+                type: safeType2,
+                domain: safeDomain,
+                timeout: 3,
+                maxLines: 10,
+                logger: self.logger
+            )
             let authRequired: Bool? =
-                result.output.contains("auth=1") ? true :
-                (result.output.contains("auth=0") ? false : nil)
+                output.contains("auth=1") ? true :
+                (output.contains("auth=0") ? false : nil)
 
             // Parse output for host info - look for "can be reached at" or hostname
-            let lines = result.output.split(separator: "\n")
+            let lines = output.split(separator: "\n")
             for line in lines {
                 let lineStr = String(line)
                 self.logger.debug("dns-sd output: \(lineStr)")
@@ -746,19 +804,24 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
 
     /// Fallback resolution using dns-sd command
     private func resolveServiceViaDNSSD(name: String, type: String, domain: String, serviceType: String) {
-        // Sanitize inputs to prevent command injection
-        let escapedName = name.replacingOccurrences(of: "'", with: "'\\''")
         // Service type should only contain alphanumeric, underscore, hyphen, period
         let safeType = type.filter { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" || $0 == "." }
         let safeDomain = domain.filter { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" || $0 == "." }
 
         guard !safeType.isEmpty else { return }
 
-        let result = ShellExecutor.execute("timeout 2 dns-sd -L '\(escapedName)' '\(safeType)' '\(safeDomain)' 2>/dev/null | head -5")
+        let output = runDnsSdLookup(
+            name: name,
+            type: safeType,
+            domain: safeDomain,
+            timeout: 2,
+            maxLines: 5,
+            logger: logger
+        )
 
         // Parse output for host info
         // Example: "hostname.local.:5900"
-        let lines = result.output.split(separator: "\n")
+        let lines = output.split(separator: "\n")
         for line in lines {
             let lineStr = String(line)
             if lineStr.contains("can be reached at") {
