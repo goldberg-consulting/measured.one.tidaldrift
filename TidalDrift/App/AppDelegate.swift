@@ -50,6 +50,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     private var localMenuPanelMonitor: Any?
     private var globalMenuPanelMonitor: Any?
     private var ignoreNextStatusItemClick = false
+    private var appResignObserver: NSObjectProtocol?
 
     private var onboardingWindow: NSWindow?
     private var settingsWindow: NSWindow?
@@ -95,10 +96,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             self, selector: #selector(handleShowOnboarding),
             name: .showOnboarding, object: nil
         )
+        appResignObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didResignActiveNotification,
+            object: NSApp,
+            queue: .main
+        ) { [weak self] _ in
+            self?.hideMenuPanel()
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         hideMenuPanel()
+        if let observer = appResignObserver {
+            NotificationCenter.default.removeObserver(observer)
+            appResignObserver = nil
+        }
+        NotificationCenter.default.removeObserver(self)
         NetworkDiscoveryService.shared.stopBrowsing()
         TidalDriftPeerService.shared.stopAdvertising()
         TidalDriftPeerService.shared.stopDiscovery()
@@ -223,6 +236,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                 onboardingWindow = nil
             } else if window === settingsWindow {
                 settingsWindow = nil
+            } else if window === menuPanel {
+                removeOutsideClickMonitor()
             }
         }
     }
@@ -261,18 +276,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         // content view has time to layout before the first show.
         let panel = NSPanel(
             contentRect: NSRect(origin: .zero, size: Self.menuPanelSize),
-            styleMask: [.borderless, .nonactivatingPanel],
+            styleMask: [.borderless],
             backing: .buffered,
             defer: false
         )
         panel.isReleasedWhenClosed = false
-        panel.hidesOnDeactivate = false
+        panel.hidesOnDeactivate = true
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
         panel.level = .statusBar
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.animationBehavior = .utilityWindow
+        panel.delegate = self
 
         // Rounded corners on the panel's content background so the SwiftUI
         // view's edges don't look square against the transparent panel.
@@ -397,9 +413,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     private func installOutsideClickMonitor() {
         removeOutsideClickMonitor()
         localMenuPanelMonitor = NSEvent.addLocalMonitorForEvents(
-            matching: [.leftMouseDown, .rightMouseDown]
+            matching: [.leftMouseDown, .rightMouseDown, .keyDown]
         ) { [weak self] event in
             guard let self else { return event }
+            if event.type == .keyDown, event.keyCode == 53 {
+                self.hideMenuPanel()
+                return nil
+            }
+            if event.type == .keyDown {
+                return event
+            }
             if self.eventIsInsideMenuPanel(event) {
                 return event
             }
