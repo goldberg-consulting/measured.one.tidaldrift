@@ -5,6 +5,11 @@ import UserNotifications
 
 private let menuBarLogger = Logger(subsystem: "com.tidaldrift", category: "MenuBar")
 
+private final class MenuStatusPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+}
+
 // Manual entry point. We used to launch via `@main struct TidalDriftApp: App`
 // with a SwiftUI `MenuBarExtra`, but `MenuBarExtra(.window)` has a bug on
 // macOS 14+/15+/26+ where the status item renders, is accessibility-enabled,
@@ -50,7 +55,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     private var localMenuPanelMonitor: Any?
     private var globalMenuPanelMonitor: Any?
     private var ignoreNextStatusItemClick = false
-    private var appResignObserver: NSObjectProtocol?
 
     private var onboardingWindow: NSWindow?
     private var settingsWindow: NSWindow?
@@ -96,21 +100,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             self, selector: #selector(handleShowOnboarding),
             name: .showOnboarding, object: nil
         )
-        appResignObserver = NotificationCenter.default.addObserver(
-            forName: NSApplication.didResignActiveNotification,
-            object: NSApp,
-            queue: .main
-        ) { [weak self] _ in
-            self?.hideMenuPanel()
-        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         hideMenuPanel()
-        if let observer = appResignObserver {
-            NotificationCenter.default.removeObserver(observer)
-            appResignObserver = nil
-        }
         NotificationCenter.default.removeObserver(self)
         NetworkDiscoveryService.shared.stopBrowsing()
         TidalDriftPeerService.shared.stopAdvertising()
@@ -274,20 +267,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         // Borderless floating panel to host MenuBarView. We deliberately
         // build this up front (not lazily on first click) so the SwiftUI
         // content view has time to layout before the first show.
-        let panel = NSPanel(
+        let panel = MenuStatusPanel(
             contentRect: NSRect(origin: .zero, size: Self.menuPanelSize),
-            styleMask: [.borderless],
+            styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
         panel.isReleasedWhenClosed = false
-        panel.hidesOnDeactivate = true
+        panel.hidesOnDeactivate = false
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
         panel.level = .statusBar
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.animationBehavior = .utilityWindow
+        panel.acceptsMouseMovedEvents = true
         panel.delegate = self
 
         // Rounded corners on the panel's content background so the SwiftUI
@@ -331,8 +325,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         menuBarLogger.info("toggleMenu: opening panel")
         positionMenuPanel(panel, below: button)
         panel.alphaValue = 0
-        panel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        panel.orderFrontRegardless()
+        panel.makeKey()
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.08
             panel.animator().alphaValue = 1
@@ -346,16 +341,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Quit TidalDrift", action: #selector(requestQuit(_:)), keyEquivalent: "q"))
         menu.items.forEach { $0.target = self }
-        statusItem?.menu = menu
-        statusItem?.button?.performClick(nil)
-        statusItem?.menu = nil
+        if let button = statusItem?.button {
+            menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.minY), in: button)
+        }
     }
 
     @objc private func openMenuFromContextMenu(_ sender: Any?) {
         guard let panel = menuPanel, let button = statusItem?.button else { return }
         positionMenuPanel(panel, below: button)
-        panel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        panel.orderFrontRegardless()
+        panel.makeKey()
         installOutsideClickMonitor()
     }
 
@@ -429,13 +425,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             if self.eventIsInsideStatusItem(event) {
                 self.ignoreNextStatusItemClick = true
             }
-            self.hideMenuPanel()
+            DispatchQueue.main.async {
+                self.hideMenuPanel()
+            }
             return event
         }
         globalMenuPanelMonitor = NSEvent.addGlobalMonitorForEvents(
             matching: [.leftMouseDown, .rightMouseDown]
         ) { [weak self] _ in
-            self?.hideMenuPanel()
+            DispatchQueue.main.async {
+                self?.hideMenuPanel()
+            }
         }
     }
 
