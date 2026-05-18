@@ -120,6 +120,11 @@ class TidalDriftTestRunner: ObservableObject {
         allTests.append(("TCP Port Bind", "Network", testTCPPortBind))
         allTests.append(("Loopback TCP Roundtrip", "Network", testLoopbackTCPRoundtrip))
         allTests.append(("Loopback UDP Roundtrip", "Network", testLoopbackUDPRoundtrip))
+        allTests.append(("Peer Identity Stable Across IP Change", "Network", testPeerIdentityStableAcrossIPChange))
+        allTests.append(("Hostname Identity Fallback", "Network", testHostnameIdentityFallback))
+        allTests.append(("Legacy Stable ID Migration Key", "Network", testLegacyStableIdRemainsAvailable))
+        allTests.append(("Wake-on-LAN Broadcast Planning", "Network", testWakeOnLANBroadcastPlanning))
+        allTests.append(("Wake-on-LAN MAC Migration", "Network", testWakeOnLANMACMigration))
         
         // Security
         allTests.append(("Session Key Generation", "Security", testSessionKeyGeneration))
@@ -127,6 +132,8 @@ class TidalDriftTestRunner: ObservableObject {
         allTests.append(("AES-GCM Encrypt/Decrypt", "Security", testAESGCMRoundtrip))
         allTests.append(("Tampered Ciphertext Rejected", "Security", testTamperedCiphertextRejected))
         allTests.append(("Wrong Password Rejected", "Security", testWrongPasswordRejected))
+        allTests.append(("Keychain Legacy Credential Migration", "Security", testKeychainLegacyCredentialMigration))
+        allTests.append(("Keychain Credential Upsert", "Security", testKeychainCredentialUpsert))
         
         // TidalDrop File Transfer
         allTests.append(("Loopback File Transfer (small)", "TidalDrop", testLoopbackSmallFileTransfer))

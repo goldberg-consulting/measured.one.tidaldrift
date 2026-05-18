@@ -6,10 +6,10 @@ import OSLog
 class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDelegate, NetServiceDelegate {
     private let logger = Logger(subsystem: "com.tidaldrift", category: "Discovery")
     static let shared = NetworkDiscoveryService()
-    
+
     @Published var discoveredDevices: [DiscoveredDevice] = []
     @Published var lastScanDate: Date?
-    
+
     private var browsers: [NWBrowser] = []
     private var netServiceBrowser: NetServiceBrowser?
     private var udpListener: NWListener?
@@ -18,17 +18,17 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
     private var scanTimer: Timer?
     private var pathMonitor: NWPathMonitor?
     private let queue = DispatchQueue(label: "com.tidaldrift.discovery", qos: .userInitiated)
-    
+
     private var publishDebounceWorkItem: DispatchWorkItem?
-    
+
     // Store active connections to prevent premature deallocation
     private var activeConnections: [UUID: NWConnection] = [:]
     private let connectionsLock = NSLock()
-    
+
     // Persistence keys
     private let savedDevicesKey = "com.tidaldrift.savedDevices"
     private let lastScanDateKey = "com.tidaldrift.lastScanDate"
-    
+
     // Extended service types for better discovery
     private let serviceTypes: [String] = [
         "_rfb._tcp",           // VNC/Screen Sharing
@@ -39,30 +39,30 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         "_tidaldrop._tcp",     // TidalDrop Transfer
         "_tidaldrift-cast._udp" // LocalCast Transfer
     ]
-    
+
     private override init() {
         super.init()
         loadSavedDevices()
-        
+
         // Clean stale devices on startup (devices not seen in 5+ minutes)
         clearStaleDevices()
-        
+
         // Defer network setup to avoid blocking on init
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
             self?.setupNetworkMonitor()
             self?.startUDPListener()
         }
     }
-    
+
     func startUDPListener() {
         let params = NWParameters.udp
-        
+
         do {
             udpListener = try NWListener(using: params, on: 5903)
             udpListener?.stateUpdateHandler = { state in
                 if case .ready = state { print("🌊 UDP Listener: Ready on port 5903") }
             }
-            
+
             udpListener?.newConnectionHandler = { [weak self] connection in
                 connection.start(queue: self?.queue ?? .main)
                 self?.receiveMessages(on: connection)
@@ -72,7 +72,7 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             print("❌ UDP Listener: Initialization failed: \(error)")
         }
     }
-    
+
     private func receiveMessages(on connection: NWConnection) {
         connection.receiveMessage { [weak self] data, context, isComplete, error in
             if let data = data, !data.isEmpty {
@@ -81,7 +81,7 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
                     self?.markAsTidalDriftPeer(hostname: peerInfo.hostname, peerInfo: peerInfo)
                 }
             }
-            
+
             if error == nil {
                 self?.receiveMessages(on: connection)
             } else {
@@ -89,30 +89,31 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             }
         }
     }
-    
+
     // MARK: - Persistence
-    
+
     /// Load previously discovered devices from storage
     private func loadSavedDevices() {
         if let data = UserDefaults.standard.data(forKey: savedDevicesKey) {
             do {
                 let devices = try JSONDecoder().decode([DiscoveredDevice].self, from: data)
-                
-                // Load into cache with IP as key
+
+                // Load into cache by stable identity so DHCP changes do not
+                // create duplicate saved devices.
                 deviceCacheLock.lock()
                 for device in devices {
-                    deviceCache[device.ipAddress] = device
+                    deviceCache[cacheKey(for: device)] = device
                 }
                 deviceCacheLock.unlock()
-                
-                // Update published devices
-                discoveredDevices = devices.sorted { $0.name < $1.name }
-                
+
+                // Update published devices from the deduped cache.
+                discoveredDevices = Array(deviceCache.values).sorted { $0.name < $1.name }
+
                 // Load last scan date
                 if let scanDate = UserDefaults.standard.object(forKey: lastScanDateKey) as? Date {
                     lastScanDate = scanDate
                 }
-                
+
                 #if DEBUG
                 print("✅ Loaded \(devices.count) saved devices")
                 #endif
@@ -123,21 +124,21 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             }
         }
     }
-    
+
     /// Save current devices to storage
     private func saveDevices() {
         deviceCacheLock.lock()
         let devices = Array(deviceCache.values)
         deviceCacheLock.unlock()
-        
+
         do {
             let data = try JSONEncoder().encode(devices)
             UserDefaults.standard.set(data, forKey: savedDevicesKey)
-            
+
             if let scanDate = lastScanDate {
                 UserDefaults.standard.set(scanDate, forKey: lastScanDateKey)
             }
-            
+
             #if DEBUG
             print("💾 Saved \(devices.count) devices")
             #endif
@@ -147,7 +148,7 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             #endif
         }
     }
-    
+
     /// Clear all saved devices
     func clearSavedDevices() {
         deviceCacheLock.lock()
@@ -158,46 +159,46 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         UserDefaults.standard.removeObject(forKey: savedDevicesKey)
         UserDefaults.standard.removeObject(forKey: lastScanDateKey)
     }
-    
+
     /// Check if a device is stale (not seen recently)
     func isDeviceStale(_ device: DiscoveredDevice) -> Bool {
         let staleThreshold: TimeInterval = 24 * 60 * 60 // 24 hours
         return Date().timeIntervalSince(device.lastSeen) > staleThreshold
     }
-    
+
     /// Remove a specific device by IP
     func removeDevice(ipAddress: String) {
         deviceCacheLock.lock()
-        deviceCache.removeValue(forKey: ipAddress)
+        deviceCache = deviceCache.filter { $0.value.ipAddress != ipAddress }
         deviceCacheLock.unlock()
         updatePublishedDevices()
         saveDevices()
     }
-    
+
     /// Clear all stale devices (not seen recently) - includes peers
     /// Uses 2 minutes for TidalDrift peers, 5 minutes for other devices
     func clearStaleDevices() {
         let peerStaleThreshold: TimeInterval = 2 * 60 // 2 minutes for peers
         let deviceStaleThreshold: TimeInterval = 5 * 60 // 5 minutes for other devices
-        
+
         deviceCacheLock.lock()
         let staleIPs = deviceCache.filter { entry in
             let threshold = entry.value.isTidalDriftPeer ? peerStaleThreshold : deviceStaleThreshold
             return Date().timeIntervalSince(entry.value.lastSeen) > threshold
         }.map { $0.key }
-        
+
         for ip in staleIPs {
             deviceCache.removeValue(forKey: ip)
         }
         deviceCacheLock.unlock()
-        
+
         if !staleIPs.isEmpty {
             updatePublishedDevices()
             saveDevices()
             print("🧹 Cleared \(staleIPs.count) stale devices on startup/scan")
         }
     }
-    
+
     /// Clear ALL devices and rediscover (full reset)
     func clearAllAndRescan() {
         deviceCacheLock.lock()
@@ -206,11 +207,11 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         updatePublishedDevices()
         saveDevices()
         print("🧹 Cleared all devices - starting fresh discovery")
-        
+
         // Trigger fresh discovery
         refreshScan()
     }
-    
+
     private func setupNetworkMonitor() {
         pathMonitor = NWPathMonitor()
         pathMonitor?.pathUpdateHandler = { [weak self] path in
@@ -223,75 +224,75 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         }
         pathMonitor?.start(queue: queue)
     }
-    
+
     func startBrowsing() {
         guard browsers.isEmpty else { return }
-        
+
         for serviceType in serviceTypes {
             // Skip UDP services in NWBrowser - use NetServiceBrowser instead
             if serviceType.contains("_udp") {
                 logger.info("🌊 Skipping \(serviceType) for NWBrowser - will use NetServiceBrowser")
                 continue
             }
-            
+
             // Use parameters that enable better discovery
             let params = NWParameters()
             params.includePeerToPeer = true
-            
+
             // Try both local. domain and nil for broader discovery
             for domain in ["local.", ""] {
                 let actualDomain = domain.isEmpty ? nil : domain
                 let browser = NWBrowser(for: .bonjour(type: serviceType, domain: actualDomain), using: params)
-                
+
                 browser.stateUpdateHandler = { [weak self] state in
                     self?.handleBrowserState(state, for: serviceType)
                 }
-                
+
                 browser.browseResultsChangedHandler = { [weak self] results, changes in
                     self?.handleBrowseResults(results, changes: changes, serviceType: serviceType)
                 }
-                
+
                 browser.start(queue: queue)
                 browsers.append(browser)
             }
         }
-        
+
         // Use NetServiceBrowser for LocalCast (UDP) - more reliable
         startNetServiceBrowserForLocalCast()
-        
+
         lastScanDate = Date()
-        
+
         // Also do an initial ARP scan to find devices that might not advertise services
         Task {
             await scanARPTable()
         }
     }
-    
+
     /// Use dns-sd command for UDP service discovery (more reliable than NWBrowser/NetServiceBrowser for UDP)
     private var dnsSdBrowseProcess: Process?
-    
+
     private func startNetServiceBrowserForLocalCast() {
         logger.info("🌊 Starting dns-sd browse for _tidaldrift-cast._udp")
-        
+
         // Use dns-sd -B to browse for services
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/dns-sd")
         process.arguments = ["-B", "_tidaldrift-cast._udp", "local."]
-        
+
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
-        
+
         dnsSdBrowseProcess = process
-        
+
         // Read output asynchronously
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty, let output = String(data: data, encoding: .utf8) else { return }
-            
+
             self?.parseDnsSdBrowseOutput(output)
         }
-        
+
         do {
             try process.run()
             logger.info("🌊 dns-sd browse started (PID: \(process.processIdentifier))")
@@ -299,22 +300,22 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             logger.error("🌊 Failed to start dns-sd browse: \(error.localizedDescription)")
         }
     }
-    
+
     /// Parse dns-sd -B output to find LocalCast services
     private func parseDnsSdBrowseOutput(_ output: String) {
         // dns-sd -B output format:
         // Timestamp     A/R    Flags  if Domain               Service Type         Instance Name
         // 21:46:09.297  Add        3   1 local.               _tidaldrift-cast._udp. Eli's-MacBook-Pro
-        
+
         let lines = output.split(separator: "\n")
         for line in lines {
             let lineStr = String(line)
-            
+
             // Skip header lines
             if lineStr.contains("Timestamp") || lineStr.contains("STARTING") || lineStr.contains("DATE:") || lineStr.contains("Browsing for") {
                 continue
             }
-            
+
             // Look for "Add" lines
             if lineStr.contains("Add") && lineStr.contains("_tidaldrift-cast") {
                 // Extract the instance name (everything after the service type)
@@ -322,12 +323,12 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
                     let instanceName = String(lineStr[range.upperBound...]).trimmingCharacters(in: .whitespaces)
                     if !instanceName.isEmpty {
                         logger.info("🌊 dns-sd found LocalCast service: '\(instanceName)'")
-                        
+
                         // Try to match by name and resolve
                         DispatchQueue.main.async { [weak self] in
                             self?.markDeviceAsLocalCastHost(name: instanceName, authRequired: nil)
                         }
-                        
+
                         // Also resolve via dns-sd -L
                         resolveLocalCastViaDnsSd(name: instanceName)
                     }
@@ -335,30 +336,30 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             }
         }
     }
-    
+
     /// Resolve a LocalCast service using dns-sd -L
     private func resolveLocalCastViaDnsSd(name: String) {
         queue.async { [weak self] in
             guard let self = self else { return }
-            
+
             // Sanitize name to prevent shell injection from Bonjour advertisements
             let safeName = name.replacingOccurrences(of: "'", with: "").replacingOccurrences(of: "\\", with: "")
             let result = ShellExecutor.execute("timeout 5 dns-sd -L '\(safeName)' _tidaldrift-cast._udp local. 2>&1 | head -20")
-            
+
             self.logger.debug("dns-sd -L output for '\(name)': \(result.output)")
-            
+
             // Parse output for hostname - look for "can be reached at" or hostname.local.:port
             let lines = result.output.split(separator: "\n")
             for line in lines {
                 let lineStr = String(line)
-                
+
                 // Look for hostname pattern like "hostname.local.:5904"
                 if lineStr.contains(".local.") {
                     // Extract hostname using regex
                     if let hostMatch = lineStr.range(of: "[a-zA-Z0-9\\-]+\\.local\\.", options: .regularExpression) {
                         var hostname = String(lineStr[hostMatch])
                         hostname = hostname.replacingOccurrences(of: ".local.", with: "")
-                        
+
                         self.logger.info("🌊 dns-sd resolved '\(name)' to hostname: \(hostname)")
                         self.resolveHostnameAndMarkLocalCast(hostname, originalName: name, authRequired: nil)
                     }
@@ -366,73 +367,73 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             }
         }
     }
-    
+
     /// Scan ARP table for additional devices that might not advertise Bonjour services
     private func scanARPTable() async {
         let result = ShellExecutor.execute("arp -a")
         let lines = result.output.split(separator: "\n")
-        
+
         for line in lines {
             let lineStr = String(line)
-            
+
             // Parse: "? (192.168.1.100) at aa:bb:cc:dd:ee:ff on en0"
             if let ipRange = lineStr.range(of: "\\([0-9.]+\\)", options: .regularExpression) {
                 var ip = String(lineStr[ipRange])
                 ip = ip.trimmingCharacters(in: CharacterSet(charactersIn: "()"))
-                
+
                 // Skip broadcast and self
                 if ip.hasSuffix(".255") || ip.hasSuffix(".1") { continue }
-                
+
                 // Check if we already know this device
                 let knownIPs = await MainActor.run { discoveredDevices.map { $0.ipAddress } }
                 if knownIPs.contains(ip) { continue }
-                
+
                 // Try to discover services on this IP
                 await scanIPForAllServices(ip)
             }
         }
     }
-    
+
     func stopBrowsing() {
         browsers.forEach { $0.cancel() }
         browsers.removeAll()
-        
+
         // Also stop dns-sd browse for LocalCast
         if let process = dnsSdBrowseProcess, process.isRunning {
             process.terminate()
         }
         dnsSdBrowseProcess = nil
-        
+
         // Also stop NetServiceBrowser for LocalCast
         netServiceBrowser?.stop()
         netServiceBrowser = nil
         discoveredLocalCastServices.removeAll()
-        
+
         pathMonitor?.cancel()
         pathMonitor = nil
-        
+
         udpListener?.cancel()
         udpListener = nil
     }
-    
+
     func refreshScan() {
         stopBrowsing()
-        
+
         deviceCacheLock.lock()
         // Preserve TidalDrift peer info before clearing cache
         let tidalDriftPeers = deviceCache.filter { $0.value.isTidalDriftPeer }
-        
+
         deviceCache.removeAll()
-        
+
         // Restore TidalDrift peer entries (they'll be updated when rediscovered)
         for (key, device) in tidalDriftPeers {
             deviceCache[key] = device
         }
         deviceCacheLock.unlock()
-        
+
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             self?.startBrowsing()
-            
+
             // Also trigger TidalDrift peer re-discovery
             if AppState.shared.settings.peerDiscoveryEnabled {
                 // Restart peer discovery to re-sync
@@ -441,23 +442,23 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             }
         }
     }
-    
+
     func startPeriodicScanning(interval: TimeInterval) {
         stopPeriodicScanning()
-        
+
         startBrowsing()
-        
+
         scanTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             self?.refreshScan()
         }
     }
-    
+
     func stopPeriodicScanning() {
         scanTimer?.invalidate()
         scanTimer = nil
         stopBrowsing()
     }
-    
+
     private func handleBrowserState(_ state: NWBrowser.State, for serviceType: String) {
         switch state {
         case .ready:
@@ -472,14 +473,14 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             break
         }
     }
-    
+
     private func handleBrowseResults(_ results: Set<NWBrowser.Result>, changes: Set<NWBrowser.Result.Change>, serviceType: String) {
         let isLocalCastService = serviceType.contains("cast") || serviceType.contains("_tidaldrift-cast")
-        
+
         if isLocalCastService {
             logger.info("🌊 LocalCast browse: \(results.count) services found for \(serviceType)")
         }
-        
+
         for result in results {
             switch result.endpoint {
             case .service(let name, let type, let domain, _):
@@ -494,7 +495,7 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
                 break
             }
         }
-        
+
         for change in changes {
             switch change {
             case .removed(let result):
@@ -504,18 +505,18 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             }
         }
     }
-    
+
     /// Resolve LocalCast service using dns-sd command (more reliable for UDP)
     private func resolveLocalCastService(name: String, type: String, domain: String) {
         logger.info("🌊 Resolving LocalCast: '\(name)'")
-        
+
         // First try to match by name to existing devices
         markDeviceAsLocalCastHost(name: name, authRequired: nil)
-        
+
         // Also resolve via dns-sd to get the IP directly
         queue.async { [weak self] in
             guard let self = self else { return }
-            
+
             // Sanitize inputs to prevent shell injection from Bonjour advertisements
             let safeName = name.replacingOccurrences(of: "'", with: "").replacingOccurrences(of: "\\", with: "")
             let safeType2 = type.replacingOccurrences(of: "'", with: "").replacingOccurrences(of: "\\", with: "")
@@ -524,20 +525,20 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             let authRequired: Bool? =
                 result.output.contains("auth=1") ? true :
                 (result.output.contains("auth=0") ? false : nil)
-            
+
             // Parse output for host info - look for "can be reached at" or hostname
             let lines = result.output.split(separator: "\n")
             for line in lines {
                 let lineStr = String(line)
                 self.logger.debug("dns-sd output: \(lineStr)")
-                
+
                 // Look for hostname pattern like "hostname.local.:5904"
                 if lineStr.contains(".local.") || lineStr.contains("can be reached at") {
                     // Extract hostname
                     if let hostMatch = lineStr.range(of: "[a-zA-Z0-9-]+\\.local\\.", options: .regularExpression) {
                         let hostname = String(lineStr[hostMatch]).replacingOccurrences(of: ".local.", with: "")
                         self.logger.info("🌊 LocalCast hostname: \(hostname)")
-                        
+
                         // Resolve hostname to IP
                         self.resolveHostnameAndMarkLocalCast(hostname, originalName: name, authRequired: authRequired)
                     }
@@ -545,50 +546,54 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             }
         }
     }
-    
+
     /// Resolve hostname to IP and mark device as LocalCast host
     private func resolveHostnameAndMarkLocalCast(_ hostname: String, originalName: String, authRequired: Bool?) {
         let cleanHostname = hostname.hasSuffix(".local") ? hostname : "\(hostname).local"
-        
+
         var hints = addrinfo()
         hints.ai_family = AF_INET // IPv4
         hints.ai_socktype = SOCK_STREAM
-        
+
         var result: UnsafeMutablePointer<addrinfo>?
         let status = getaddrinfo(cleanHostname, nil, &hints, &result)
-        
+
         defer { if result != nil { freeaddrinfo(result) } }
-        
+
         guard status == 0, let addrInfo = result else {
             logger.warning("🌊 LocalCast: Failed to resolve hostname \(hostname)")
             return
         }
-        
+
         var addr = addrInfo.pointee.ai_addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
         var ipBuffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
         inet_ntop(AF_INET, &addr.sin_addr, &ipBuffer, socklen_t(INET_ADDRSTRLEN))
         let ipAddress = String(cString: ipBuffer)
-        
+
         logger.info("🌊 LocalCast resolved: \(hostname) -> \(ipAddress)")
-        
+
         // Mark device at this IP as LocalCast host
         DispatchQueue.main.async { [weak self] in
             self?.addLocalCastToDevice(ipAddress: ipAddress, name: originalName, authRequired: authRequired)
         }
     }
-    
+
     /// Add LocalCast service to a device by IP address
     private func addLocalCastToDevice(ipAddress: String, name: String, authRequired: Bool?) {
         deviceCacheLock.lock()
-        
-        if var device = deviceCache[ipAddress] {
+
+        if let existingKey = cacheKey(matchingIP: ipAddress), var device = deviceCache[existingKey] {
             if !device.services.contains(.localCast) {
                 device.services.insert(.localCast)
             }
             if let authRequired {
                 device.localCastAuthRequired = authRequired
             }
-            deviceCache[ipAddress] = device
+            let updatedKey = cacheKey(for: device)
+            deviceCache[updatedKey] = device
+            if updatedKey != existingKey {
+                deviceCache.removeValue(forKey: existingKey)
+            }
             logger.info("🌊 ✅ Added/updated LocalCast on existing device: \(device.name) at \(ipAddress), auth=\(authRequired.map(String.init(describing:)) ?? "unknown")")
         } else {
             // Create new device entry for this LocalCast host
@@ -601,14 +606,14 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
                 lastSeen: Date(),
                 localCastAuthRequired: authRequired
             )
-            deviceCache[ipAddress] = newDevice
+            deviceCache[cacheKey(for: newDevice)] = newDevice
             logger.info("🌊 ✅ Created new LocalCast device: \(displayName) at \(ipAddress), auth=\(authRequired.map(String.init(describing:)) ?? "unknown")")
         }
-        
+
         deviceCacheLock.unlock()
         updatePublishedDevices()
     }
-    
+
     /// Normalize a name for comparison (removes special chars, lowercases, etc)
     private func normalizeName(_ name: String) -> String {
         return name.lowercased()
@@ -622,14 +627,14 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             .filter { !$0.isEmpty }
             .joined(separator: " ")
     }
-    
+
     /// Mark a device as supporting LocalCast based on its advertised name
     private func markDeviceAsLocalCastHost(name: String, authRequired: Bool?) {
         let normalizedName = normalizeName(name)
-        
+
         deviceCacheLock.lock()
         var foundMatch = false
-        
+
         // Log all devices in cache for debugging
         logger.info("🌊 LocalCast matching: Looking for '\(name)' (normalized: '\(normalizedName)')")
         logger.info("🌊 LocalCast matching: Cache has \(self.deviceCache.count) devices:")
@@ -638,12 +643,12 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             let normalizedHostName = normalizeName(device.hostname)
             logger.info("🌊   - '\(device.name)' (\(ip)) [normalized: '\(normalizedDeviceName)', host: '\(normalizedHostName)']")
         }
-        
+
         // Find device by name match
         for (ip, var device) in deviceCache {
             let normalizedDeviceName = normalizeName(device.name)
             let normalizedHostName = normalizeName(device.hostname)
-            
+
             // Check for match (exact or substring)
             let isMatch = normalizedDeviceName == normalizedName ||
                          normalizedHostName == normalizedName ||
@@ -651,7 +656,7 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
                          normalizedName.contains(normalizedDeviceName) ||
                          normalizedHostName.contains(normalizedName) ||
                          normalizedName.contains(normalizedHostName)
-            
+
             if isMatch {
                 if !device.services.contains(.localCast) {
                     device.services.insert(.localCast)
@@ -664,9 +669,9 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
                 foundMatch = true
             }
         }
-        
+
         deviceCacheLock.unlock()
-        
+
         if foundMatch {
             DispatchQueue.main.async { [weak self] in
                 self?.updatePublishedDevices()
@@ -675,25 +680,25 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             logger.warning("🌊 No device match for LocalCast name: '\(name)' - will try to resolve hostname")
         }
     }
-    
+
     private func resolveService(name: String, type: String, domain: String, serviceType: String) {
         // Method 1: Use NWConnection to resolve
         // Use UDP parameters for UDP services, TCP for others
         let isUDPService = type.contains("_udp")
         let params = isUDPService ? NWParameters.udp : NWParameters.tcp
         params.includePeerToPeer = true
-        
+
         print("🌊 Discovery: Resolving \(name) type:\(type) (UDP: \(isUDPService))")
-        
+
         let endpoint = NWEndpoint.service(name: name, type: type, domain: domain, interface: nil)
         let connection = NWConnection(to: endpoint, using: params)
         let connectionId = UUID()
-        
+
         // Store connection to prevent premature deallocation
         connectionsLock.lock()
         activeConnections[connectionId] = connection
         connectionsLock.unlock()
-        
+
         connection.stateUpdateHandler = { [weak self] state in
             switch state {
             case .ready:
@@ -714,14 +719,14 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
                 break
             }
         }
-        
+
         connection.start(queue: queue)
-        
+
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
             self?.connectionsLock.lock()
             let conn = self?.activeConnections[connectionId]
             self?.connectionsLock.unlock()
-            
+
             if let conn = conn, conn.state != .ready && conn.state != .cancelled {
                 // Timeout - try fallback
                 self?.resolveServiceViaDNSSD(name: name, type: type, domain: domain, serviceType: serviceType)
@@ -729,7 +734,7 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             }
         }
     }
-    
+
     private func cleanupConnection(id: UUID) {
         connectionsLock.lock()
         if let connection = activeConnections[id] {
@@ -738,7 +743,7 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         }
         connectionsLock.unlock()
     }
-    
+
     /// Fallback resolution using dns-sd command
     private func resolveServiceViaDNSSD(name: String, type: String, domain: String, serviceType: String) {
         // Sanitize inputs to prevent command injection
@@ -746,11 +751,11 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         // Service type should only contain alphanumeric, underscore, hyphen, period
         let safeType = type.filter { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" || $0 == "." }
         let safeDomain = domain.filter { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" || $0 == "." }
-        
+
         guard !safeType.isEmpty else { return }
-        
+
         let result = ShellExecutor.execute("timeout 2 dns-sd -L '\(escapedName)' '\(safeType)' '\(safeDomain)' 2>/dev/null | head -5")
-        
+
         // Parse output for host info
         // Example: "hostname.local.:5900"
         let lines = result.output.split(separator: "\n")
@@ -766,39 +771,39 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             }
         }
     }
-    
+
     /// Resolve a hostname to IP address
     private func resolveHostname(_ hostname: String, name: String, serviceType: String) {
         let cleanHostname = hostname.trimmingCharacters(in: CharacterSet(charactersIn: "."))
-        
+
         var hints = addrinfo()
         hints.ai_family = AF_INET // IPv4
         hints.ai_socktype = SOCK_STREAM
-        
+
         var result: UnsafeMutablePointer<addrinfo>?
         let status = getaddrinfo(cleanHostname, nil, &hints, &result)
-        
+
         defer { freeaddrinfo(result) }
-        
+
         guard status == 0, let addrInfo = result else { return }
-        
+
         var addr = addrInfo.pointee.ai_addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
         var ipBuffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
         inet_ntop(AF_INET, &addr.sin_addr, &ipBuffer, socklen_t(INET_ADDRSTRLEN))
         let ipAddress = String(cString: ipBuffer)
-        
+
         let service = mapServiceType(serviceType)
         DispatchQueue.main.async { [weak self] in
             self?.addOrUpdateDevice(name: name, ipAddress: ipAddress, port: 5900, service: service)
         }
     }
-    
+
     private func extractIPAddress(from endpoint: NWEndpoint, name: String, serviceType: String) {
         guard case .hostPort(let host, let port) = endpoint else { return }
-        
+
         let portNumber = Int(port.rawValue)
         let service = mapServiceType(serviceType)
-        
+
         switch host {
         case .ipv4(let addr):
             let ipAddress = cleanIPAddress("\(addr)")
@@ -826,7 +831,7 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             break
         }
     }
-    
+
     /// Remove interface suffix from IP addresses (e.g., "192.168.1.125%en0" -> "192.168.1.125")
     private func cleanIPAddress(_ ip: String) -> String {
         if let percentIndex = ip.firstIndex(of: "%") {
@@ -834,43 +839,51 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         }
         return ip
     }
-    
+
+    private func cacheKey(for device: DiscoveredDevice) -> String {
+        device.discoveryKey
+    }
+
+    private func cacheKey(matchingIP ipAddress: String) -> String? {
+        deviceCache.first { $0.value.ipAddress == ipAddress }?.key
+    }
+
     private func resolveHostnameToIP(_ hostname: String, completion: @escaping (String?) -> Void) {
         // Use getaddrinfo to resolve hostname to IP
         queue.async {
             var hints = addrinfo()
             hints.ai_family = AF_INET  // Prefer IPv4
             hints.ai_socktype = SOCK_STREAM
-            
+
             var result: UnsafeMutablePointer<addrinfo>?
             let status = getaddrinfo(hostname, nil, &hints, &result)
-            
+
             defer {
                 if result != nil {
                     freeaddrinfo(result)
                 }
             }
-            
+
             guard status == 0, let addrInfo = result else {
                 // Try IPv6 if IPv4 fails
                 var hints6 = addrinfo()
                 hints6.ai_family = AF_INET6
                 hints6.ai_socktype = SOCK_STREAM
-                
+
                 var result6: UnsafeMutablePointer<addrinfo>?
                 let status6 = getaddrinfo(hostname, nil, &hints6, &result6)
-                
+
                 defer {
                     if result6 != nil {
                         freeaddrinfo(result6)
                     }
                 }
-                
+
                 guard status6 == 0, let addrInfo6 = result6 else {
                     completion(nil)
                     return
                 }
-                
+
                 // Extract IPv6 address
                 if let sockaddr = addrInfo6.pointee.ai_addr {
                     var ipBuffer = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
@@ -887,7 +900,7 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
                 completion(nil)
                 return
             }
-            
+
             // Extract IPv4 address
             if let sockaddr = addrInfo.pointee.ai_addr {
                 var ipBuffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
@@ -901,11 +914,11 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
                     return
                 }
             }
-            
+
             completion(nil)
         }
     }
-    
+
     private func mapServiceType(_ type: String) -> DiscoveredDevice.ServiceType? {
         let service: DiscoveredDevice.ServiceType?
         switch type {
@@ -929,18 +942,32 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         }
         return service
     }
-    
+
     private func addOrUpdateDevice(name: String, ipAddress: String, port: Int, service: DiscoveredDevice.ServiceType?) {
-        // Use IP as primary key to avoid duplicates
-        let cacheKey = ipAddress
-        
+        var services: Set<DiscoveredDevice.ServiceType> = []
+        if let service {
+            services.insert(service)
+        }
+        let incomingDevice = DiscoveredDevice(
+            name: name,
+            hostname: "\(name).local",
+            ipAddress: ipAddress,
+            services: services,
+            lastSeen: Date(),
+            port: port
+        )
+        let newCacheKey = cacheKey(for: incomingDevice)
+
         if service == .localCast {
             print("🌊 Discovery: Adding LocalCast service for \(name) at \(ipAddress)")
         }
-        
+
         deviceCacheLock.lock()
-        if var existingDevice = deviceCache[cacheKey] {
+        let existingKey = deviceCache[newCacheKey] != nil ? newCacheKey : cacheKey(matchingIP: ipAddress)
+        if let existingKey, var existingDevice = deviceCache[existingKey] {
             existingDevice.lastSeen = Date()
+            existingDevice.ipAddress = ipAddress
+            existingDevice.port = port
             if let service = service {
                 let wasAdded = existingDevice.services.insert(service).inserted
                 if service == .localCast && wasAdded {
@@ -952,28 +979,19 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
                 existingDevice.name = name
                 existingDevice.hostname = "\(name).local"
             }
-            deviceCache[cacheKey] = existingDevice
-        } else {
-            var services: Set<DiscoveredDevice.ServiceType> = []
-            if let service = service {
-                services.insert(service)
+            let updatedKey = cacheKey(for: existingDevice)
+            deviceCache[updatedKey] = existingDevice
+            if updatedKey != existingKey {
+                deviceCache.removeValue(forKey: existingKey)
             }
-            
-            let newDevice = DiscoveredDevice(
-                name: name,
-                hostname: "\(name).local",
-                ipAddress: ipAddress,
-                services: services,
-                lastSeen: Date(),
-                port: port
-            )
-            deviceCache[cacheKey] = newDevice
+        } else {
+            deviceCache[newCacheKey] = incomingDevice
         }
         deviceCacheLock.unlock()
-        
+
         updatePublishedDevices()
     }
-    
+
     private func handleDeviceRemoved(_ result: NWBrowser.Result) {
         switch result.endpoint {
         case .service(let name, _, _, _):
@@ -986,7 +1004,7 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             break
         }
     }
-    
+
     /// Coalesces rapid device-cache mutations into a single sort + publish + save.
     private func updatePublishedDevices() {
         publishDebounceWorkItem?.cancel()
@@ -998,7 +1016,7 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
                 return a.displayName.localizedCaseInsensitiveCompare(b.displayName) == .orderedAscending
             }
             self.deviceCacheLock.unlock()
-            
+
             DispatchQueue.main.async { [weak self] in
                 self?.discoveredDevices = devices
                 self?.saveDevices()
@@ -1007,7 +1025,7 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         publishDebounceWorkItem = work
         queue.asyncAfter(deadline: .now() + 0.2, execute: work)
     }
-    
+
     func addManualDevice(name: String, ipAddress: String, port: Int = 5900, services: Set<DiscoveredDevice.ServiceType> = [.screenSharing]) {
         let device = DiscoveredDevice(
             name: name,
@@ -1015,47 +1033,52 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             ipAddress: ipAddress,
             services: services,
             lastSeen: Date(),
+            savedCredentialRef: "ip-\(ipAddress)",
             port: port
         )
-        
-        let cacheKey = ipAddress
+
         deviceCacheLock.lock()
-        deviceCache[cacheKey] = device
+        deviceCache[cacheKey(for: device)] = device
         deviceCacheLock.unlock()
         updatePublishedDevices()
     }
-    
+
     /// Mark a device as a TidalDrift peer with enhanced info from TidalDriftPeerService
     func markAsTidalDriftPeer(hostname: String, peerInfo: TidalDriftPeerService.PeerInfo) {
         print("🌊 TidalDrift PEER: Attempting to mark '\(hostname)' at \(peerInfo.ipAddress) as peer")
-        
+
         DispatchQueue.main.async {
             // Normalize input hostname
             let inputHostname = hostname.lowercased().replacingOccurrences(of: ".local", with: "")
             let inputIP = peerInfo.ipAddress
-            
+            let inputPeerId = peerInfo.peerId
+
             self.deviceCacheLock.lock()
-            
+
             // Check cache directly first
             var matchedIP: String?
-            
-            // Match by IP
-            if !inputIP.isEmpty && self.deviceCache[inputIP] != nil {
-                matchedIP = inputIP
+
+            // Match by stable peer identity first, then by current IP, then by hostname.
+            if let inputPeerId, !inputPeerId.isEmpty,
+               let existing = self.deviceCache.first(where: { $0.value.peerId == inputPeerId }) {
+                matchedIP = existing.key
+            } else if !inputIP.isEmpty,
+                      let existing = self.deviceCache.first(where: { $0.value.ipAddress == inputIP }) {
+                matchedIP = existing.key
             } else {
                 // Match by hostname or name in cache
                 for (ip, device) in self.deviceCache {
                     let dName = device.name.lowercased()
                     let dHost = device.hostname.lowercased().replacingOccurrences(of: ".local", with: "")
-                    
-                    if dName == inputHostname || dHost == inputHostname || 
+
+                    if dName == inputHostname || dHost == inputHostname ||
                        dName.contains(inputHostname) || inputHostname.contains(dName) {
                         matchedIP = ip
                         break
                     }
                 }
             }
-            
+
             if let ip = matchedIP, var device = self.deviceCache[ip] {
                 device.isTidalDriftPeer = true
                 device.services.insert(.ssh)
@@ -1068,13 +1091,18 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
                 device.peerUserName = peerInfo.userName
                 device.peerUptimeHours = peerInfo.uptimeHours
                 device.peerTidalDriftName = peerInfo.tidalDriftName
-                
+                device.peerId = peerInfo.peerId
+
                 // Keep the most accurate IP
                 if !inputIP.isEmpty && inputIP != "Unknown" {
                     device.ipAddress = inputIP
                 }
-                
-                self.deviceCache[device.ipAddress] = device
+
+                let updatedKey = self.cacheKey(for: device)
+                if ip != updatedKey {
+                    self.deviceCache.removeValue(forKey: ip)
+                }
+                self.deviceCache[updatedKey] = device
                 self.deviceCacheLock.unlock()
                 print("🌊 TidalDrift PEER: ✅ Updated cache entry '\(device.displayName)' as peer")
             } else {
@@ -1095,21 +1123,22 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
                     peerMacOSVersion: peerInfo.macOSVersion,
                     peerUserName: peerInfo.userName,
                     peerUptimeHours: peerInfo.uptimeHours,
-                    peerTidalDriftName: peerInfo.tidalDriftName
+                    peerTidalDriftName: peerInfo.tidalDriftName,
+                    peerId: peerInfo.peerId
                 )
-                self.deviceCache[newDevice.ipAddress] = newDevice
+                self.deviceCache[self.cacheKey(for: newDevice)] = newDevice
                 self.deviceCacheLock.unlock()
                 print("🌊 TidalDrift PEER: ✅ Created new device entry for peer '\(displayName)'")
             }
             self.updatePublishedDevices()
         }
     }
-    
+
     // MARK: - Active IP Scanning (for VPNs and when Bonjour fails)
-    
+
     @Published var isScanningSubnet: Bool = false
     @Published var scanProgress: Double = 0
-    
+
     /// Scan a specific IP address for screen sharing service
     func scanIP(_ ipAddress: String, port: Int = 5900) async -> Bool {
         return await withCheckedContinuation { continuation in
@@ -1117,14 +1146,14 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             let port = NWEndpoint.Port(rawValue: UInt16(port))!
             let connection = NWConnection(host: host, port: port, using: .tcp)
             let connectionId = UUID()
-            
+
             // Store connection to prevent premature deallocation
             self.connectionsLock.lock()
             self.activeConnections[connectionId] = connection
             self.connectionsLock.unlock()
-            
+
             let didResume = AtomicFlag()
-            
+
             connection.stateUpdateHandler = { [weak self] state in
                 switch state {
                 case .ready:
@@ -1142,7 +1171,7 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
                     self?.connectionsLock.lock()
                     self?.activeConnections.removeValue(forKey: connectionId)
                     self?.connectionsLock.unlock()
-                    
+
                     // Resume if not already done (timeout case)
                     guard !didResume.value else { return }
                     didResume.value = true
@@ -1151,9 +1180,9 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
                     break
                 }
             }
-            
+
             connection.start(queue: self.queue)
-            
+
             // 2 second timeout per IP
             DispatchQueue.global().asyncAfter(deadline: .now() + 2) { [weak self] in
                 guard !didResume.value else { return }
@@ -1163,17 +1192,17 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             }
         }
     }
-    
+
     /// Scan a range of IPs (e.g., 192.168.1.1 to 192.168.1.254)
     func scanSubnet(baseIP: String, startHost: Int = 1, endHost: Int = 254) async {
         await MainActor.run {
             isScanningSubnet = true
             scanProgress = 0.01 // Show immediate progress
-            
+
             // Clear stale devices (including old peers) before fresh scan
             clearStaleDevices()
         }
-        
+
         // Parse base IP (e.g., "192.168.1" from "192.168.1.100")
         let components = baseIP.split(separator: ".")
         guard components.count >= 3 else {
@@ -1181,40 +1210,40 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             return
         }
         let subnet = components.prefix(3).joined(separator: ".")
-        
+
         // Get the current host number to prioritize nearby IPs
         let currentHost = Int(components.last ?? "1") ?? 1
-        
+
         // Reorder to scan nearby IPs first (more likely to find devices quickly)
         var hostsToScan = Array(startHost...endHost)
         hostsToScan.sort { abs($0 - currentHost) < abs($1 - currentHost) }
-        
+
         let totalIPs = hostsToScan.count
-        
+
         // Track which IPs responded during this scan
         final class ScanTracker: @unchecked Sendable {
             var scannedCount: Int = 0
             var respondedIPs: Set<String> = []
             let lock = NSLock()
-            
+
             func addRespondedIP(_ ip: String) {
                 lock.lock()
                 respondedIPs.insert(ip)
                 lock.unlock()
             }
-            
+
             func incrementScanned() {
                 lock.lock()
                 scannedCount += 1
                 lock.unlock()
             }
-            
+
             func getScannedCount() -> Int {
                 lock.lock()
                 defer { lock.unlock() }
                 return scannedCount
             }
-            
+
             func getRespondedIPs() -> Set<String> {
                 lock.lock()
                 defer { lock.unlock() }
@@ -1222,7 +1251,7 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             }
         }
         let tracker = ScanTracker()
-        
+
         // Structure to hold scan results for an IP
         struct ScanResult: Sendable {
             let ip: String
@@ -1231,13 +1260,13 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             let hasAFP: Bool
             let hasSSH: Bool
         }
-        
+
         // Scan in batches, processing nearby IPs first for faster initial results
         let batchSize = 25 // Larger batches for faster scanning
         for batchStart in stride(from: 0, to: hostsToScan.count, by: batchSize) {
             let batchEnd = min(batchStart + batchSize, hostsToScan.count)
             let batch = Array(hostsToScan[batchStart..<batchEnd])
-            
+
             await withTaskGroup(of: ScanResult.self) { group in
                 for hostNum in batch {
                     let ip = "\(subnet).\(hostNum)"
@@ -1246,11 +1275,11 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
                         async let screenShare = self.scanIP(ip, port: 5900)
                         async let fileShare = self.scanIP(ip, port: 445)
                         async let afp = self.scanIP(ip, port: 548)
-                        
+
                         // Only scan for SSH if enabled in settings
                         let shouldScanSSH = await MainActor.run { AppState.shared.settings.sshDiscoveryEnabled }
                         async let ssh = shouldScanSSH ? self.scanIP(ip, port: 22) : false
-                        
+
                         return ScanResult(
                             ip: ip,
                             hasScreenSharing: await screenShare,
@@ -1260,19 +1289,19 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
                         )
                     }
                 }
-                
+
                 for await result in group {
                     tracker.incrementScanned()
                     await MainActor.run {
                         scanProgress = Double(tracker.getScannedCount()) / Double(totalIPs)
                     }
-                    
+
                     let hasAnyService = result.hasScreenSharing || result.hasFileSharing || result.hasAFP || result.hasSSH
-                    
+
                     if hasAnyService {
                         tracker.addRespondedIP(result.ip)
                         let name = self.getHostname(for: result.ip) ?? "Mac at \(result.ip)"
-                        
+
                         await MainActor.run {
                             if result.hasScreenSharing {
                                 self.addOrUpdateDevice(name: name, ipAddress: result.ip, port: 5900, service: .screenSharing)
@@ -1291,7 +1320,7 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
                 }
             }
         }
-        
+
         // After scan completes, remove devices on this subnet that didn't respond
         // (but keep TidalDrift peers and manually added devices)
         let respondedIPs = tracker.getRespondedIPs()
@@ -1301,27 +1330,27 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             scanProgress = 1.0
         }
     }
-    
+
     /// Remove devices on the given subnet that didn't respond during scan
     /// Preserves TidalDrift peers (they're discovered via Bonjour, not port scan)
     private func removeUnresponsiveDevices(onSubnet subnet: String, respondedIPs: Set<String>) {
         var devicesToRemove: [String] = []
-        
+
         deviceCacheLock.lock()
-        for (ip, device) in deviceCache {
+        for (key, device) in deviceCache {
             // Skip if not on the scanned subnet
-            guard ip.hasPrefix(subnet + ".") else { continue }
-            
+            guard device.ipAddress.hasPrefix(subnet + ".") else { continue }
+
             // Skip TidalDrift peers - they may not have open ports but are valid
             if device.isTidalDriftPeer { continue }
-            
+
             // Skip if this IP responded during the scan
-            if respondedIPs.contains(ip) { continue }
-            
+            if respondedIPs.contains(device.ipAddress) { continue }
+
             // This device is on our subnet but didn't respond - mark for removal
-            devicesToRemove.append(ip)
+            devicesToRemove.append(key)
         }
-        
+
         // Remove unresponsive devices
         for ip in devicesToRemove {
             deviceCache.removeValue(forKey: ip)
@@ -1330,7 +1359,7 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             #endif
         }
         deviceCacheLock.unlock()
-        
+
         if !devicesToRemove.isEmpty {
             updatePublishedDevices()
             #if DEBUG
@@ -1338,7 +1367,7 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             #endif
         }
     }
-    
+
     /// Scan common ports on a single IP
     func scanIPForAllServices(_ ipAddress: String) async {
         // Check VNC (screen sharing)
@@ -1348,7 +1377,7 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
                 addOrUpdateDevice(name: name, ipAddress: ipAddress, port: 5900, service: .screenSharing)
             }
         }
-        
+
         // Check SMB (file sharing)
         if await scanIP(ipAddress, port: 445) {
             let name = getHostname(for: ipAddress) ?? "Mac at \(ipAddress)"
@@ -1356,7 +1385,7 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
                 addOrUpdateDevice(name: name, ipAddress: ipAddress, port: 445, service: .fileSharing)
             }
         }
-        
+
         // Check AFP
         if await scanIP(ipAddress, port: 548) {
             let name = getHostname(for: ipAddress) ?? "Mac at \(ipAddress)"
@@ -1375,17 +1404,17 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             }
         }
     }
-    
+
     private func getHostname(for ipAddress: String) -> String? {
         var hints = addrinfo()
         hints.ai_flags = AI_NUMERICHOST
-        
+
         var result: UnsafeMutablePointer<addrinfo>?
         guard getaddrinfo(ipAddress, nil, &hints, &result) == 0, let addrInfo = result else {
             return nil
         }
         defer { freeaddrinfo(result) }
-        
+
         var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
         let error = getnameinfo(
             addrInfo.pointee.ai_addr,
@@ -1396,7 +1425,7 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             0,
             0
         )
-        
+
         if error == 0 {
             let name = String(cString: hostname)
             // Return nil if it just returned the IP back
@@ -1407,70 +1436,70 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         }
         return nil
     }
-    
+
     // MARK: - NetServiceBrowserDelegate (for LocalCast UDP discovery)
-    
+
     private var discoveredLocalCastServices: [NetService] = []
-    
+
     func netServiceBrowserWillSearch(_ browser: NetServiceBrowser) {
         logger.info("🌊 NetServiceBrowser: Started searching for LocalCast services")
     }
-    
+
     func netServiceBrowserDidStopSearch(_ browser: NetServiceBrowser) {
         logger.info("🌊 NetServiceBrowser: Stopped searching")
     }
-    
+
     func netServiceBrowser(_ browser: NetServiceBrowser, didNotSearch errorDict: [String : NSNumber]) {
         logger.error("🌊 NetServiceBrowser: Failed to search - \(errorDict)")
     }
-    
+
     func netServiceBrowser(_ browser: NetServiceBrowser, didFind service: NetService, moreComing: Bool) {
         logger.info("🌊 NetServiceBrowser: Found LocalCast service '\(service.name)' type:\(service.type)")
-        
+
         // Store and resolve the service
         discoveredLocalCastServices.append(service)
         service.delegate = self
         service.resolve(withTimeout: 10.0)
-        
+
         // Also try to match by name immediately
         markDeviceAsLocalCastHost(name: service.name, authRequired: nil)
     }
-    
+
     func netServiceBrowser(_ browser: NetServiceBrowser, didRemove service: NetService, moreComing: Bool) {
         logger.info("🌊 NetServiceBrowser: LocalCast service removed '\(service.name)'")
         discoveredLocalCastServices.removeAll { $0.name == service.name }
-        
+
         // TODO: Could remove LocalCast capability from device, but leave for now
     }
-    
+
     // MARK: - NetServiceDelegate (for LocalCast service resolution)
-    
+
     func netServiceDidResolveAddress(_ sender: NetService) {
         logger.info("🌊 NetService: Resolved '\(sender.name)' - host: \(sender.hostName ?? "nil"), port: \(sender.port)")
-        
+
         // Get IP addresses from the resolved addresses
         if let addresses = sender.addresses {
             for addressData in addresses {
                 if let ipAddress = extractIPAddress(from: addressData) {
                     logger.info("🌊 NetService: LocalCast '\(sender.name)' at IP: \(ipAddress)")
-                    
+
                     DispatchQueue.main.async { [weak self] in
                         self?.addLocalCastToDevice(ipAddress: ipAddress, name: sender.name, authRequired: nil)
                     }
                 }
             }
         }
-        
+
         // Also try hostname resolution
         if let hostname = sender.hostName?.replacingOccurrences(of: ".local.", with: "") {
             resolveHostnameAndMarkLocalCast(hostname, originalName: sender.name, authRequired: nil)
         }
     }
-    
+
     func netService(_ sender: NetService, didNotResolve errorDict: [String : NSNumber]) {
         logger.error("🌊 NetService: Failed to resolve '\(sender.name)' - \(errorDict)")
     }
-    
+
     /// Extract IPv4 address from sockaddr data
     private func extractIPAddress(from addressData: Data) -> String? {
         var storage = sockaddr_storage()
@@ -1480,7 +1509,7 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
                 memcpy(&storage, sockaddr, min(addressData.count, MemoryLayout<sockaddr_storage>.size))
             }
         }
-        
+
         // Check for IPv4
         if storage.ss_family == UInt8(AF_INET) {
             var addr = withUnsafePointer(to: &storage) {
@@ -1489,14 +1518,14 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
             inet_ntop(AF_INET, &addr.sin_addr, &buffer, socklen_t(INET_ADDRSTRLEN))
             let ip = String(cString: buffer)
-            
+
             // Skip localhost
             if ip.hasPrefix("127.") {
                 return nil
             }
             return ip
         }
-        
+
         return nil
     }
 }

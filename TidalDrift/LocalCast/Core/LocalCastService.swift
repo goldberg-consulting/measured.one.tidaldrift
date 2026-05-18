@@ -166,7 +166,7 @@ class LocalCastService: ObservableObject {
         let session = HostSession(configuration: configuration, password: hostPassword)
         try await session.start(target: target)
 
-        advertiseLocalCast(port: LocalCastConfiguration.hostPort)
+        advertiseLocalCast(port: LocalCastConfiguration.hostPort, authEnabled: hostPassword != nil)
 
         self.hostSession = session
         self.isHosting = true
@@ -190,7 +190,7 @@ class LocalCastService: ObservableObject {
         logger.info("Hosting stopped")
     }
 
-    private func advertiseLocalCast(port: UInt16) {
+    private func advertiseLocalCast(port: UInt16, authEnabled: Bool) {
         let displayName = NetworkUtils.sanitizedComputerName
         stopAdvertisement()
 
@@ -205,7 +205,7 @@ class LocalCastService: ObservableObject {
             "codec=\(codec)",
             "fps=\(configuration.targetFrameRate)",
             "ip=\(ip)",
-            "auth=\(configuration.requireAuthentication ? "1" : "0")"
+            "auth=\(authEnabled ? "1" : "0")"
         ]
 
         let pipe = Pipe()
@@ -236,7 +236,7 @@ class LocalCastService: ObservableObject {
         // If no password was provided, try to auto-fill from saved credentials
         var resolvedPassword = password
         if resolvedPassword == nil || resolvedPassword?.isEmpty == true {
-            if let creds = try? KeychainService.shared.getCredential(for: device.stableId) {
+            if let creds = try? KeychainService.shared.getCredential(for: device) {
                 resolvedPassword = creds.password
                 logger.info("🔐 Using saved credentials for \(device.name)")
             }

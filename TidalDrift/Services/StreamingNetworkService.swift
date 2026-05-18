@@ -222,6 +222,19 @@ class StreamingNetworkService: ObservableObject, @unchecked Sendable {
     
     nonisolated private func handleRequest(_ data: Data, on connection: NWConnection) {
         guard let request = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) else { return }
+        if request.hasPrefix("FOCUS|") {
+            let bundleId = String(request.dropFirst("FOCUS|".count))
+            Task { @MainActor in
+                let appIsAdvertised = AppStreamingService.shared.availableApps.contains {
+                    $0.bundleIdentifier == bundleId
+                }
+                let runningApp = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId).first
+                let success = appIsAdvertised && (runningApp?.activate(options: [.activateIgnoringOtherApps]) ?? false)
+                let response = Data((success ? "OK" : "FAILED").utf8)
+                connection.send(content: response, completion: .contentProcessed { _ in })
+            }
+            return
+        }
         
         switch request {
         case "LIST_APPS":

@@ -97,7 +97,7 @@ struct DeviceCardView: View {
     
     /// Look up saved password for this device from Keychain.
     private var savedDevicePassword: String? {
-        guard let creds = try? KeychainService.shared.getCredential(for: device.stableId) else {
+        guard let creds = try? KeychainService.shared.getCredential(for: device) else {
             return nil
         }
         return creds.password.isEmpty ? nil : creds.password
@@ -115,6 +115,7 @@ struct DeviceCardView: View {
     private func connectLocalCast(password: String?) {
         Task {
             do {
+                await WakeOnLANService.shared.prepareForConnection(to: device, service: .localCast)
                 let viewer = try await LocalCastService.shared.connect(to: device, password: password)
                 await MainActor.run {
                     viewer.showWindow(nil)

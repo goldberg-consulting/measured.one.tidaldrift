@@ -409,7 +409,7 @@ struct MenuBarDeviceRow: View {
     }
     
     private var savedDevicePassword: String? {
-        guard let creds = try? KeychainService.shared.getCredential(for: device.stableId) else {
+        guard let creds = try? KeychainService.shared.getCredential(for: device) else {
             return nil
         }
         return creds.password.isEmpty ? nil : creds.password
@@ -452,7 +452,10 @@ struct MenuBarDeviceRow: View {
                     HStack(spacing: 4) {
                         QuickActionIcon(icon: "display", color: .blue, tooltip: "Screen Share (VNC)") {
                             dismissPopoverAndRun {
-                                Task { try? await ScreenShareConnectionService.shared.connect(to: device) }
+                                Task {
+                                    await WakeOnLANService.shared.prepareForConnection(to: device, service: .screenSharing)
+                                    try? await ScreenShareConnectionService.shared.connect(to: device)
+                                }
                             }
                         }
                         
@@ -464,14 +467,20 @@ struct MenuBarDeviceRow: View {
                         
                         QuickActionIcon(icon: "folder", color: .orange, tooltip: "File Share") {
                             dismissPopoverAndRun {
-                                Task { try? await ScreenShareConnectionService.shared.connectToFileShare(device: device) }
+                                Task {
+                                    await WakeOnLANService.shared.prepareForConnection(to: device, service: .fileSharing)
+                                    try? await ScreenShareConnectionService.shared.connectToFileShare(device: device)
+                                }
                             }
                         }
                         
                         if showSSH {
                             QuickActionIcon(icon: "terminal", color: .green, tooltip: "SSH") {
                                 dismissPopoverAndRun {
-                                    ScreenShareConnectionService.shared.connectToSSH(device: device)
+                                    Task {
+                                        await WakeOnLANService.shared.prepareForConnection(to: device, service: .ssh)
+                                        ScreenShareConnectionService.shared.connectToSSH(device: device)
+                                    }
                                 }
                             }
                         }
@@ -521,6 +530,7 @@ struct MenuBarDeviceRow: View {
         let password = savedDevicePassword
         Task {
             do {
+                await WakeOnLANService.shared.prepareForConnection(to: device, service: .localCast)
                 let controller = try await LocalCastService.shared.connect(to: device, password: password)
                 await MainActor.run {
                     NSApp.activate(ignoringOtherApps: true)

@@ -12,59 +12,76 @@ class DeviceDetailViewModel: ObservableObject {
     @Published var connectionMode: ScreenShareMode = .control
     @Published var isTestingConnection: Bool = false
     @Published var connectionTestResult: Bool?
-    
+    @Published var credentialError: String?
+
     init(device: DiscoveredDevice) {
         self.device = device
         loadSavedCredentials()
     }
-    
+
     var isTrusted: Bool {
         AppState.shared.isDeviceTrusted(device.id)
     }
-    
+
     var hasCredentials: Bool {
-        KeychainService.shared.hasCredential(for: device.stableId)
+        KeychainService.shared.hasCredential(for: device)
     }
-    
+
     var connectionHistory: [ConnectionRecord] {
         AppState.shared.connectionHistory.filter { $0.deviceId == device.id }
     }
-    
+
     func toggleTrust() {
         AppState.shared.toggleDeviceTrust(device.id)
         objectWillChange.send()
     }
-    
+
     func loadSavedCredentials() {
-        if let credentials = try? KeychainService.shared.getCredential(for: device.stableId) {
+        do {
+            guard let credentials = try KeychainService.shared.getCredential(for: device) else {
+                return
+            }
             username = credentials.username
             password = credentials.password
+            credentialError = nil
+        } catch KeychainError.authenticationFailed {
+            credentialError = "Credential access was cancelled. Retry to use the saved password."
+        } catch {
+            credentialError = error.localizedDescription
         }
     }
-    
+
     func saveCredentialsIfNeeded() {
         if saveCredentials && !username.isEmpty {
-            try? KeychainService.shared.saveCredential(
-                for: device.stableId,
-                username: username,
-                password: password
-            )
+            do {
+                try KeychainService.shared.saveCredential(for: device, username: username, password: password)
+                credentialError = nil
+            } catch {
+                credentialError = error.localizedDescription
+            }
         }
     }
-    
+
     func deleteCredentials() {
-        try? KeychainService.shared.deleteCredential(for: device.stableId)
-        username = ""
-        password = ""
+        do {
+            try KeychainService.shared.deleteCredential(for: device)
+            username = ""
+            password = ""
+            credentialError = nil
+        } catch {
+            credentialError = error.localizedDescription
+        }
     }
-    
+
     func connect(to service: DiscoveredDevice.ServiceType) async {
         await MainActor.run {
             isConnecting = true
             connectionError = nil
         }
-        
+
         do {
+            await WakeOnLANService.shared.prepareForConnection(to: device, service: service)
+
             switch service {
             case .screenSharing, .tidalDrift:
                 let usernameToUse = username.isEmpty ? nil : username
@@ -102,9 +119,9 @@ class DeviceDetailViewModel: ObservableObject {
                 let viewer = try await LocalCastService.shared.connect(to: device)
                 await MainActor.run { viewer.showWindow(nil) }
             }
-            
+
             saveCredentialsIfNeeded()
-            
+
             let record = ConnectionRecord(
                 deviceId: device.id,
                 deviceName: device.name,
@@ -112,7 +129,7 @@ class DeviceDetailViewModel: ObservableObject {
                 connectionType: service == .screenSharing ? .screenShare : .fileShare,
                 wasSuccessful: true
             )
-            
+
             await MainActor.run {
                 AppState.shared.addConnectionRecord(record)
                 isConnecting = false
@@ -125,7 +142,7 @@ class DeviceDetailViewModel: ObservableObject {
                 connectionType: service == .screenSharing ? .screenShare : .fileShare,
                 wasSuccessful: false
             )
-            
+
             await MainActor.run {
                 AppState.shared.addConnectionRecord(record)
                 connectionError = error.localizedDescription
@@ -133,22 +150,22 @@ class DeviceDetailViewModel: ObservableObject {
             }
         }
     }
-    
+
     func testConnection() async {
         await MainActor.run {
             isTestingConnection = true
             connectionTestResult = nil
         }
-        
+
         // Use smart resolution-based connection test (handles stale IPs)
         let result = await ScreenShareConnectionService.shared.testConnectionToDevice(device)
-        
+
         await MainActor.run {
             connectionTestResult = result
             isTestingConnection = false
         }
     }
-    
+
     func quickConnect() async {
         if device.services.contains(.screenSharing) {
             await connect(to: .screenSharing)
