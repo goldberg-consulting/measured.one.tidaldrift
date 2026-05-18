@@ -162,6 +162,7 @@ jobs:
           cd /tmp/tap
 
           CASK="Casks/tidaldrift.rb"
+          cp "$GITHUB_WORKSPACE/Casks/tidaldrift.rb" "$CASK"
           sed -i '' "s/version \".*\"/version \"${APP_VERSION}\"/" "$CASK"
           sed -i '' "s/sha256 \".*\"/sha256 \"${SHA}\"/" "$CASK"
 

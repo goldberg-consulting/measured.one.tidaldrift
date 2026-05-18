@@ -1,13 +1,18 @@
 cask "tidaldrift" do
   version "1.5.0"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  sha256 "9013111239140609224271035228696b3d935ec02b8c3ad5c41f1b40647e3125"
 
   url "https://github.com/goldberg-consulting/measured.one.tidaldrift/releases/download/v#{version}/TidalDrift-#{version}.dmg"
   name "TidalDrift"
-  desc "Menu-bar Mac utility for discovering, connecting to, and streaming between Macs on your local network"
+  desc "Menu-bar utility for discovering and connecting to local computers"
   homepage "https://github.com/goldberg-consulting/measured.one.tidaldrift"
 
-  depends_on macos: ">= :ventura"
+  livecheck do
+    url :url
+    strategy :github_latest
+  end
+
+  depends_on macos: :ventura
 
   app "TidalDrift.app"
 
@@ -20,7 +25,7 @@ cask "tidaldrift" do
   end
 
   zap trash: [
-    "~/Library/Preferences/com.goldbergconsulting.tidaldrift.plist",
     "~/Library/Application Support/TidalDrift",
+    "~/Library/Preferences/com.goldbergconsulting.tidaldrift.plist",
   ]
 end
