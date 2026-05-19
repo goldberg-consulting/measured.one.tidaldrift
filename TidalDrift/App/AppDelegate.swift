@@ -54,7 +54,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     private var menuPanel: NSPanel?
     private var localMenuPanelMonitor: Any?
     private var globalMenuPanelMonitor: Any?
-    private var ignoreNextStatusItemClick = false
 
     private var onboardingWindow: NSWindow?
     private var settingsWindow: NSWindow?
@@ -307,10 +306,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             menuBarLogger.warning("toggleMenu: missing panel or button")
             return
         }
-        if ignoreNextStatusItemClick {
-            ignoreNextStatusItemClick = false
-            return
-        }
         if NSApp.currentEvent?.type == .rightMouseUp {
             showStatusContextMenu()
             return
@@ -391,6 +386,69 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         removeOutsideClickMonitor()
     }
 
+    /// Hides the menu panel, then runs `action` on the next main-queue turn.
+    /// Does not call `NSApp.activate` — activating the accessory app from menu
+    /// actions was leaving the TD status item unclickable after Metal stream
+    /// and permission flows.
+    func runAfterMenuDismissed(_ action: @escaping () -> Void) {
+        hideMenuPanel()
+        DispatchQueue.main.async(execute: action)
+    }
+
+    /// Presents a permission alert in its own window so it still works after
+    /// the menu panel has been dismissed (SwiftUI `.alert` on the panel does not).
+    func showMetalStreamUnavailableAlert() {
+        hideMenuPanel()
+        DispatchQueue.main.async {
+            let alert = NSAlert()
+            alert.messageText = "Metal Stream Unavailable"
+            alert.informativeText = "Could not connect to the remote Metal streaming host. Make sure TidalDrift is running on the remote Mac with Metal Streaming hosting enabled."
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+        }
+    }
+
+    func showMetalStreamingPermissionAlert(message: String) {
+        hideMenuPanel()
+        DispatchQueue.main.async {
+            let alert = NSAlert()
+            alert.messageText = "Metal Streaming Permission Required"
+            alert.informativeText = message + "\n\nGrant Screen Recording to host Metal streams, and Accessibility to accept remote input control from clients."
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "Open Screen Recording Settings")
+            alert.addButton(withTitle: "Open Accessibility Settings")
+            alert.addButton(withTitle: "Cancel")
+
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 1, height: 1),
+                styleMask: [.titled],
+                backing: .buffered,
+                defer: false
+            )
+            window.isReleasedWhenClosed = false
+            window.center()
+            window.level = .floating
+            window.orderFrontRegardless()
+
+            alert.beginSheetModal(for: window) { response in
+                switch response {
+                case .alertFirstButtonReturn:
+                    if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+                        NSWorkspace.shared.open(url)
+                    }
+                case .alertSecondButtonReturn:
+                    if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+                        NSWorkspace.shared.open(url)
+                    }
+                default:
+                    break
+                }
+                window.close()
+            }
+        }
+    }
+
     /// Close the panel when the user clicks anywhere outside it.
     ///
     /// We keep the monitor surface area as small as possible. The local
@@ -418,10 +476,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             matching: [.leftMouseDown, .rightMouseDown]
         ) { [weak self] event in
             guard let self else { return }
-            // If the user clicks the status item, `toggleMenu` will fire next
-            // and we want it to close (not re-open) the panel.
+            // Status-item clicks are handled only by `toggleMenu`. If we also
+            // hide here and set a "ignore next click" flag, a missed action
+            // delivery leaves TD stuck until the user clicks twice.
             if self.eventIsInsideStatusItem(event) {
-                self.ignoreNextStatusItemClick = true
+                return
             }
             self.scheduleHideMenuPanel()
         }

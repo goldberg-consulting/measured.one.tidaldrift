@@ -6,8 +6,6 @@ struct MenuBarView: View {
     @ObservedObject private var discoveryService = NetworkDiscoveryService.shared
     @ObservedObject private var clipboardService = ClipboardSyncService.shared
     @State private var isTogglingLocalCast = false
-    @State private var showPermissionAlert = false
-    @State private var permissionAlertMessage = ""
     @State private var isEditingName = false
     @State private var editingNameText = ""
     
@@ -42,16 +40,6 @@ struct MenuBarView: View {
         }
         .padding(12)
         .frame(width: 340)
-    }
-    
-    /// Close the menu bar popover, then run an action on the next run loop
-    /// so the target window can become key without competing for focus.
-    private func dismissPopoverAndRun(_ action: @escaping () -> Void) {
-        (NSApp.delegate as? AppDelegate)?.hideMenuPanel()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-            NSApp.activate(ignoringOtherApps: true)
-            action()
-        }
     }
     
     // MARK: - Header
@@ -150,13 +138,14 @@ struct MenuBarView: View {
                                         try await localCast.startHosting()
                                     } catch let error as LocalCastError {
                                         await MainActor.run {
-                                            permissionAlertMessage = error.errorDescription ?? "Failed to start LocalCast"
-                                            showPermissionAlert = true
+                                            let message = error.errorDescription ?? "Failed to start LocalCast"
+                                            (NSApp.delegate as? AppDelegate)?
+                                                .showMetalStreamingPermissionAlert(message: message)
                                         }
                                     } catch {
                                         await MainActor.run {
-                                            permissionAlertMessage = error.localizedDescription
-                                            showPermissionAlert = true
+                                            (NSApp.delegate as? AppDelegate)?
+                                                .showMetalStreamingPermissionAlert(message: error.localizedDescription)
                                         }
                                     }
                                 } else {
@@ -171,18 +160,6 @@ struct MenuBarView: View {
                     .labelsHidden()
                 }
             }
-            .alert("Metal Streaming Permission Required", isPresented: $showPermissionAlert) {
-                Button("Open Screen Recording Settings") {
-                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
-                }
-                Button("Open Accessibility Settings") {
-                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
-                }
-                Button("Cancel", role: .cancel) { }
-            } message: {
-                Text(permissionAlertMessage + "\n\nGrant Screen Recording to host Metal streams, and Accessibility to accept remote input control from clients.")
-            }
-            
             if localCast.isHosting {
                 if !localCast.activeConnections.isEmpty {
                     ForEach(localCast.activeConnections) { conn in
@@ -308,7 +285,7 @@ struct MenuBarView: View {
             .disabled(discoveryService.isScanningSubnet)
             
             MenuBarActionButton(icon: "gearshape", label: "Settings...") {
-                dismissPopoverAndRun {
+                (NSApp.delegate as? AppDelegate)?.runAfterMenuDismissed {
                     // Route directly to the AppDelegate instead of walking the
                     // responder chain via NSApp.sendAction. On macOS Sonoma+,
                     // SwiftUI synthesises a hidden handler for
@@ -324,7 +301,7 @@ struct MenuBarView: View {
             }
             
             MenuBarActionButton(icon: "arrow.counterclockwise", label: "Run Setup Wizard") {
-                dismissPopoverAndRun {
+                (NSApp.delegate as? AppDelegate)?.runAfterMenuDismissed {
                     (NSApp.delegate as? AppDelegate)?.showOnboarding()
                 }
             }
@@ -392,7 +369,6 @@ struct MenuBarDeviceRow: View {
     let device: DiscoveredDevice
     @ObservedObject private var localCast = LocalCastService.shared
     @State private var isHovering = false
-    @State private var showAppStreamError = false
     
     private var showLocalCast: Bool {
         device.services.contains(.localCast)
@@ -406,15 +382,6 @@ struct MenuBarDeviceRow: View {
             return nil
         }
         return creds.password.isEmpty ? nil : creds.password
-    }
-    
-    /// Close the status-bar popover before opening external apps/URLs.
-    private func dismissPopoverAndRun(_ action: @escaping () -> Void) {
-        (NSApp.delegate as? AppDelegate)?.hideMenuPanel()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-            NSApp.activate(ignoringOtherApps: true)
-            action()
-        }
     }
     
     var body: some View {
@@ -441,7 +408,7 @@ struct MenuBarDeviceRow: View {
                 if isHovering {
                     HStack(spacing: 4) {
                         QuickActionIcon(icon: "display", color: .blue, tooltip: "Screen Share (VNC)") {
-                            dismissPopoverAndRun {
+                            (NSApp.delegate as? AppDelegate)?.runAfterMenuDismissed {
                                 Task {
                                     await WakeOnLANService.shared.prepareForConnection(to: device, service: .screenSharing)
                                     try? await ScreenShareConnectionService.shared.connect(to: device)
@@ -451,12 +418,14 @@ struct MenuBarDeviceRow: View {
                         
                         if showLocalCast {
                             QuickActionIcon(icon: "bolt.fill", color: .purple, tooltip: "Metal Stream (high-fps)") {
-                                dismissPopoverAndRun { startMetalStreaming() }
+                                (NSApp.delegate as? AppDelegate)?.runAfterMenuDismissed {
+                                    startMetalStreaming()
+                                }
                             }
                         }
                         
                         QuickActionIcon(icon: "folder", color: .orange, tooltip: "File Share") {
-                            dismissPopoverAndRun {
+                            (NSApp.delegate as? AppDelegate)?.runAfterMenuDismissed {
                                 Task {
                                     await WakeOnLANService.shared.prepareForConnection(to: device, service: .fileSharing)
                                     try? await ScreenShareConnectionService.shared.connectToFileShare(device: device)
@@ -466,7 +435,7 @@ struct MenuBarDeviceRow: View {
                         
                         if showSSH {
                             QuickActionIcon(icon: "terminal", color: .green, tooltip: "SSH") {
-                                dismissPopoverAndRun {
+                                (NSApp.delegate as? AppDelegate)?.runAfterMenuDismissed {
                                     Task {
                                         await WakeOnLANService.shared.prepareForConnection(to: device, service: .ssh)
                                         ScreenShareConnectionService.shared.connectToSSH(device: device)
@@ -505,11 +474,6 @@ struct MenuBarDeviceRow: View {
                 withAnimation(.easeInOut(duration: 0.15)) { isHovering = hovering }
             }
         }
-        .alert("Metal Stream Unavailable", isPresented: $showAppStreamError) {
-            Button("OK", role: .cancel) { }
-        } message: {
-            Text("Could not connect to the remote Metal streaming host. Make sure TidalDrift is running on the remote Mac with Metal Streaming hosting enabled.")
-        }
     }
 
     /// Opens the TidalDrift Metal-accelerated streaming viewer for the given
@@ -523,12 +487,14 @@ struct MenuBarDeviceRow: View {
                 await WakeOnLANService.shared.prepareForConnection(to: device, service: .localCast)
                 let controller = try await LocalCastService.shared.connect(to: device, password: password)
                 await MainActor.run {
-                    NSApp.activate(ignoringOtherApps: true)
                     controller.showWindow(nil)
+                    controller.window?.orderFrontRegardless()
                 }
             } catch {
                 print("MenuBar Metal streaming failed: \(error)")
-                await MainActor.run { showAppStreamError = true }
+                await MainActor.run {
+                    (NSApp.delegate as? AppDelegate)?.showMetalStreamUnavailableAlert()
+                }
             }
         }
     }
