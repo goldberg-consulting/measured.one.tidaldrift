@@ -59,7 +59,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     private var onboardingWindow: NSWindow?
     private var settingsWindow: NSWindow?
     private var permissionRepairWindow: NSWindow?
-    private let lastPermissionHelperBuildKey = "lastPermissionHelperBuild"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         menuBarLogger.info("applicationDidFinishLaunching")
@@ -72,7 +71,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         AppState.shared.loadTrustedDevices()
         AppState.shared.loadConnectionHistory()
 
-        runPermissionRepairThenStartServices()
+        // Start network services right away. We intentionally do NOT reset TCC
+        // permissions or run shell commands on launch — those used to block
+        // the main thread for ~1-2s per launch and revoke Screen Recording on
+        // every version upgrade. Permission repair is now an explicit action
+        // surfaced in Settings > Troubleshooting.
+        startNetworkServices()
 
         // Show onboarding on first launch
         if !AppState.shared.hasCompletedOnboarding {
@@ -290,6 +294,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     /// Primary click handler for the status item. Acts as an on/off toggle
     /// for the menu panel. Dismissal when the user clicks outside is handled
     /// by a local/global event monitor installed while the panel is visible.
+    ///
+    /// We intentionally do NOT call `NSApp.activate(ignoringOtherApps:)` here.
+    /// For a menu-bar accessory app, activating the whole app causes the
+    /// previously-key window in another app to relinquish key state, which
+    /// triggers AppKit deactivation cascades and reorders windows behind the
+    /// scenes. Combined with our outside-click monitor, that produced the
+    /// "menu opens but controls don't respond / app appears frozen" behavior.
     @objc func toggleMenu(_ sender: Any?) {
         menuBarLogger.info("toggleMenu fired")
         guard let panel = menuPanel, let button = statusItem?.button else {
@@ -311,14 +322,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         }
         menuBarLogger.info("toggleMenu: opening panel")
         positionMenuPanel(panel, below: button)
-        panel.alphaValue = 0
-        NSApp.activate(ignoringOtherApps: true)
-        panel.orderFrontRegardless()
-        panel.makeKey()
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.08
-            panel.animator().alphaValue = 1
-        }
+        panel.alphaValue = 1
+        panel.makeKeyAndOrderFront(nil)
         installOutsideClickMonitor()
     }
 
@@ -336,9 +341,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     @objc private func openMenuFromContextMenu(_ sender: Any?) {
         guard let panel = menuPanel, let button = statusItem?.button else { return }
         positionMenuPanel(panel, below: button)
-        NSApp.activate(ignoringOtherApps: true)
-        panel.orderFrontRegardless()
-        panel.makeKey()
+        panel.makeKeyAndOrderFront(nil)
         installOutsideClickMonitor()
     }
 
@@ -388,51 +391,50 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         removeOutsideClickMonitor()
     }
 
-    /// Close the panel when the user clicks anywhere outside it — including
-    /// on the status item itself (which AppKit would otherwise route back
-    /// through `toggleMenu`, giving us a close-then-immediately-reopen
-    /// flicker). Install only while the panel is visible to minimize
-    /// background event monitoring.
+    /// Close the panel when the user clicks anywhere outside it.
+    ///
+    /// We keep the monitor surface area as small as possible. The local
+    /// monitor only handles the Escape key — never mouse events — because a
+    /// local monitor that decides whether to swallow a mouse event has to
+    /// run before AppKit dispatches that event to the SwiftUI control under
+    /// the cursor, and any bug in our hit-test there blocks button clicks.
+    /// Outside-clicks (in other apps or on our status item) are handled by
+    /// the global monitor.
     private func installOutsideClickMonitor() {
         removeOutsideClickMonitor()
+
         localMenuPanelMonitor = NSEvent.addLocalMonitorForEvents(
-            matching: [.leftMouseDown, .rightMouseDown, .keyDown]
+            matching: [.keyDown]
         ) { [weak self] event in
-            guard let self else { return event }
-            if event.type == .keyDown, event.keyCode == 53 {
-                self.hideMenuPanel()
+            // Escape closes the panel.
+            if event.keyCode == 53 {
+                self?.scheduleHideMenuPanel()
                 return nil
-            }
-            if event.type == .keyDown {
-                return event
-            }
-            if self.eventIsInsideMenuPanel(event) {
-                return event
-            }
-            if self.eventIsInsideStatusItem(event) {
-                self.ignoreNextStatusItemClick = true
-            }
-            DispatchQueue.main.async {
-                self.hideMenuPanel()
             }
             return event
         }
+
         globalMenuPanelMonitor = NSEvent.addGlobalMonitorForEvents(
             matching: [.leftMouseDown, .rightMouseDown]
-        ) { [weak self] _ in
-            DispatchQueue.main.async {
-                self?.hideMenuPanel()
+        ) { [weak self] event in
+            guard let self else { return }
+            // If the user clicks the status item, `toggleMenu` will fire next
+            // and we want it to close (not re-open) the panel.
+            if self.eventIsInsideStatusItem(event) {
+                self.ignoreNextStatusItemClick = true
             }
+            self.scheduleHideMenuPanel()
         }
     }
 
-    private func eventIsInsideMenuPanel(_ event: NSEvent) -> Bool {
-        guard let panel = menuPanel, panel.isVisible else { return false }
-        if event.window === panel {
-            return true
+    /// Hide the panel on the next run-loop tick to avoid closing the window
+    /// synchronously inside an AppKit event handler — that re-entry was a
+    /// likely cause of the apparent freeze where the panel would open and
+    /// SwiftUI controls would stop responding.
+    private func scheduleHideMenuPanel() {
+        DispatchQueue.main.async { [weak self] in
+            self?.hideMenuPanel()
         }
-        let screenPoint = event.window?.convertPoint(toScreen: event.locationInWindow) ?? NSEvent.mouseLocation
-        return panel.frame.contains(screenPoint)
     }
 
     private func eventIsInsideStatusItem(_ event: NSEvent) -> Bool {
@@ -453,46 +455,35 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         }
     }
 
-    private func runPermissionRepairThenStartServices() {
-        Task { @MainActor in
-            if let result = await PermissionHealthService.shared.resetTCCPermissionsForCurrentBuildIfNeeded() {
-                self.showPermissionRepairWindow(message: result.message)
-            } else if !CGPreflightScreenCaptureAccess(), self.shouldShowPermissionHelperForCurrentBuild() {
-                self.showPermissionRepairWindow(message: "Screen Recording permission is required for Metal Streaming.")
-            }
-            self.startNetworkServices()
-        }
-    }
-
     private func startNetworkServices() {
-        NetworkDiscoveryService.shared.startBrowsing()
-        TidalDriftPeerService.shared.startAdvertising()
-        TidalDriftPeerService.shared.startDiscovery()
-        _ = TidalDropService.shared
+        // Defer slightly so the status bar item paints and AppState finishes
+        // its first run-loop init before any background sockets fire.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            NetworkDiscoveryService.shared.startBrowsing()
+            TidalDriftPeerService.shared.startAdvertising()
+            TidalDriftPeerService.shared.startDiscovery()
+            _ = TidalDropService.shared
 
-        if UserDefaults.standard.bool(forKey: "localCastAutoHost") {
-            Task {
-                do {
-                    try await LocalCastService.shared.startHosting()
-                } catch {
-                    print("LocalCast: Auto-host failed: \(error.localizedDescription)")
+            if UserDefaults.standard.bool(forKey: "localCastAutoHost") {
+                Task {
+                    do {
+                        try await LocalCastService.shared.startHosting()
+                    } catch {
+                        print("LocalCast: Auto-host failed: \(error.localizedDescription)")
+                    }
                 }
             }
         }
     }
 
-    private func shouldShowPermissionHelperForCurrentBuild() -> Bool {
-        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown"
-        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "unknown"
-        let buildKey = "\(version)-\(build)"
-        guard UserDefaults.standard.string(forKey: lastPermissionHelperBuildKey) != buildKey else {
-            return false
-        }
-        UserDefaults.standard.set(buildKey, forKey: lastPermissionHelperBuildKey)
-        return true
+    /// Public entry point for the Troubleshooting view's "Repair Permissions"
+    /// button. Shows the same window the previous build opened on launch, but
+    /// only on explicit user request.
+    @objc func showPermissionRepairFromMenu(_ sender: Any?) {
+        showPermissionRepairWindow(message: nil)
     }
 
-    private func showPermissionRepairWindow(message: String? = nil) {
+    func showPermissionRepairWindow(message: String? = nil) {
         if let existing = permissionRepairWindow {
             existing.orderFrontRegardless()
             existing.makeKeyAndOrderFront(nil)
