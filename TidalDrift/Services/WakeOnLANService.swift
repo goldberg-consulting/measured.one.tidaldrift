@@ -4,11 +4,16 @@ import Network
 /// Service for sending Wake-on-LAN magic packets to wake sleeping Macs
 class WakeOnLANService {
     static let shared = WakeOnLANService()
-    
+
     private init() {}
-    
+
+    struct WakePacketTarget: Hashable {
+        let address: String
+        let port: UInt16
+    }
+
     // MARK: - Magic Packet Generation
-    
+
     /// Wake a device using its MAC address
     /// - Parameters:
     ///   - macAddress: MAC address in format "AA:BB:CC:DD:EE:FF" or "AA-BB-CC-DD-EE-FF"
@@ -21,16 +26,16 @@ class WakeOnLANService {
         guard settings.wakeOnLANEnabled else {
             return false
         }
-        
+
         guard let macBytes = parseMACAddress(macAddress) else {
             return false
         }
-        
+
         let wolPort = port ?? UInt16(settings.wakeOnLANPort)
         let retries = settings.wakeOnLANRetries
-        
+
         let magicPacket = createMagicPacket(macBytes: macBytes)
-        
+
         // Send multiple packets based on retry setting
         var success = false
         for _ in 0..<retries {
@@ -40,10 +45,37 @@ class WakeOnLANService {
             // Small delay between retries
             try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
         }
-        
+
         return success
     }
-    
+
+    /// Wake a device using limited and directed broadcasts on common WOL ports.
+    func wakeBroadly(macAddress: String) async -> Bool {
+        let settings = AppState.shared.settings
+        guard settings.wakeOnLANEnabled else {
+            return false
+        }
+
+        guard let macBytes = parseMACAddress(macAddress) else {
+            return false
+        }
+
+        let magicPacket = createMagicPacket(macBytes: macBytes)
+        let targets = wakePacketTargets(primaryPort: UInt16(settings.wakeOnLANPort))
+        var success = false
+
+        for _ in 0..<settings.wakeOnLANRetries {
+            for target in targets {
+                if await sendPacket(magicPacket, to: target.address, port: target.port) {
+                    success = true
+                }
+            }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+
+        return success
+    }
+
     /// Wake a device and wait for it to come online
     /// - Parameters:
     ///   - macAddress: MAC address
@@ -52,10 +84,10 @@ class WakeOnLANService {
     /// - Returns: True if device came online within timeout
     func wakeAndWait(macAddress: String, ipAddress: String, timeout: TimeInterval = 60) async -> Bool {
         // Send wake packet
-        guard await wake(macAddress: macAddress) else {
+        guard await wakeBroadly(macAddress: macAddress) else {
             return false
         }
-        
+
         // Wait for device to come online
         let startTime = Date()
         while Date().timeIntervalSince(startTime) < timeout {
@@ -63,87 +95,116 @@ class WakeOnLANService {
             if await NetworkDiscoveryService.shared.scanIP(ipAddress, port: 5900) {
                 return true
             }
-            
+
             // Wait before retrying
             try? await Task.sleep(nanoseconds: 2_000_000_000) // 2 seconds
         }
-        
+
         return false
     }
-    
+
+    func wakeAndWait(device: DiscoveredDevice, service: DiscoveredDevice.ServiceType? = nil, timeout: TimeInterval = 60) async -> Bool {
+        guard let macAddress = device.storedMACAddress else {
+            return false
+        }
+        guard await wakeBroadly(macAddress: macAddress) else {
+            return false
+        }
+
+        let startTime = Date()
+        while Date().timeIntervalSince(startTime) < timeout {
+            if await isDeviceReachableAfterWake(device, service: service) {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+        }
+
+        return false
+    }
+
     /// Check if Wake-on-LAN is enabled in settings
     var isEnabled: Bool {
         AppState.shared.settings.wakeOnLANEnabled
     }
-    
+
     /// Check if auto-wake before connect is enabled
     var shouldAutoWakeBeforeConnect: Bool {
         let settings = AppState.shared.settings
         return settings.wakeOnLANEnabled && settings.autoWakeBeforeConnect
     }
-    
+
+    func prepareForConnection(to device: DiscoveredDevice, service: DiscoveredDevice.ServiceType, timeout: TimeInterval = 30) async {
+        guard shouldAutoWakeBeforeConnect,
+              !device.isOnline,
+              device.storedMACAddress != nil else {
+            return
+        }
+
+        _ = await wakeAndWait(device: device, service: service, timeout: timeout)
+    }
+
     // MARK: - MAC Address Parsing
-    
+
     private func parseMACAddress(_ mac: String) -> [UInt8]? {
         // Support both ":" and "-" separators
         let cleanMAC = mac.replacingOccurrences(of: "-", with: ":")
         let parts = cleanMAC.split(separator: ":")
-        
+
         guard parts.count == 6 else { return nil }
-        
+
         var bytes: [UInt8] = []
         for part in parts {
             guard let byte = UInt8(part, radix: 16) else { return nil }
             bytes.append(byte)
         }
-        
+
         return bytes
     }
-    
+
     /// Validate MAC address format
     func isValidMACAddress(_ mac: String) -> Bool {
         return parseMACAddress(mac) != nil
     }
-    
+
     /// Format MAC address consistently
     func formatMACAddress(_ mac: String) -> String? {
         guard let bytes = parseMACAddress(mac) else { return nil }
         return bytes.map { String(format: "%02X", $0) }.joined(separator: ":")
     }
-    
+
     // MARK: - Magic Packet Creation
-    
+
     private func createMagicPacket(macBytes: [UInt8]) -> Data {
         var packet = Data()
-        
+
         // Magic packet header: 6 bytes of 0xFF
         for _ in 0..<6 {
             packet.append(0xFF)
         }
-        
+
         // Followed by MAC address repeated 16 times
         for _ in 0..<16 {
             packet.append(contentsOf: macBytes)
         }
-        
+
         return packet
     }
-    
+
     // MARK: - Network Transmission
-    
+
     private func sendPacket(_ packet: Data, to address: String, port: UInt16) async -> Bool {
         return await withCheckedContinuation { continuation in
             // Create UDP socket
             var sock: Int32 = -1
-            
+
             sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
             guard sock >= 0 else {
                 continuation.resume(returning: false)
                 return
             }
-            
+
             defer { close(sock) }
-            
+
             // Enable broadcast
             var broadcastEnable: Int32 = 1
             let optResult = setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcastEnable, socklen_t(MemoryLayout<Int32>.size))
@@ -151,13 +212,13 @@ class WakeOnLANService {
                 continuation.resume(returning: false)
                 return
             }
-            
+
             // Setup destination address
             var addr = sockaddr_in()
             addr.sin_family = sa_family_t(AF_INET)
             addr.sin_port = port.bigEndian
             addr.sin_addr.s_addr = inet_addr(address)
-            
+
             // Send packet
             let sent = packet.withUnsafeBytes { buffer -> Int in
                 withUnsafePointer(to: &addr) { addrPtr -> Int in
@@ -166,13 +227,132 @@ class WakeOnLANService {
                     }
                 }
             }
-            
+
             continuation.resume(returning: sent == packet.count)
         }
     }
-    
+
+    func wakePacketTargets(primaryPort: UInt16) -> [WakePacketTarget] {
+        var targets: [WakePacketTarget] = []
+        let addresses = ["255.255.255.255"] + interfaceBroadcastAddresses()
+        let ports = Self.wakePorts(primaryPort: primaryPort)
+
+        for address in addresses {
+            for port in ports {
+                targets.append(WakePacketTarget(address: address, port: port))
+            }
+        }
+
+        var seen: Set<WakePacketTarget> = []
+        return targets.filter { seen.insert($0).inserted }
+    }
+
+    static func wakePorts(primaryPort: UInt16) -> [UInt16] {
+        var ports = [primaryPort]
+        for fallback in [UInt16(9), UInt16(7)] where !ports.contains(fallback) {
+            ports.append(fallback)
+        }
+        return ports
+    }
+
+    static func directedBroadcastAddress(ipAddress: String, netmask: String) -> String? {
+        var ip = in_addr()
+        var mask = in_addr()
+        guard inet_pton(AF_INET, ipAddress, &ip) == 1,
+              inet_pton(AF_INET, netmask, &mask) == 1 else {
+            return nil
+        }
+
+        let hostIP = UInt32(bigEndian: ip.s_addr)
+        let hostMask = UInt32(bigEndian: mask.s_addr)
+        let broadcast = (hostIP & hostMask) | ~hostMask
+        var broadcastAddr = in_addr(s_addr: broadcast.bigEndian)
+        var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+        guard inet_ntop(AF_INET, &broadcastAddr, &buffer, socklen_t(INET_ADDRSTRLEN)) != nil else {
+            return nil
+        }
+        return String(cString: buffer)
+    }
+
+    static func macStorageKey(for device: DiscoveredDevice) -> String {
+        "mac_\(device.identityKey)"
+    }
+
+    private func interfaceBroadcastAddresses() -> [String] {
+        var addresses: [String] = []
+        var interfaces: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&interfaces) == 0, let first = interfaces else {
+            return []
+        }
+        defer { freeifaddrs(interfaces) }
+
+        for pointer in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            let interface = pointer.pointee
+            let flags = Int32(interface.ifa_flags)
+            guard flags & IFF_UP != 0,
+                  flags & IFF_RUNNING != 0,
+                  flags & IFF_LOOPBACK == 0,
+                  interface.ifa_addr.pointee.sa_family == UInt8(AF_INET),
+                  let netmaskPointer = interface.ifa_netmask else {
+                continue
+            }
+
+            let addr = interface.ifa_addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
+            let mask = netmaskPointer.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
+            var ipBuffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+            var maskBuffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+            var ipAddr = addr.sin_addr
+            var maskAddr = mask.sin_addr
+
+            guard inet_ntop(AF_INET, &ipAddr, &ipBuffer, socklen_t(INET_ADDRSTRLEN)) != nil,
+                  inet_ntop(AF_INET, &maskAddr, &maskBuffer, socklen_t(INET_ADDRSTRLEN)) != nil,
+                  let broadcast = Self.directedBroadcastAddress(
+                    ipAddress: String(cString: ipBuffer),
+                    netmask: String(cString: maskBuffer)
+                  ) else {
+                continue
+            }
+            addresses.append(broadcast)
+        }
+
+        return addresses
+    }
+
+    private func isDeviceReachableAfterWake(_ device: DiscoveredDevice, service: DiscoveredDevice.ServiceType?) async -> Bool {
+        if let service {
+            return await probe(device: device, service: service)
+        }
+
+        for service in device.services where await probe(device: device, service: service) {
+            return true
+        }
+
+        if getMACAddress(for: device.ipAddress) != nil {
+            return true
+        }
+
+        return false
+    }
+
+    private func probe(device: DiscoveredDevice, service: DiscoveredDevice.ServiceType) async -> Bool {
+        switch service {
+        case .screenSharing, .tidalDrift:
+            return await NetworkDiscoveryService.shared.scanIP(device.ipAddress, port: 5900)
+        case .fileSharing:
+            return await NetworkDiscoveryService.shared.scanIP(device.ipAddress, port: 445)
+        case .afp:
+            return await NetworkDiscoveryService.shared.scanIP(device.ipAddress, port: 548)
+        case .ssh:
+            return await NetworkDiscoveryService.shared.scanIP(device.ipAddress, port: 22)
+        case .localCast:
+            return await NetworkDiscoveryService.shared.scanIP(device.ipAddress, port: Int(LocalCastConfiguration.hostPort))
+        case .tidalDrop:
+            return await NetworkDiscoveryService.shared.scanIP(device.ipAddress, port: 5902)
+        }
+    }
+
     // MARK: - MAC Address Discovery
-    
+
     /// Get MAC address from IP using ARP table
     func getMACAddress(for ipAddress: String) -> String? {
         // Validate IP address format to prevent command injection
@@ -184,40 +364,40 @@ class WakeOnLANService {
               }) else {
             return nil
         }
-        
+
         let result = ShellExecutor.execute("arp -n '\(ipAddress)'")
-        
+
         // Parse ARP output: "? (192.168.1.100) at aa:bb:cc:dd:ee:ff on en0 ifscope [ethernet]"
         let pattern = "([0-9a-fA-F]{1,2}:[0-9a-fA-F]{1,2}:[0-9a-fA-F]{1,2}:[0-9a-fA-F]{1,2}:[0-9a-fA-F]{1,2}:[0-9a-fA-F]{1,2})"
-        
+
         if let range = result.output.range(of: pattern, options: .regularExpression) {
             let mac = String(result.output[range])
             return formatMACAddress(mac)
         }
-        
+
         return nil
     }
-    
+
     /// Scan network and get MAC addresses for all discovered devices
     func discoverMACAddresses() -> [String: String] {
         // First, ping the broadcast to populate ARP table
         _ = ShellExecutor.execute("ping -c 1 -t 1 255.255.255.255 2>/dev/null")
-        
+
         // Get ARP table
         let result = ShellExecutor.execute("arp -a")
-        
+
         var macAddresses: [String: String] = [:]
         let lines = result.output.split(separator: "\n")
-        
+
         for line in lines {
             // Parse: "? (192.168.1.100) at aa:bb:cc:dd:ee:ff on en0"
             let lineStr = String(line)
-            
+
             // Extract IP
             if let ipRange = lineStr.range(of: "\\([0-9.]+\\)", options: .regularExpression) {
                 var ip = String(lineStr[ipRange])
                 ip = ip.trimmingCharacters(in: CharacterSet(charactersIn: "()"))
-                
+
                 // Extract MAC
                 if let macRange = lineStr.range(of: "([0-9a-fA-F]{1,2}:){5}[0-9a-fA-F]{1,2}", options: .regularExpression) {
                     let mac = String(lineStr[macRange])
@@ -227,7 +407,7 @@ class WakeOnLANService {
                 }
             }
         }
-        
+
         return macAddresses
     }
 }
@@ -238,17 +418,32 @@ extension DiscoveredDevice {
     /// Store MAC address in UserDefaults
     var storedMACAddress: String? {
         get {
-            UserDefaults.standard.string(forKey: "mac_\(ipAddress)")
+            let identityKey = WakeOnLANService.macStorageKey(for: self)
+            if let mac = UserDefaults.standard.string(forKey: identityKey) {
+                return mac
+            }
+
+            let legacyKey = "mac_\(ipAddress)"
+            guard let legacy = UserDefaults.standard.string(forKey: legacyKey) else {
+                return nil
+            }
+            UserDefaults.standard.set(legacy, forKey: identityKey)
+            UserDefaults.standard.removeObject(forKey: legacyKey)
+            return legacy
         }
         set {
+            let identityKey = WakeOnLANService.macStorageKey(for: self)
+            let legacyKey = "mac_\(ipAddress)"
             if let mac = newValue {
-                UserDefaults.standard.set(mac, forKey: "mac_\(ipAddress)")
+                UserDefaults.standard.set(mac, forKey: identityKey)
+                UserDefaults.standard.removeObject(forKey: legacyKey)
             } else {
-                UserDefaults.standard.removeObject(forKey: "mac_\(ipAddress)")
+                UserDefaults.standard.removeObject(forKey: identityKey)
+                UserDefaults.standard.removeObject(forKey: legacyKey)
             }
         }
     }
-    
+
     /// Check if device supports Wake-on-LAN
     var supportsWOL: Bool {
         storedMACAddress != nil

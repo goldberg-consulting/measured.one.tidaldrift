@@ -2,8 +2,10 @@ import SwiftUI
 
 struct MenuBarView: View {
     @EnvironmentObject var appState: AppState
+    @ObservedObject private var localCast = LocalCastService.shared
     @ObservedObject private var discoveryService = NetworkDiscoveryService.shared
     @ObservedObject private var clipboardService = ClipboardSyncService.shared
+    @State private var isTogglingLocalCast = false
     @State private var isEditingName = false
     @State private var editingNameText = ""
     
@@ -22,6 +24,10 @@ struct MenuBarView: View {
             
             Divider().padding(.vertical, 6)
             
+            localCastSection
+            
+            Divider().padding(.vertical, 6)
+            
             devicesSection
             
             Divider().padding(.vertical, 6)
@@ -34,23 +40,6 @@ struct MenuBarView: View {
         }
         .padding(12)
         .frame(width: 340)
-    }
-    
-    /// Close the menu bar popover, then run an action on the next run loop
-    /// so the target window can become key without competing for focus.
-    private func dismissPopoverAndRun(_ action: @escaping () -> Void) {
-        if let popover = NSApp.windows.first(where: {
-            $0.isVisible
-                && ($0.level == .statusBar
-                    || $0.styleMask.contains(.nonactivatingPanel)
-                    || $0.className.contains("StatusBar"))
-        }) {
-            popover.close()
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-            NSApp.activate(ignoringOtherApps: true)
-            action()
-        }
     }
     
     // MARK: - Header
@@ -122,6 +111,74 @@ struct MenuBarView: View {
         appState.settings.tidalDriftDisplayName = isDefault ? "" : trimmed
         isEditingName = false
         TidalDriftPeerService.shared.restartAdvertising()
+    }
+    
+    // MARK: - LocalCast
+    
+    private var localCastSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Image(systemName: "bolt.fill")
+                    .foregroundColor(localCast.isHosting ? .yellow : .secondary)
+                    .font(.system(size: 12))
+                Text("Metal Streaming Host")
+                    .font(.system(size: 12, weight: .medium))
+                Spacer()
+                
+                if isTogglingLocalCast {
+                    ProgressView().scaleEffect(0.6).frame(width: 36)
+                } else {
+                    Toggle("", isOn: Binding(
+                        get: { localCast.isHosting },
+                        set: { newValue in
+                            isTogglingLocalCast = true
+                            Task {
+                                if newValue {
+                                    do {
+                                        try await localCast.startHosting()
+                                    } catch let error as LocalCastError {
+                                        await MainActor.run {
+                                            let message = error.errorDescription ?? "Failed to start LocalCast"
+                                            (NSApp.delegate as? AppDelegate)?
+                                                .showMetalStreamingPermissionAlert(message: message)
+                                        }
+                                    } catch {
+                                        await MainActor.run {
+                                            (NSApp.delegate as? AppDelegate)?
+                                                .showMetalStreamingPermissionAlert(message: error.localizedDescription)
+                                        }
+                                    }
+                                } else {
+                                    localCast.stopHosting()
+                                }
+                                await MainActor.run { isTogglingLocalCast = false }
+                            }
+                        }
+                    ))
+                    .toggleStyle(.switch)
+                    .scaleEffect(0.65)
+                    .labelsHidden()
+                }
+            }
+            if localCast.isHosting {
+                if !localCast.activeConnections.isEmpty {
+                    ForEach(localCast.activeConnections) { conn in
+                        HStack(spacing: 4) {
+                            Image(systemName: "display").font(.system(size: 10))
+                            Text(conn.clientName).font(.system(size: 10))
+                        }
+                        .foregroundColor(.secondary)
+                        .padding(.leading, 20)
+                    }
+                } else {
+                    Text("Waiting for connections...")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                        .italic()
+                        .padding(.leading, 20)
+                }
+            }
+        }
     }
     
     // MARK: - Devices
@@ -228,13 +285,23 @@ struct MenuBarView: View {
             .disabled(discoveryService.isScanningSubnet)
             
             MenuBarActionButton(icon: "gearshape", label: "Settings...") {
-                dismissPopoverAndRun {
-                    NSApp.sendAction(#selector(AppDelegate.showSettingsWindow(_:)), to: nil, from: nil)
+                (NSApp.delegate as? AppDelegate)?.runAfterMenuDismissed {
+                    // Route directly to the AppDelegate instead of walking the
+                    // responder chain via NSApp.sendAction. On macOS Sonoma+,
+                    // SwiftUI synthesises a hidden handler for
+                    // `showSettingsWindow:` and pops up a phantom Settings
+                    // scene (this app deliberately doesn't declare a SwiftUI
+                    // `Settings` scene — we manage the window manually).
+                    // That phantom window becomes key and silently absorbs
+                    // every subsequent menu-bar click, making the app look
+                    // frozen. Direct delegate dispatch bypasses SwiftUI's
+                    // interception and always reaches our showSettings().
+                    (NSApp.delegate as? AppDelegate)?.showSettingsWindow(nil)
                 }
             }
             
             MenuBarActionButton(icon: "arrow.counterclockwise", label: "Run Setup Wizard") {
-                dismissPopoverAndRun {
+                (NSApp.delegate as? AppDelegate)?.runAfterMenuDismissed {
                     (NSApp.delegate as? AppDelegate)?.showOnboarding()
                 }
             }
@@ -242,7 +309,7 @@ struct MenuBarView: View {
             Divider().padding(.vertical, 2)
             
             MenuBarActionButton(icon: "power", label: "Quit TidalDrift") {
-                NSApplication.shared.terminate(nil)
+                (NSApp.delegate as? AppDelegate)?.requestQuit(nil)
             }
         }
     }
@@ -300,29 +367,21 @@ struct MenuBarActionButton: View {
 
 struct MenuBarDeviceRow: View {
     let device: DiscoveredDevice
+    @ObservedObject private var localCast = LocalCastService.shared
     @State private var isHovering = false
     
+    private var showLocalCast: Bool {
+        device.services.contains(.localCast)
+    }
     private var showSSH: Bool {
         device.services.contains(.ssh) || device.isTidalDriftPeer
     }
     
     private var savedDevicePassword: String? {
-        guard let creds = try? KeychainService.shared.getCredential(for: device.stableId) else {
+        guard let creds = try? KeychainService.shared.getCredential(for: device) else {
             return nil
         }
         return creds.password.isEmpty ? nil : creds.password
-    }
-    
-    /// Close the status-bar popover before opening external apps/URLs.
-    private func dismissPopoverAndRun(_ action: @escaping () -> Void) {
-        if let popover = NSApp.keyWindow,
-           popover.level == .statusBar || popover.styleMask.contains(.nonactivatingPanel) || popover.className.contains("StatusBar") {
-            popover.close()
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-            NSApp.activate(ignoringOtherApps: true)
-            action()
-        }
     }
     
     var body: some View {
@@ -349,21 +408,38 @@ struct MenuBarDeviceRow: View {
                 if isHovering {
                     HStack(spacing: 4) {
                         QuickActionIcon(icon: "display", color: .blue, tooltip: "Screen Share (VNC)") {
-                            dismissPopoverAndRun {
-                                Task { try? await ScreenShareConnectionService.shared.connect(to: device) }
+                            (NSApp.delegate as? AppDelegate)?.runAfterMenuDismissed {
+                                Task {
+                                    await WakeOnLANService.shared.prepareForConnection(to: device, service: .screenSharing)
+                                    try? await ScreenShareConnectionService.shared.connect(to: device)
+                                }
+                            }
+                        }
+                        
+                        if showLocalCast {
+                            QuickActionIcon(icon: "bolt.fill", color: .purple, tooltip: "Metal Stream (high-fps)") {
+                                (NSApp.delegate as? AppDelegate)?.runAfterMenuDismissed {
+                                    startMetalStreaming()
+                                }
                             }
                         }
                         
                         QuickActionIcon(icon: "folder", color: .orange, tooltip: "File Share") {
-                            dismissPopoverAndRun {
-                                Task { try? await ScreenShareConnectionService.shared.connectToFileShare(device: device) }
+                            (NSApp.delegate as? AppDelegate)?.runAfterMenuDismissed {
+                                Task {
+                                    await WakeOnLANService.shared.prepareForConnection(to: device, service: .fileSharing)
+                                    try? await ScreenShareConnectionService.shared.connectToFileShare(device: device)
+                                }
                             }
                         }
                         
                         if showSSH {
                             QuickActionIcon(icon: "terminal", color: .green, tooltip: "SSH") {
-                                dismissPopoverAndRun {
-                                    ScreenShareConnectionService.shared.connectToSSH(device: device)
+                                (NSApp.delegate as? AppDelegate)?.runAfterMenuDismissed {
+                                    Task {
+                                        await WakeOnLANService.shared.prepareForConnection(to: device, service: .ssh)
+                                        ScreenShareConnectionService.shared.connectToSSH(device: device)
+                                    }
                                 }
                             }
                         }
@@ -396,6 +472,29 @@ struct MenuBarDeviceRow: View {
             .contentShape(Rectangle())
             .onHover { hovering in
                 withAnimation(.easeInOut(duration: 0.15)) { isHovering = hovering }
+            }
+        }
+    }
+
+    /// Opens the TidalDrift Metal-accelerated streaming viewer for the given
+    /// device. Uses the keychain password if one is saved; otherwise the
+    /// session connects without a password and the host auth flow decides
+    /// whether to reject it.
+    private func startMetalStreaming() {
+        let password = device.localCastAuthRequired == true ? savedDevicePassword : nil
+        Task {
+            do {
+                await WakeOnLANService.shared.prepareForConnection(to: device, service: .localCast)
+                let controller = try await LocalCastService.shared.connect(to: device, password: password)
+                await MainActor.run {
+                    controller.showWindow(nil)
+                    controller.window?.orderFrontRegardless()
+                }
+            } catch {
+                print("MenuBar Metal streaming failed: \(error)")
+                await MainActor.run {
+                    (NSApp.delegate as? AppDelegate)?.showMetalStreamUnavailableAlert()
+                }
             }
         }
     }

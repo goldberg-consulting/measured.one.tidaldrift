@@ -4,12 +4,14 @@ import ApplicationServices
 
 struct StatusCardView: View {
     @EnvironmentObject var appState: AppState
+    @ObservedObject private var localCast = LocalCastService.shared
     @ObservedObject private var clipboard = ClipboardSyncService.shared
     private let logger = Logger(subsystem: "com.tidaldrift", category: "StatusCard")
 
     @State private var isTogglingScreen = false
     @State private var isTogglingFile = false
     @State private var isTogglingSSH = false
+    @State private var isTogglingLocalCast = false
     @State private var showPermissionAlert = false
     @State private var permissionAlertMessage = ""
 
@@ -94,6 +96,56 @@ struct StatusCardView: View {
                     .frame(width: 40)
             }
 
+            HStack {
+                Text("Metal Streaming Host")
+                    .font(.caption)
+                Spacer()
+
+                if isTogglingLocalCast {
+                    ProgressView()
+                        .scaleEffect(0.6)
+                        .frame(width: 40)
+                } else {
+                    Toggle("", isOn: Binding(
+                        get: { localCast.isHosting },
+                        set: { newValue in
+                            isTogglingLocalCast = true
+                            Task {
+                                defer { Task { @MainActor in isTogglingLocalCast = false } }
+                                if newValue {
+                                    do {
+                                        try await localCast.startHosting()
+                                    } catch {
+                                        await MainActor.run {
+                                            permissionAlertMessage = error.localizedDescription
+                                            showPermissionAlert = true
+                                        }
+                                    }
+                                } else {
+                                    localCast.stopHosting()
+                                }
+                            }
+                        }
+                    ))
+                    .toggleStyle(.switch)
+                    .scaleEffect(0.7)
+                    .frame(width: 40)
+                }
+            }
+            
+            // Show encrypted badge when auth is active
+            if localCast.isHosting && localCast.isAuthEnabled {
+                HStack(spacing: 4) {
+                    Image(systemName: "lock.fill")
+                        .font(.caption2)
+                        .foregroundColor(.green)
+                    Text("Encrypted")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                    Spacer()
+                }
+            }
+            
             // Accessibility permission (required for remote input control)
             HStack {
                 Text("Input Control")

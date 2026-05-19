@@ -7,6 +7,9 @@ struct DeviceCardView: View {
     
     @State private var isPressed = false
     @State private var isTargetedForDrop = false
+    @State private var showPINEntry = false
+    @State private var showLocalCastError = false
+    
     @ObservedObject private var dropService = TidalDropService.shared
     
     /// Active transfer to/from this device
@@ -39,6 +42,24 @@ struct DeviceCardView: View {
         .onTapGesture { handleTap() }
         .onDrop(of: [.fileURL], isTargeted: $isTargetedForDrop) { providers in
             handleDrop(providers: providers)
+        }
+        .sheet(isPresented: $showPINEntry) {
+            LocalCastPINEntryView(
+                deviceName: device.name,
+                savedPassword: savedDevicePassword,
+                onConnect: { password in
+                    showPINEntry = false
+                    connectLocalCast(password: password)
+                },
+                onCancel: {
+                    showPINEntry = false
+                }
+            )
+        }
+        .alert("Metal Stream Unavailable", isPresented: $showLocalCastError) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text("Could not connect to the remote Metal streaming host. Make sure TidalDrift is running on the remote Mac with Metal Streaming hosting enabled.")
         }
     }
     
@@ -82,11 +103,38 @@ struct DeviceCardView: View {
     
     /// Look up saved password for this device from Keychain.
     private var savedDevicePassword: String? {
-        guard let creds = try? KeychainService.shared.getCredential(for: device.stableId) else {
+        guard let creds = try? KeychainService.shared.getCredential(for: device) else {
             return nil
         }
         return creds.password.isEmpty ? nil : creds.password
     }
+    
+    private func startLocalCast() {
+        // If saved credentials exist, auto-connect without showing the sheet
+        if device.localCastAuthRequired == true, let password = savedDevicePassword {
+            connectLocalCast(password: password)
+        } else if device.localCastAuthRequired == true {
+            showPINEntry = true
+        } else {
+            connectLocalCast(password: nil)
+        }
+    }
+    
+    private func connectLocalCast(password: String?) {
+        Task {
+            do {
+                await WakeOnLANService.shared.prepareForConnection(to: device, service: .localCast)
+                let viewer = try await LocalCastService.shared.connect(to: device, password: password)
+                await MainActor.run {
+                    viewer.showWindow(nil)
+                }
+            } catch {
+                print("❌ LocalCast: Connection failed: \(error.localizedDescription)")
+                await MainActor.run { showLocalCastError = true }
+            }
+        }
+    }
+    
     
     private func handleDrop(providers: [NSItemProvider]) -> Bool {
         let targetDevice = device
@@ -383,19 +431,37 @@ struct DeviceCardView: View {
     
     private var actionButtonsSection: some View {
         VStack(spacing: 6) {
-            Button(action: { onTap() }) {
+            if device.supportsLocalCast {
                 HStack(spacing: 4) {
-                    Image(systemName: device.isTidalDriftPeer ? "macwindow.on.rectangle" : "link")
-                    Text(device.isTidalDriftPeer ? "SCREEN SHARE" : "CONNECT")
+                    Button(action: { startLocalCast() }) {
+                        HStack(spacing: 3) {
+                            Image(systemName: "bolt.fill")
+                            Text("METAL STREAM")
+                        }
+                        .font(.system(size: 9, weight: .bold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 6)
+                        .background(Capsule().fill(Color.purple))
+                        .foregroundColor(.white)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Metal-accelerated full-desktop streaming")
                 }
-                .font(.system(size: 9, weight: .bold))
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 6)
-                .background(Capsule().fill(device.isTidalDriftPeer ? Color.tidalDriftPeer : Color.accentColor))
-                .foregroundColor(.white)
+            } else {
+                Button(action: { onTap() }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: device.isTidalDriftPeer ? "macwindow.on.rectangle" : "link")
+                        Text(device.isTidalDriftPeer ? "SCREEN SHARE" : "CONNECT")
+                    }
+                    .font(.system(size: 9, weight: .bold))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 6)
+                    .background(Capsule().fill(device.isTidalDriftPeer ? Color.tidalDriftPeer : Color.accentColor))
+                    .foregroundColor(.white)
+                }
+                .buttonStyle(.plain)
+                .help("Standard screen sharing")
             }
-            .buttonStyle(.plain)
-            .help("Standard screen sharing")
             
             HStack(spacing: 6) {
                 if device.isTidalDriftPeer || device.services.contains(.ssh) {

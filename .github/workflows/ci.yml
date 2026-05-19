@@ -11,6 +11,43 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  pre-commit:
+    name: Pre-commit
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pre-commit and SwiftLint
+        run: brew install pre-commit swiftlint
+
+      - name: Run pre-commit hooks
+        run: pre-commit run --all-files
+
+  homebrew-cask:
+    name: Homebrew Cask
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Style cask
+        run: brew style Casks/tidaldrift.rb
+
+      - name: Verify cask asset checksum
+        run: |
+          VERSION=$(ruby -ne 'puts $1 if /^\s*version "([^"]+)"/' Casks/tidaldrift.rb)
+          SHA=$(ruby -ne 'puts $1 if /^\s*sha256 "([^"]+)"/' Casks/tidaldrift.rb)
+          URL="https://github.com/goldberg-consulting/measured.one.tidaldrift/releases/download/v${VERSION}/TidalDrift-${VERSION}.dmg"
+          curl --fail --location --output /tmp/TidalDrift.dmg "$URL"
+          echo "${SHA}  /tmp/TidalDrift.dmg" | shasum -a 256 --check
+
+      - name: Dry-run cask install
+        run: |
+          brew tap-new local/tidaldrift
+          mkdir -p "$(brew --repository)/Library/Taps/local/homebrew-tidaldrift/Casks"
+          cp Casks/tidaldrift.rb "$(brew --repository)/Library/Taps/local/homebrew-tidaldrift/Casks/tidaldrift.rb"
+          brew install --cask --dry-run local/tidaldrift/tidaldrift
+          brew untap --force local/tidaldrift
+
   lint:
     name: SwiftLint
     runs-on: macos-15

@@ -11,6 +11,10 @@ struct DiscoveredDevice: Identifiable, Codable, Hashable {
     var savedCredentialRef: String?
     var port: Int
     
+    /// Advertised LocalCast auth requirement from Bonjour TXT (`auth=1/0`).
+    /// nil means unknown (older hosts or unresolved TXT).
+    var localCastAuthRequired: Bool?
+    
     // TidalDrift peer info (if running on remote machine)
     var isTidalDriftPeer: Bool
     var peerModelName: String?
@@ -21,6 +25,7 @@ struct DiscoveredDevice: Identifiable, Codable, Hashable {
     var peerUserName: String?
     var peerUptimeHours: Int?
     var peerTidalDriftName: String?
+    var peerId: String?
     
     /// Display name: prefer the peer's custom TidalDrift name, fall back to discovered name
     var displayName: String {
@@ -30,9 +35,35 @@ struct DiscoveredDevice: Identifiable, Codable, Hashable {
         return name
     }
     
-    /// Stable identifier based on name + IP for credential storage
+    /// Stable identifier based on name + IP for legacy credential migration.
     var stableId: String {
         "\(name.lowercased().replacingOccurrences(of: " ", with: "-"))_\(ipAddress)"
+    }
+
+    /// Stable device identity for credentials and Wake-on-LAN metadata.
+    var identityKey: String {
+        if let credentialRef = Self.normalizedIdentityComponent(savedCredentialRef) {
+            return "manual:\(credentialRef)"
+        }
+
+        if isTrusted, let peerId = Self.normalizedIdentityComponent(peerId) {
+            return "peer:\(peerId)"
+        }
+
+        if let hostname = Self.normalizedHostname(hostname) {
+            return "host:\(hostname)"
+        }
+
+        return "manual:\(id.uuidString.lowercased())"
+    }
+
+    /// Stable key for discovery cache merges. Peer IDs arrive via Bonjour/UDP,
+    /// so they are not used for secrets until the device is trusted.
+    var discoveryKey: String {
+        if let peerId = Self.normalizedIdentityComponent(peerId) {
+            return "peer:\(peerId)"
+        }
+        return identityKey
     }
     
     init(id: UUID = UUID(),
@@ -44,6 +75,7 @@ struct DiscoveredDevice: Identifiable, Codable, Hashable {
          isTrusted: Bool = false,
          savedCredentialRef: String? = nil,
          port: Int = 5900,
+         localCastAuthRequired: Bool? = nil,
          isTidalDriftPeer: Bool = false,
          peerModelName: String? = nil,
          peerModelIdentifier: String? = nil,
@@ -52,7 +84,8 @@ struct DiscoveredDevice: Identifiable, Codable, Hashable {
          peerMacOSVersion: String? = nil,
          peerUserName: String? = nil,
          peerUptimeHours: Int? = nil,
-         peerTidalDriftName: String? = nil) {
+         peerTidalDriftName: String? = nil,
+         peerId: String? = nil) {
         self.id = id
         self.name = name
         self.hostname = hostname
@@ -62,6 +95,7 @@ struct DiscoveredDevice: Identifiable, Codable, Hashable {
         self.isTrusted = isTrusted
         self.savedCredentialRef = savedCredentialRef
         self.port = port
+        self.localCastAuthRequired = localCastAuthRequired
         self.isTidalDriftPeer = isTidalDriftPeer
         self.peerModelName = peerModelName
         self.peerModelIdentifier = peerModelIdentifier
@@ -71,6 +105,7 @@ struct DiscoveredDevice: Identifiable, Codable, Hashable {
         self.peerUserName = peerUserName
         self.peerUptimeHours = peerUptimeHours
         self.peerTidalDriftName = peerTidalDriftName
+        self.peerId = peerId
     }
     
     enum ServiceType: String, Codable, CaseIterable {
@@ -80,6 +115,7 @@ struct DiscoveredDevice: Identifiable, Codable, Hashable {
         case ssh = "_ssh._tcp."
         case tidalDrift = "_tidaldrift._tcp."
         case tidalDrop = "_tidaldrop._tcp."
+        case localCast = "_tidaldrift-cast._udp."
         
         var displayName: String {
             switch self {
@@ -89,6 +125,7 @@ struct DiscoveredDevice: Identifiable, Codable, Hashable {
             case .ssh: return "SSH"
             case .tidalDrift: return "TidalDrift"
             case .tidalDrop: return "TidalDrop"
+            case .localCast: return "LocalCast"
             }
         }
         
@@ -100,6 +137,7 @@ struct DiscoveredDevice: Identifiable, Codable, Hashable {
             case .ssh: return "terminal"
             case .tidalDrift: return "wave.3.right"
             case .tidalDrop: return "arrow.down.doc"
+            case .localCast: return "bolt.fill"
             }
         }
     }
@@ -171,6 +209,37 @@ struct DiscoveredDevice: Identifiable, Codable, Hashable {
     
     static func == (lhs: DiscoveredDevice, rhs: DiscoveredDevice) -> Bool {
         lhs.id == rhs.id
+    }
+
+    static func normalizedHostname(_ value: String?) -> String? {
+        guard var hostname = value?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !hostname.isEmpty,
+              hostname != "unknown",
+              hostname != "resolving..." else {
+            return nil
+        }
+
+        hostname = hostname.replacingOccurrences(of: ".local.", with: ".local")
+        hostname = hostname.trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        if hostname.range(of: #"^\d{1,3}(\.\d{1,3}){3}$"#, options: .regularExpression) != nil {
+            return nil
+        }
+        return hostname.hasSuffix(".local") ? hostname : "\(hostname).local"
+    }
+
+    static func normalizedIdentityComponent(_ value: String?) -> String? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !value.isEmpty,
+              value != "unknown",
+              value != "resolving..." else {
+            return nil
+        }
+
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_.:"))
+        let normalized = value.unicodeScalars.map { scalar in
+            allowed.contains(scalar) ? Character(scalar) : "-"
+        }
+        return String(normalized)
     }
 }
 

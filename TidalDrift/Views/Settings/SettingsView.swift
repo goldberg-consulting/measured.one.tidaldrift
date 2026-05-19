@@ -10,6 +10,11 @@ struct SettingsView: View {
                     Label("General", systemImage: "gear")
                 }
             
+            LocalCastSettingsView()
+                .tabItem {
+                    Label("Metal Streaming", systemImage: "bolt.fill")
+                }
+            
             NetworkSettingsView()
                 .tabItem {
                     Label("Network", systemImage: "network")
@@ -167,13 +172,39 @@ struct GeneralSettingsView: View {
                             .foregroundColor(.purple)
                         VStack(alignment: .leading) {
                             Text("Show Experimental Features")
-                            Text("Enable experimental features in sidebar")
+                            Text("Enable Clipboard Sync in sidebar")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                         }
                     }
                 }
+
+                #if DEBUG
+                if appState.settings.showExperimentalFeatures {
+                    Toggle(isOn: Binding(
+                        get: { AppStreamingService.shared.isExperimentalEnabled },
+                        set: { AppStreamingService.shared.setExperimentalEnabled($0) }
+                    )) {
+                        HStack {
+                            Image(systemName: "app.connected.to.app.below.fill")
+                                .foregroundColor(.orange)
+                            VStack(alignment: .leading) {
+                                Text("App Streaming (debug)")
+                                Text("Per-window streaming — dormant pipeline, debug builds only")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                    }
+                    .padding(.leading, 24)
+                }
+                #endif
+
+                Text("⚠️ These features are experimental and may not work reliably. Enable at your own risk.")
+                    .font(.caption)
+                    .foregroundColor(.orange)
             }
+
             
             Section {
                 Picker("Appearance", selection: $appState.settings.theme) {

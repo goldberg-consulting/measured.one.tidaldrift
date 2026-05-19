@@ -14,7 +14,7 @@ VERSION_FILE="$SCRIPT_DIR/version.env"
 VERSION="${APP_VERSION:-1.4.3}"
 BUILD_NUMBER="${BUILD_NUMBER:-1}"
 
-RUN_APP=true; [[ "$1" == "--no-run" ]] && RUN_APP=false
+RUN_APP=true; [[ "${1:-}" == "--no-run" ]] && RUN_APP=false
 
 echo ""
 echo -e "${BLUE}╔══════════════════════════════════════════════════════════╗${NC}"
@@ -83,7 +83,7 @@ cat > "$APP_NAME.app/Contents/Info.plist" << EOF
     <key>LSUIElement</key><true/>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSLocalNetworkUsageDescription</key><string>TidalDrift discovers Macs on your network.</string>
-    <key>NSBonjourServices</key><array><string>_rfb._tcp</string><string>_smb._tcp</string><string>_afpovertcp._tcp</string><string>_ssh._tcp</string><string>_tidaldrift._tcp</string><string>_tidaldrop._tcp</string><string>_tidalclip._tcp</string><string>_tidalstream._tcp</string></array>
+    <key>NSBonjourServices</key><array><string>_rfb._tcp</string><string>_smb._tcp</string><string>_afpovertcp._tcp</string><string>_ssh._tcp</string><string>_tidaldrift._tcp</string><string>_tidaldrop._tcp</string><string>_tidaldrift-cast._udp</string><string>_tidalclip._tcp</string><string>_tidalstream._tcp</string></array>
 </dict></plist>
 EOF
 echo -n "APPL????" > "$APP_NAME.app/Contents/PkgInfo"

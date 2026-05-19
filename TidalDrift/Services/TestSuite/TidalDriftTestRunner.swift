@@ -112,6 +112,7 @@ class TidalDriftTestRunner: ObservableObject {
         // Bonjour
         allTests.append(("Peer Service Advertising", "Bonjour", testPeerAdvertising))
         allTests.append(("Peer Service Discovery", "Bonjour", testPeerDiscovery))
+        allTests.append(("LocalCast Bonjour Advertise+Browse", "Bonjour", testLocalCastBonjour))
         allTests.append(("TidalDrop Listener Active", "Bonjour", testTidalDropListener))
         
         // Network
@@ -119,11 +120,30 @@ class TidalDriftTestRunner: ObservableObject {
         allTests.append(("TCP Port Bind", "Network", testTCPPortBind))
         allTests.append(("Loopback TCP Roundtrip", "Network", testLoopbackTCPRoundtrip))
         allTests.append(("Loopback UDP Roundtrip", "Network", testLoopbackUDPRoundtrip))
+        allTests.append(("Peer Identity Stable Across IP Change", "Network", testPeerIdentityStableAcrossIPChange))
+        allTests.append(("Hostname Identity Fallback", "Network", testHostnameIdentityFallback))
+        allTests.append(("Legacy Stable ID Migration Key", "Network", testLegacyStableIdRemainsAvailable))
+        allTests.append(("Wake-on-LAN Broadcast Planning", "Network", testWakeOnLANBroadcastPlanning))
+        allTests.append(("Wake-on-LAN MAC Migration", "Network", testWakeOnLANMACMigration))
+        
+        // Security
+        allTests.append(("Session Key Generation", "Security", testSessionKeyGeneration))
+        allTests.append(("HKDF Key Derivation", "Security", testHKDFKeyDerivation))
+        allTests.append(("AES-GCM Encrypt/Decrypt", "Security", testAESGCMRoundtrip))
+        allTests.append(("Tampered Ciphertext Rejected", "Security", testTamperedCiphertextRejected))
+        allTests.append(("Wrong Password Rejected", "Security", testWrongPasswordRejected))
+        allTests.append(("Keychain Legacy Credential Migration", "Security", testKeychainLegacyCredentialMigration))
+        allTests.append(("Keychain Credential Upsert", "Security", testKeychainCredentialUpsert))
         
         // TidalDrop File Transfer
         allTests.append(("Loopback File Transfer (small)", "TidalDrop", testLoopbackSmallFileTransfer))
         allTests.append(("Loopback File Transfer (1MB)", "TidalDrop", testLoopbackLargeFileTransfer))
         allTests.append(("Drop Destination Folder Exists", "TidalDrop", testDropDestinationExists))
         
+        // LocalCast
+        allTests.append(("Streaming Tuning Interpolation", "LocalCast", testStreamingTuningInterpolation))
+        allTests.append(("Quality Payload Encode/Decode", "LocalCast", testQualityPayloadCodable))
+        allTests.append(("Packet Protocol Encode/Decode", "LocalCast", testPacketProtocol))
+        allTests.append(("Host Session Start (loopback)", "LocalCast", testHostSessionLoopback))
     }
 }

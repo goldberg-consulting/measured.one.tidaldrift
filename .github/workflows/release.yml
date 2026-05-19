@@ -48,15 +48,28 @@ jobs:
           echo "Found certificate: $DEV_ID"
 
       - name: Store notarization credentials
+        id: notarization
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           TEAM_ID: ${{ secrets.TEAM_ID }}
           APP_SPECIFIC_PASSWORD: ${{ secrets.APP_SPECIFIC_PASSWORD }}
         run: |
-          xcrun notarytool store-credentials "notarytool-profile" \
+          if [ -z "$APPLE_ID" ] || [ -z "$TEAM_ID" ] || [ -z "$APP_SPECIFIC_PASSWORD" ]; then
+            echo "Notarization credentials are not configured; publishing a signed-only DMG."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if xcrun notarytool store-credentials "notarytool-profile" \
             --apple-id "$APPLE_ID" \
             --team-id "$TEAM_ID" \
-            --password "$APP_SPECIFIC_PASSWORD"
+            --password "$APP_SPECIFIC_PASSWORD"; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Notarization unavailable; publishing a signed-only DMG."
+            echo "This is expected while Apple Developer agreements are missing or expired."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Build (Release)
         working-directory: TidalDrift
@@ -126,10 +139,17 @@ jobs:
           echo "DMG_PATH=$DMG" >> "$GITHUB_ENV"
 
       - name: Notarize
+        if: steps.notarization.outputs.enabled == 'true'
         working-directory: TidalDrift
         run: |
           xcrun notarytool submit "$DMG_PATH" --keychain-profile "notarytool-profile" --wait
           xcrun stapler staple "$DMG_PATH"
+
+      - name: Note signed-only DMG
+        if: steps.notarization.outputs.enabled != 'true'
+        run: |
+          echo "::warning::Publishing signed-only DMG because notarization is unavailable."
+          echo "::warning::Homebrew postflight removes quarantine until Apple agreements are renewed."
 
       - name: Upload DMG to release
         working-directory: TidalDrift
@@ -162,6 +182,7 @@ jobs:
           cd /tmp/tap
 
           CASK="Casks/tidaldrift.rb"
+          cp "$GITHUB_WORKSPACE/Casks/tidaldrift.rb" "$CASK"
           sed -i '' "s/version \".*\"/version \"${APP_VERSION}\"/" "$CASK"
           sed -i '' "s/sha256 \".*\"/sha256 \"${SHA}\"/" "$CASK"
 

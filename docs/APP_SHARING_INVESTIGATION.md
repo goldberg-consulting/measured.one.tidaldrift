@@ -1,9 +1,13 @@
 # App-Sharing Feature Investigation
 
-**Date:** 2025-02  
+**Date:** 2025-02
 **Scope:** TidalDrift app-sharing (remote app list + app-window control) per `.cursor/agents/app-sharing-investigator.md`
 
 ---
+
+## 2026-05 Status
+
+The original infinite-loading failure has been partially addressed: the client now has an app-list timeout, and the LocalCast host sends an empty app-list response when `SCShareableContent` fails. App Control remains an experimental/dormant surface, so current work should focus on avoiding misleading entry points, advertising the host's actual LocalCast auth state, and validating focus/isolate requests against the last app list.
 
 ## 1. Data Flow Summary
 
@@ -36,22 +40,22 @@
 
 ## 2. Root Causes (Client Does Not See Remote Apps)
 
-1. **Host not running LocalCast**  
+1. **Host not running LocalCast**
    UDP 5904 is only bound when `LocalCastService.startHosting()` is active on the host. If the user only enabled macOS Screen Sharing (VNC) and did not start LocalCast hosting, no process listens on 5904. The client sends heartbeats and `appListRequest` into the void → no response → app list stays empty and/or loading.
 
-2. **Host lacks Screen Recording permission**  
-   `HostSession.handleAppListRequest` uses `SCShareableContent.excludingDesktopWindows(...)`, which requires Screen Recording. If the host app does not have it, the call throws. The host catches the error and **only logs**; it does **not** send an empty list or error packet to the client. The client never receives a reply → `isLoadingApps` stays `true` indefinitely.
+2. **Host lacks Screen Recording permission**
+   `HostSession.handleAppListRequest` uses `SCShareableContent.excludingDesktopWindows(...)`, which requires Screen Recording. If the host app does not have it, the current host path sends an empty app list so the client can stop loading, but the user still needs clear permission guidance.
 
-3. **No loading timeout**  
-   If the host never responds (not hosting, or permission failure), the client has no timeout to clear `isLoadingApps`. The panel can show "Loading remote apps..." forever.
+3. **Timeout and error state are required**
+   If the host never responds (not hosting, or network failure), the client timeout clears `isLoadingApps` and shows a failure hint. Keep this behavior whenever App Control is refactored.
 
-4. **Firewall / network**  
+4. **Firewall / network**
    If the host firewall (or network) drops UDP 5904, the client gets no heartbeat and no app list. Diagnostic timer will eventually set `connectionPhase = .firewallBlocked` (after 6s with no heartbeat), but the app list request is still never answered.
 
-5. **Timing (minor)**  
+5. **Timing (minor)**
    App Control panel requests the list after a fixed 1s delay. By then `hostEndpoint` is set and heartbeats are in flight, so the request is usually sent. If the host is slow to start or auth is still in progress, the host can still process `appListRequest` when it arrives; no strict ordering is required.
 
-6. **StreamingNetworkService path**  
+6. **StreamingNetworkService path**
    Remote apps there come from `_tidalstream._tcp` hosts that implement the TCP `LIST_APPS` / custom JSON protocol. If that service is not running or uses a different format, `discoveredHosts` / `allRemoteApps` stay empty for that path only.
 
 ---
@@ -69,16 +73,16 @@
 
 **Fix (localized changes)**
 
-1. **Host: always respond to app list request**  
+1. **Host: always respond to app list request**
    In `HostSession.handleAppListRequest(replyTo:)`, in the `catch` block, send an **empty** `appListResponse` (e.g. `payload: "[]".data(using: .utf8)!`) so the client can set `isLoadingApps = false` and show “No apps found” instead of spinning forever. Optionally add a small error flag in the payload later if needed.
 
-2. **Client: loading timeout**  
+2. **Client: loading timeout**
    In `ClientSession.requestAppList()`, after sending the request, schedule a fallback (e.g. 5–8s) that sets `isLoadingApps = false` if it is still true (and optionally show a “Could not load apps” message in the panel). Prevents infinite loading when the host is down or not hosting.
 
-3. **UX: clarify dependency on LocalCast hosting**  
+3. **UX: clarify dependency on LocalCast hosting**
    In the App Control panel or when opening System Screen Share, show a short line such as “App list requires the host Mac to have LocalCast turned on.” So users know that VNC alone is not enough for the app list.
 
-4. **Optional: validate PIDs on host**  
+4. **Optional: validate PIDs on host**
    Maintain a set of PIDs that were in the last sent app list (or that pass a simple “was recently enumerated” check). In `handleFocusAppRequest` / `handleIsolateAppRequest`, ignore or reject requests whose PID is not in that set (or not in the current shareable content). Reduces abuse from arbitrary PID injection.
 
 **Testing**

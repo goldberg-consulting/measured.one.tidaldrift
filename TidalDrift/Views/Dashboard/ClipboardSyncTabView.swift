@@ -252,21 +252,6 @@ struct ClipboardHistoryRow: View {
     }
 }
 
-private struct BulletPoint: View {
-    let text: String
-    let done: Bool
-
-    var body: some View {
-        HStack(alignment: .top, spacing: 6) {
-            Image(systemName: done ? "checkmark.circle.fill" : "circle")
-                .foregroundColor(done ? .green : .secondary)
-                .font(.caption)
-            Text(text)
-                .font(.subheadline)
-        }
-    }
-}
-
 struct ClipboardSyncTabView_Previews: PreviewProvider {
     static var previews: some View {
         ClipboardSyncTabView()

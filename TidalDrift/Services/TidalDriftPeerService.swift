@@ -10,6 +10,7 @@ class TidalDriftPeerService: NSObject, ObservableObject {
     static let shared = TidalDriftPeerService()
     
     private static let logger = Logger(subsystem: "com.tidaldrift", category: "PeerService")
+    private static let installIdKey = "com.tidaldrift.peerInstallId"
     
     // Background queue for file logging to avoid blocking main thread
     private static let logQueue = DispatchQueue(label: "com.tidaldrift.peer.log", qos: .utility)
@@ -60,6 +61,16 @@ class TidalDriftPeerService: NSObject, ObservableObject {
     
     private let serviceType = "_tidaldrift._tcp"
     private let dropServiceType = "_tidaldrop._tcp"
+
+    static var localPeerId: String {
+        if let existing = UserDefaults.standard.string(forKey: installIdKey), !existing.isEmpty {
+            return existing
+        }
+
+        let peerId = UUID().uuidString.lowercased()
+        UserDefaults.standard.set(peerId, forKey: installIdKey)
+        return peerId
+    }
     
     /// The advertised name: custom TidalDrift display name if set, otherwise system computer name
     var advertisedName: String {
@@ -73,6 +84,7 @@ class TidalDriftPeerService: NSObject, ObservableObject {
     private let localInfo: PeerInfo
     
     struct PeerInfo: Codable {
+        let peerId: String?
         let hostname: String
         let ipAddress: String
         let modelName: String
@@ -94,6 +106,7 @@ class TidalDriftPeerService: NSObject, ObservableObject {
         let ipAddress = NetworkUtils.getLocalIPAddress() ?? "Unknown"
         
         localInfo = PeerInfo(
+            peerId: Self.localPeerId,
             hostname: hostname,
             ipAddress: ipAddress,
             modelName: Self.getModelName(),
@@ -160,6 +173,7 @@ class TidalDriftPeerService: NSObject, ObservableObject {
         
         let customName = AppState.shared.settings.tidalDriftDisplayName
         var txtParts = [
+            "peerId=\(Self.localPeerId)",
             "model=\(localInfo.modelName)",
             "modelId=\(localInfo.modelIdentifier)",
             "cpu=\(localInfo.processorInfo)",
@@ -258,6 +272,7 @@ class TidalDriftPeerService: NSObject, ObservableObject {
     
     private func createTXTRecord() -> NWTXTRecord {
         var txt = NWTXTRecord()
+        txt["peerId"] = Self.localPeerId
         txt["model"] = localInfo.modelName
         txt["modelId"] = localInfo.modelIdentifier
         txt["cpu"] = localInfo.processorInfo
@@ -273,6 +288,7 @@ class TidalDriftPeerService: NSObject, ObservableObject {
     
     private func createTXTDictionary() -> [String: Data] {
         var dict = [String: Data]()
+        dict["peerId"] = Self.localPeerId.data(using: .utf8)
         dict["model"] = localInfo.modelName.data(using: .utf8)
         dict["modelId"] = localInfo.modelIdentifier.data(using: .utf8)
         dict["cpu"] = localInfo.processorInfo.data(using: .utf8)
@@ -690,6 +706,7 @@ class TidalDriftPeerService: NSObject, ObservableObject {
             Self.log("   Model: \(modelName), OS: \(osVersion), User: \(userName)")
             
             peer = PeerInfo(
+                peerId: txt?["peerId"],
                 hostname: name,
                 ipAddress: actualIP,
                 modelName: modelName,
@@ -809,6 +826,7 @@ class TidalDriftPeerService: NSObject, ObservableObject {
     
     private func addPeer(name: String, ip: String, txt: NWTXTRecord?) {
         let peer = PeerInfo(
+            peerId: txt?["peerId"],
             hostname: name,
             ipAddress: ip,
             modelName: txt?["model"] ?? "Unknown",
@@ -1042,6 +1060,7 @@ extension TidalDriftPeerService: NetServiceBrowserDelegate {
         Self.log("✅ Resolved \(sender.name) -> \(ipAddress)")
         
         let peer = PeerInfo(
+            peerId: txtValues["peerId"],
             hostname: sender.name,
             ipAddress: ipAddress,
             modelName: txtValues["model"] ?? "Unknown",

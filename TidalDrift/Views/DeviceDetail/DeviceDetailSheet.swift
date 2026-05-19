@@ -4,51 +4,51 @@ struct DeviceDetailSheet: View {
     let device: DiscoveredDevice
     @StateObject private var viewModel: DeviceDetailViewModel
     @Environment(\.dismiss) var dismiss
-    
+
     // Wake-on-LAN state
     @State private var macAddress: String = ""
     @State private var isWaking = false
     @State private var wakeResult: WakeResult?
     @State private var isDiscoveringMAC = false
-    
+
     enum WakeResult {
         case success
         case failed
         case waiting
     }
-    
+
     init(device: DiscoveredDevice) {
         self.device = device
         _viewModel = StateObject(wrappedValue: DeviceDetailViewModel(device: device))
     }
-    
+
     var body: some View {
         VStack(spacing: 0) {
             header
-            
+
             Divider()
-            
+
             ScrollView {
                 VStack(spacing: 24) {
                     connectionSection
-                    
+
                     wakeOnLANSection
-                    
+
                     servicesSection
-                    
+
                     peerInfoSection
-                    
+
                     credentialsSection
-                    
+
                     if !viewModel.connectionHistory.isEmpty {
                         historySection
                     }
                 }
                 .padding(24)
             }
-            
+
             Divider()
-            
+
             footer
         }
         .frame(width: 450, height: 580)
@@ -56,7 +56,7 @@ struct DeviceDetailSheet: View {
             Button("OK") {
                 viewModel.connectionError = nil
             }
-            
+
             // Add "Fix Remote" button if it's the "not permitted" error and device is a TidalDrift peer
             if let error = viewModel.connectionError,
                error.contains("not permitted") && device.isTidalDriftPeer {
@@ -72,9 +72,9 @@ struct DeviceDetailSheet: View {
                 if error.contains("not permitted") {
                     Text("""
                     \(error)
-                    
+
                     This is a known macOS bug. The remote machine needs to restart its Screen Sharing service.
-                    
+
                     \(device.isTidalDriftPeer ? "Click 'Fix Remote Screen Sharing' to fix automatically." : "On the remote Mac: System Settings → Sharing → Toggle Screen Sharing OFF then ON.")
                     """)
                 } else {
@@ -83,7 +83,7 @@ struct DeviceDetailSheet: View {
             }
         }
     }
-    
+
     private var header: some View {
         HStack(spacing: 16) {
             ZStack {
@@ -96,21 +96,21 @@ struct DeviceDetailSheet: View {
                         )
                     )
                     .frame(width: 60, height: 60)
-                
+
                 Image(systemName: device.deviceIcon)
                     .font(.system(size: 28))
                     .foregroundColor(.accentColor)
             }
-            
+
             VStack(alignment: .leading, spacing: 4) {
                 Text(device.name)
                     .font(.title2)
                     .fontWeight(.semibold)
-                
+
                 Text(device.ipAddress)
                     .font(.subheadline)
                     .foregroundColor(.secondary)
-                
+
                 HStack(spacing: 6) {
                     StatusIndicator(isOnline: device.isOnline, size: 8)
                     Text(device.statusText)
@@ -118,9 +118,9 @@ struct DeviceDetailSheet: View {
                         .foregroundColor(device.isOnline ? .green : .secondary)
                 }
             }
-            
+
             Spacer()
-            
+
             Button {
                 dismiss()
             } label: {
@@ -132,15 +132,15 @@ struct DeviceDetailSheet: View {
         }
         .padding(20)
     }
-    
+
     @State private var isFixingRemoteScreenSharing = false
     @State private var fixRemoteResult: Bool?
-    
+
     private var connectionSection: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Quick Connect")
                 .font(.headline)
-            
+
             HStack(spacing: 12) {
                 if device.services.contains(.screenSharing) {
                     ConnectButton(
@@ -153,7 +153,7 @@ struct DeviceDetailSheet: View {
                         }
                     }
                 }
-                
+
                 if device.services.contains(.fileSharing) {
                     ConnectButton(
                         title: "File Share",
@@ -166,7 +166,7 @@ struct DeviceDetailSheet: View {
                     }
                 }
             }
-            
+
             HStack {
                 Toggle("Trust this device", isOn: Binding(
                     get: { viewModel.isTrusted },
@@ -174,9 +174,9 @@ struct DeviceDetailSheet: View {
                 ))
                 .toggleStyle(.switch)
                 .controlSize(.small)
-                
+
                 Spacer()
-                
+
                 // Fix Remote Screen Sharing button (for "not permitted" error)
                 if device.isTidalDriftPeer && device.services.contains(.screenSharing) {
                     Button {
@@ -186,7 +186,7 @@ struct DeviceDetailSheet: View {
                             let success = await ScreenShareConnectionService.shared.requestRemoteScreenSharingRestart(ipAddress: device.ipAddress)
                             fixRemoteResult = success
                             isFixingRemoteScreenSharing = false
-                            
+
                             // Auto-clear result after 3 seconds
                             try? await Task.sleep(nanoseconds: 3_000_000_000)
                             fixRemoteResult = nil
@@ -209,7 +209,7 @@ struct DeviceDetailSheet: View {
                     .controlSize(.small)
                     .help("Restart Screen Sharing on remote machine (fixes 'not permitted' error)")
                 }
-                
+
                 Button {
                     Task {
                         await viewModel.testConnection()
@@ -229,7 +229,7 @@ struct DeviceDetailSheet: View {
                 .buttonStyle(.bordered)
                 .controlSize(.small)
             }
-            
+
             // Show fix instructions if not a TidalDrift peer
             if !device.isTidalDriftPeer {
                 Text("💡 If you see 'not permitted' error, toggle Screen Sharing off/on on the remote Mac")
@@ -243,7 +243,7 @@ struct DeviceDetailSheet: View {
                 .fill(Color(nsColor: .controlBackgroundColor))
         )
     }
-    
+
     private var wakeOnLANSection: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
@@ -251,16 +251,16 @@ struct DeviceDetailSheet: View {
                     .foregroundColor(.orange)
                 Text("Wake-on-LAN")
                     .font(.headline)
-                
+
                 Spacer()
-                
+
                 if !device.isOnline {
                     Text("Device Offline")
                         .font(.caption)
                         .foregroundColor(.orange)
                 }
             }
-            
+
             HStack(spacing: 8) {
                 TextField("MAC Address (AA:BB:CC:DD:EE:FF)", text: $macAddress)
                     .textFieldStyle(.roundedBorder)
@@ -271,7 +271,7 @@ struct DeviceDetailSheet: View {
                             macAddress = stored
                         }
                     }
-                
+
                 Button {
                     discoverMAC()
                 } label: {
@@ -286,7 +286,7 @@ struct DeviceDetailSheet: View {
                 .help("Auto-discover MAC address")
                 .disabled(isDiscoveringMAC || !device.isOnline)
             }
-            
+
             HStack {
                 Button {
                     wakeDevice()
@@ -305,7 +305,7 @@ struct DeviceDetailSheet: View {
                 .buttonStyle(.borderedProminent)
                 .tint(.orange)
                 .disabled(!WakeOnLANService.shared.isValidMACAddress(macAddress) || isWaking)
-                
+
                 if let result = wakeResult {
                     HStack(spacing: 4) {
                         switch result {
@@ -326,7 +326,7 @@ struct DeviceDetailSheet: View {
                     .font(.caption)
                 }
             }
-            
+
             Text("Wake-on-LAN sends a magic packet to power on sleeping Macs. The device must have WOL enabled in Energy Saver settings.")
                 .font(.caption2)
                 .foregroundColor(.secondary)
@@ -341,10 +341,10 @@ struct DeviceDetailSheet: View {
                 )
         )
     }
-    
+
     private func discoverMAC() {
         isDiscoveringMAC = true
-        
+
         Task {
             // Try to get MAC from ARP table
             if let mac = WakeOnLANService.shared.getMACAddress(for: device.ipAddress) {
@@ -355,34 +355,30 @@ struct DeviceDetailSheet: View {
                     mutableDevice.storedMACAddress = mac
                 }
             }
-            
+
             await MainActor.run {
                 isDiscoveringMAC = false
             }
         }
     }
-    
+
     private func wakeDevice() {
         guard WakeOnLANService.shared.isValidMACAddress(macAddress) else { return }
-        
+
         // Store MAC for future use
         var mutableDevice = device
         mutableDevice.storedMACAddress = macAddress
-        
+
         isWaking = true
         wakeResult = .waiting
-        
+
         Task {
-            let success = await WakeOnLANService.shared.wakeAndWait(
-                macAddress: macAddress,
-                ipAddress: device.ipAddress,
-                timeout: 30
-            )
-            
+            let success = await WakeOnLANService.shared.wakeAndWait(device: device, timeout: 30)
+
             await MainActor.run {
                 isWaking = false
                 wakeResult = success ? .success : .failed
-                
+
                 // Clear result after delay
                 DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
                     wakeResult = nil
@@ -390,12 +386,12 @@ struct DeviceDetailSheet: View {
             }
         }
     }
-    
+
     private var servicesSection: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Available Services")
                 .font(.headline)
-            
+
             if device.services.isEmpty {
                 Text("No services discovered")
                     .font(.subheadline)
@@ -406,12 +402,12 @@ struct DeviceDetailSheet: View {
                         Image(systemName: service.icon)
                             .foregroundColor(.accentColor)
                             .frame(width: 24)
-                        
+
                         Text(service.displayName)
                             .font(.subheadline)
-                        
+
                         Spacer()
-                        
+
                         Circle()
                             .fill(Color.green)
                             .frame(width: 8, height: 8)
@@ -426,7 +422,7 @@ struct DeviceDetailSheet: View {
                 .fill(Color(nsColor: .controlBackgroundColor))
         )
     }
-    
+
     @ViewBuilder
     private var peerInfoSection: some View {
         if device.isTidalDriftPeer {
@@ -444,30 +440,30 @@ struct DeviceDetailSheet: View {
                         .padding(.vertical, 4)
                         .background(Capsule().fill(Color.blue.opacity(0.1)))
                 }
-                
+
                 Divider()
-                
+
                 VStack(alignment: .leading, spacing: 8) {
                     if let model = device.peerModelName, !model.isEmpty {
                         PeerInfoRow(label: "Model", value: model, icon: "desktopcomputer")
                     }
-                    
+
                     if let processor = device.peerProcessorInfo, !processor.isEmpty {
                         PeerInfoRow(label: "Processor", value: processor, icon: "cpu")
                     }
-                    
+
                     if let memory = device.peerMemoryGB, memory > 0 {
                         PeerInfoRow(label: "Memory", value: "\(memory) GB RAM", icon: "memorychip")
                     }
-                    
+
                     if let macOS = device.peerMacOSVersion, !macOS.isEmpty {
                         PeerInfoRow(label: "macOS", value: macOS, icon: "applelogo")
                     }
-                    
+
                     if let user = device.peerUserName, !user.isEmpty {
                         PeerInfoRow(label: "User", value: user, icon: "person")
                     }
-                    
+
                     if let uptime = device.peerUptimeHours, uptime > 0 {
                         let days = uptime / 24
                         let hours = uptime % 24
@@ -487,15 +483,15 @@ struct DeviceDetailSheet: View {
             )
         }
     }
-    
+
     private var credentialsSection: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Text("Saved Credentials")
                     .font(.headline)
-                
+
                 Spacer()
-                
+
                 if viewModel.hasCredentials {
                     Button("Delete") {
                         viewModel.deleteCredentials()
@@ -505,16 +501,22 @@ struct DeviceDetailSheet: View {
                     .font(.caption)
                 }
             }
-            
+
             TextField("Username", text: $viewModel.username)
                 .textFieldStyle(.roundedBorder)
-            
+
             SecureField("Password", text: $viewModel.password)
                 .textFieldStyle(.roundedBorder)
-            
+
             Toggle("Save credentials in Keychain", isOn: $viewModel.saveCredentials)
                 .toggleStyle(.checkbox)
                 .controlSize(.small)
+
+            if let credentialError = viewModel.credentialError {
+                Text(credentialError)
+                    .font(.caption)
+                    .foregroundColor(.red)
+            }
         }
         .padding(16)
         .background(
@@ -522,24 +524,24 @@ struct DeviceDetailSheet: View {
                 .fill(Color(nsColor: .controlBackgroundColor))
         )
     }
-    
+
     private var historySection: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Connection History")
                 .font(.headline)
-            
+
             ForEach(viewModel.connectionHistory.prefix(5)) { record in
                 HStack {
                     Image(systemName: record.connectionType.icon)
                         .foregroundColor(.secondary)
                         .frame(width: 20)
-                    
+
                     Text(record.relativeTimestamp)
                         .font(.caption)
                         .foregroundColor(.secondary)
-                    
+
                     Spacer()
-                    
+
                     Image(systemName: record.wasSuccessful ? "checkmark.circle" : "xmark.circle")
                         .foregroundColor(record.wasSuccessful ? .green : .red)
                         .font(.caption)
@@ -552,15 +554,15 @@ struct DeviceDetailSheet: View {
                 .fill(Color(nsColor: .controlBackgroundColor))
         )
     }
-    
+
     private var footer: some View {
         HStack {
             Text("Last seen: \(device.lastSeen.formatted())")
                 .font(.caption)
                 .foregroundColor(.secondary)
-            
+
             Spacer()
-            
+
             Button("Done") {
                 dismiss()
             }
@@ -575,7 +577,7 @@ struct ConnectButton: View {
     let icon: String
     let isLoading: Bool
     let action: () -> Void
-    
+
     var body: some View {
         Button(action: action) {
             HStack {
@@ -598,22 +600,22 @@ struct PeerInfoRow: View {
     let label: String
     let value: String
     let icon: String
-    
+
     var body: some View {
         HStack {
             Image(systemName: icon)
                 .foregroundColor(.blue)
                 .frame(width: 20)
-            
+
             Text(label)
                 .font(.subheadline)
                 .foregroundColor(.secondary)
                 .frame(width: 80, alignment: .leading)
-            
+
             Text(value)
                 .font(.subheadline)
                 .lineLimit(1)
-            
+
             Spacer()
         }
     }
