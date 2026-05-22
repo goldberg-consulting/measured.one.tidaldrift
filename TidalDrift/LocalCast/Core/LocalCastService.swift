@@ -125,7 +125,7 @@ class LocalCastService: ObservableObject {
     private func startHosting(target: HostCaptureTarget) async throws {
         let permissions = LocalCastPermissions()
 
-        if !permissions.requestScreenCaptureIfNeeded() {
+        if !(await permissions.requestScreenCaptureIfNeeded()) {
             logger.info("Screen Recording denied -- waiting for user to grant in System Settings")
             let granted = await permissions.waitForScreenCaptureGrant(maxWait: 30)
             if !granted {
@@ -239,7 +239,14 @@ class LocalCastService: ObservableObject {
         // for an auth challenge that will never arrive.
         var resolvedPassword = device.localCastAuthRequired == false ? nil : password
         if device.localCastAuthRequired == true && (resolvedPassword == nil || resolvedPassword?.isEmpty == true) {
-            if let creds = try? KeychainService.shared.getCredential(for: device) {
+            // Run the auth-gated keychain read off the main thread so the
+            // biometric prompt does not freeze the UI. The active app is
+            // activated first so the system dialog appears in front.
+            await MainActor.run { NSApp.activate(ignoringOtherApps: true) }
+            let creds = await Task.detached(priority: .userInitiated) {
+                try? KeychainService.shared.getCredential(for: device)
+            }.value
+            if let creds {
                 resolvedPassword = creds.password
                 logger.info("🔐 Using saved credentials for \(device.name)")
             }

@@ -87,9 +87,48 @@ class KeychainService {
     }
 
     func getCredential(for deviceId: String) throws -> (username: String, password: String)? {
-        let context = LAContext()
-        context.localizedReason = "Access saved credentials for \(deviceId)"
+        try copyCredential(for: deviceId, allowUI: true)
+    }
 
+    func getCredential(for device: DiscoveredDevice) throws -> (username: String, password: String)? {
+        if let credentials = try copyCredential(for: device.identityKey, allowUI: true) {
+            return credentials
+        }
+
+        guard device.identityKey != device.stableId,
+              let legacy = try copyCredential(for: device.stableId, allowUI: true) else {
+            return nil
+        }
+
+        try saveCredential(for: device.identityKey, username: legacy.username, password: legacy.password)
+        try? deleteCredential(for: device.stableId)
+        return legacy
+    }
+
+    /// Reads a credential without ever triggering a biometric prompt or sheet.
+    /// Returns nil if the item exists but requires authentication. Use this
+    /// from SwiftUI view bodies and other paths where blocking the main
+    /// thread on Touch ID would freeze the UI. When you need the value for
+    /// an actual connection, call `getCredential(for:)` from a background
+    /// task after the app has been activated.
+    func peekCredential(for deviceId: String) -> (username: String, password: String)? {
+        guard let credentials = try? copyCredential(for: deviceId, allowUI: false) else {
+            return nil
+        }
+        return credentials
+    }
+
+    func peekCredential(for device: DiscoveredDevice) -> (username: String, password: String)? {
+        if let credentials = peekCredential(for: device.identityKey) {
+            return credentials
+        }
+        if device.identityKey != device.stableId {
+            return peekCredential(for: device.stableId)
+        }
+        return nil
+    }
+
+    private func copyCredential(for deviceId: String, allowUI: Bool) throws -> (username: String, password: String)? {
         var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: serviceName,
@@ -98,30 +137,36 @@ class KeychainService {
             kSecMatchLimit as String: kSecMatchLimitOne
         ]
 
-        // Always provide an authentication context so older ACL-protected items
-        // remain readable even if the current biometric setting is off.
-        query[kSecUseAuthenticationContext as String] = context
+        if allowUI {
+            let context = LAContext()
+            context.localizedReason = "Access saved credentials for \(deviceId)"
+            query[kSecUseAuthenticationContext as String] = context
+        } else {
+            // Probe-only read: returns errSecInteractionNotAllowed instead
+            // of putting up Touch ID. The caller treats that as "no credential
+            // available right now" and falls back to the auth-required path
+            // only when the user explicitly initiates a connection.
+            query[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUIFail
+        }
 
         var result: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
 
-        guard status == errSecSuccess,
-              let data = result as? Data else {
-            if status == errSecItemNotFound {
+        guard status == errSecSuccess, let data = result as? Data else {
+            switch status {
+            case errSecItemNotFound, errSecInteractionNotAllowed:
                 return nil
-            }
-            if status == errSecUserCanceled || status == errSecAuthFailed {
+            case errSecUserCanceled, errSecAuthFailed:
                 throw KeychainError.authenticationFailed
+            default:
+                throw KeychainError.retrieveFailed(status)
             }
-            throw KeychainError.retrieveFailed(status)
         }
 
-        // Try new JSON format first
         if let credential = try? JSONDecoder().decode(StoredCredential.self, from: data) {
             return (username: credential.username, password: credential.password)
         }
 
-        // Fall back to legacy colon-separated format for existing credentials
         if let credentials = String(data: data, encoding: .utf8) {
             let parts = credentials.split(separator: ":", maxSplits: 1).map(String.init)
             if parts.count == 2 {
@@ -130,21 +175,6 @@ class KeychainService {
         }
 
         throw KeychainError.invalidData
-    }
-
-    func getCredential(for device: DiscoveredDevice) throws -> (username: String, password: String)? {
-        if let credentials = try getCredential(for: device.identityKey) {
-            return credentials
-        }
-
-        guard device.identityKey != device.stableId,
-              let legacy = try getCredential(for: device.stableId) else {
-            return nil
-        }
-
-        try saveCredential(for: device.identityKey, username: legacy.username, password: legacy.password)
-        try? deleteCredential(for: device.stableId)
-        return legacy
     }
 
     func deleteCredential(for deviceId: String) throws {

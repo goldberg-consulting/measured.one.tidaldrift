@@ -781,14 +781,19 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         connection.start(queue: queue)
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-            self?.connectionsLock.lock()
-            let conn = self?.activeConnections[connectionId]
-            self?.connectionsLock.unlock()
+            guard let self else { return }
+            self.connectionsLock.lock()
+            let conn = self.activeConnections[connectionId]
+            self.connectionsLock.unlock()
 
             if let conn = conn, conn.state != .ready && conn.state != .cancelled {
-                // Timeout - try fallback
-                self?.resolveServiceViaDNSSD(name: name, type: type, domain: domain, serviceType: serviceType)
-                self?.cleanupConnection(id: connectionId)
+                // `resolveServiceViaDNSSD` forks `dns-sd` and blocks for up to
+                // 2.5s on a DispatchSemaphore. Run it on the discovery queue
+                // so the main runloop never parks here.
+                self.queue.async { [weak self] in
+                    self?.resolveServiceViaDNSSD(name: name, type: type, domain: domain, serviceType: serviceType)
+                }
+                self.cleanupConnection(id: connectionId)
             }
         }
     }
