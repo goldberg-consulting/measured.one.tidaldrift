@@ -377,13 +377,17 @@ struct MenuBarDeviceRow: View {
         device.services.contains(.ssh) || device.isTidalDriftPeer
     }
     
+    /// Non-prompting peek used to decide whether we have something to send.
+    /// Computed properties are evaluated on every SwiftUI re-render; calling
+    /// the auth-gated `getCredential` here would put up Touch ID on the main
+    /// thread and freeze the menu panel.
     private var savedDevicePassword: String? {
-        guard let creds = try? KeychainService.shared.getCredential(for: device) else {
+        guard let creds = KeychainService.shared.peekCredential(for: device) else {
             return nil
         }
         return creds.password.isEmpty ? nil : creds.password
     }
-    
+
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {

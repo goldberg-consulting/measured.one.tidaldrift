@@ -23,17 +23,28 @@ class LocalCastPermissions: ObservableObject {
     }
 
     /// Request screen capture permission. Triggers the system dialog the first time.
-    /// If already denied, opens System Settings and polls for up to 30s.
-    func requestScreenCaptureIfNeeded() -> Bool {
+    /// If already denied, opens System Settings and the caller can poll via
+    /// `waitForScreenCaptureGrant`.
+    ///
+    /// `CGRequestScreenCaptureAccess()` blocks until the TCC daemon responds.
+    /// On an LSUIElement app the prompt also appears behind the active app
+    /// unless we activate first. The body runs off the main actor and only
+    /// hops back to mutate the `@Published` flag.
+    func requestScreenCaptureIfNeeded() async -> Bool {
         if CGPreflightScreenCaptureAccess() {
             screenCaptureGranted = true
             return true
         }
-        
-        let granted = CGRequestScreenCaptureAccess()
+
+        NSApp.activate(ignoringOtherApps: true)
+
+        let granted = await Task.detached(priority: .userInitiated) {
+            CGRequestScreenCaptureAccess()
+        }.value
+
         screenCaptureGranted = granted
         if granted { return true }
-        
+
         logger.warning("Screen Recording not granted after request — opening System Settings")
         openScreenCapturePreferences()
         return false

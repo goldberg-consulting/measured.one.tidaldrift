@@ -212,6 +212,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     }
 
     func windowWillClose(_ notification: Notification) {
+        // The menu panel uses `orderOut`, not `close`, so it never posts
+        // willCloseNotification. Monitor cleanup happens in `hideMenuPanel`.
         if let window = notification.object as? NSWindow {
             if window === onboardingWindow {
                 onboardingWindow = nil
@@ -219,8 +221,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                 settingsWindow = nil
             } else if window === permissionRepairWindow {
                 permissionRepairWindow = nil
-            } else if window === menuPanel {
-                removeOutsideClickMonitor()
             }
         }
     }
@@ -395,56 +395,52 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         DispatchQueue.main.async(execute: action)
     }
 
-    /// Presents a permission alert in its own window so it still works after
-    /// the menu panel has been dismissed (SwiftUI `.alert` on the panel does not).
-    func showMetalStreamUnavailableAlert() {
+    /// Run a modal `NSAlert` after activating TidalDrift. Without activation,
+    /// the alert window appears behind whatever app was last in front and the
+    /// `runModal()` call blocks the main thread on a dialog the user cannot
+    /// see — the canonical "menu bar froze" symptom.
+    private func presentModalAlert(_ configure: (NSAlert) -> Void) -> NSApplication.ModalResponse {
         hideMenuPanel()
-        DispatchQueue.main.async {
-            let alert = NSAlert()
-            alert.messageText = "Metal Stream Unavailable"
-            alert.informativeText = "Could not connect to the remote Metal streaming host. Make sure TidalDrift is running on the remote Mac with Metal Streaming hosting enabled."
-            alert.alertStyle = .warning
-            alert.addButton(withTitle: "OK")
-            alert.runModal()
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        configure(alert)
+        alert.window.level = .modalPanel
+        return alert.runModal()
+    }
+
+    func showMetalStreamUnavailableAlert() {
+        DispatchQueue.main.async { [weak self] in
+            _ = self?.presentModalAlert { alert in
+                alert.messageText = "Metal Stream Unavailable"
+                alert.informativeText = "Could not connect to the remote Metal streaming host. Make sure TidalDrift is running on the remote Mac with Metal Streaming hosting enabled."
+                alert.alertStyle = .warning
+                alert.addButton(withTitle: "OK")
+            }
         }
     }
 
     func showMetalStreamingPermissionAlert(message: String) {
-        hideMenuPanel()
-        DispatchQueue.main.async {
-            let alert = NSAlert()
-            alert.messageText = "Metal Streaming Permission Required"
-            alert.informativeText = message + "\n\nGrant Screen Recording to host Metal streams, and Accessibility to accept remote input control from clients."
-            alert.alertStyle = .warning
-            alert.addButton(withTitle: "Open Screen Recording Settings")
-            alert.addButton(withTitle: "Open Accessibility Settings")
-            alert.addButton(withTitle: "Cancel")
-
-            let window = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 1, height: 1),
-                styleMask: [.titled],
-                backing: .buffered,
-                defer: false
-            )
-            window.isReleasedWhenClosed = false
-            window.center()
-            window.level = .floating
-            window.orderFrontRegardless()
-
-            alert.beginSheetModal(for: window) { response in
-                switch response {
-                case .alertFirstButtonReturn:
-                    if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
-                        NSWorkspace.shared.open(url)
-                    }
-                case .alertSecondButtonReturn:
-                    if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
-                        NSWorkspace.shared.open(url)
-                    }
-                default:
-                    break
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let response = self.presentModalAlert { alert in
+                alert.messageText = "Metal Streaming Permission Required"
+                alert.informativeText = message + "\n\nGrant Screen Recording to host Metal streams, and Accessibility to accept remote input control from clients."
+                alert.alertStyle = .warning
+                alert.addButton(withTitle: "Open Screen Recording Settings")
+                alert.addButton(withTitle: "Open Accessibility Settings")
+                alert.addButton(withTitle: "Cancel")
+            }
+            switch response {
+            case .alertFirstButtonReturn:
+                if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+                    NSWorkspace.shared.open(url)
                 }
-                window.close()
+            case .alertSecondButtonReturn:
+                if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+                    NSWorkspace.shared.open(url)
+                }
+            default:
+                break
             }
         }
     }

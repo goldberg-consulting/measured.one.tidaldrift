@@ -101,9 +101,12 @@ struct DeviceCardView: View {
         }
     }
     
-    /// Look up saved password for this device from Keychain.
+    /// Look up saved password for this device from Keychain without ever
+    /// triggering a biometric prompt. SwiftUI re-evaluates computed
+    /// properties on every render, so the prompted `getCredential` would
+    /// park the main thread on Touch ID.
     private var savedDevicePassword: String? {
-        guard let creds = try? KeychainService.shared.getCredential(for: device) else {
+        guard let creds = KeychainService.shared.peekCredential(for: device) else {
             return nil
         }
         return creds.password.isEmpty ? nil : creds.password
