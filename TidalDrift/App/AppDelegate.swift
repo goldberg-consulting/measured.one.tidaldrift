@@ -296,10 +296,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
         // Rounded corners on the panel's content background so the SwiftUI
         // view's edges don't look square against the transparent panel.
+        // Use `.topLeading` alignment so the menu content sits flush at the
+        // top of the panel rather than getting vertically centered, which
+        // produced a ~100pt whitespace cap on shorter device lists.
         let rootView = AnyView(
             MenuBarView()
                 .environmentObject(AppState.shared)
-                .frame(width: Self.menuPanelSize.width, height: Self.menuPanelSize.height)
+                .frame(
+                    width: Self.menuPanelSize.width,
+                    height: Self.menuPanelSize.height,
+                    alignment: .topLeading
+                )
                 .background(.background)
                 .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         )
