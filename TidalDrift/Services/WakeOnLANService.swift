@@ -140,6 +140,12 @@ class WakeOnLANService {
             return
         }
 
+        // Surface the wait in the UI so the user does not perceive a 30s freeze.
+        let token = await WakeProgressTracker.shared.begin(device: device, service: service)
+        defer {
+            Task { @MainActor in WakeProgressTracker.shared.end(token) }
+        }
+
         _ = await wakeAndWait(device: device, service: service, timeout: timeout)
     }
 

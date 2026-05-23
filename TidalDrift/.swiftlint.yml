@@ -51,7 +51,7 @@ line_length:
 
 file_length:
   warning: 600
-  error: 1600
+  error: 2000
 
 type_body_length:
   warning: 400

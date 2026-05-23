@@ -250,6 +250,118 @@ class KeychainService {
             }
         }
     }
+
+    /// Result of a biometric-ACL migration pass.
+    struct MigrationSummary {
+        let processed: Int
+        let migrated: Int
+        let skipped: Int
+        let failed: Int
+    }
+
+    /// Re-save every credential in the keychain under the access policy that
+    /// matches the current `useBiometrics` setting. Use this when the user
+    /// disables Touch ID so previously-saved items stop prompting for
+    /// fingerprint on every read. One pre-auth biometric prompt covers the
+    /// entire run via a shared `LAContext`.
+    ///
+    /// The migration is intentionally best-effort: items the user cannot
+    /// authenticate for are left in place and reported in `failed`. The
+    /// caller can surface a summary message.
+    func migrateCredentialsToCurrentBiometricSetting() async throws -> MigrationSummary {
+        let allAccounts = try getAllSavedDeviceIds()
+        guard !allAccounts.isEmpty else {
+            return MigrationSummary(processed: 0, migrated: 0, skipped: 0, failed: 0)
+        }
+
+        let context = LAContext()
+        context.localizedReason = "Update saved credentials for the new authentication setting"
+
+        // Pre-authenticate once so individual reads do not each prompt.
+        var canAuth = false
+        var error: NSError?
+        if context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error) {
+            canAuth = await withCheckedContinuation { continuation in
+                context.evaluatePolicy(.deviceOwnerAuthentication,
+                                       localizedReason: "Update saved credentials") { success, _ in
+                    continuation.resume(returning: success)
+                }
+            }
+        }
+
+        var migrated = 0
+        var skipped = 0
+        var failed = 0
+
+        for account in allAccounts {
+            // Read with the shared context. Items not protected by an ACL
+            // succeed without prompting; ACL-protected items reuse the
+            // context's prior evaluation.
+            let credentials: (username: String, password: String)?
+            do {
+                credentials = try readWithContext(account: account, context: canAuth ? context : nil)
+            } catch {
+                failed += 1
+                continue
+            }
+
+            guard let credentials else {
+                skipped += 1
+                continue
+            }
+
+            // Delete and re-add so the new ACL or its absence takes effect.
+            do {
+                try deleteCredential(for: account)
+                try saveCredential(for: account, username: credentials.username, password: credentials.password)
+                migrated += 1
+            } catch {
+                failed += 1
+            }
+        }
+
+        return MigrationSummary(processed: allAccounts.count, migrated: migrated, skipped: skipped, failed: failed)
+    }
+
+    private func readWithContext(account: String, context: LAContext?) throws -> (username: String, password: String)? {
+        var query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: serviceName,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        if let context {
+            query[kSecUseAuthenticationContext as String] = context
+        } else {
+            // No usable context: read non-prompting so we never block here.
+            query[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUIFail
+        }
+
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess, let data = result as? Data else {
+            switch status {
+            case errSecItemNotFound, errSecInteractionNotAllowed:
+                return nil
+            case errSecUserCanceled, errSecAuthFailed:
+                throw KeychainError.authenticationFailed
+            default:
+                throw KeychainError.retrieveFailed(status)
+            }
+        }
+
+        if let credential = try? JSONDecoder().decode(StoredCredential.self, from: data) {
+            return (username: credential.username, password: credential.password)
+        }
+        if let credentials = String(data: data, encoding: .utf8) {
+            let parts = credentials.split(separator: ":", maxSplits: 1).map(String.init)
+            if parts.count == 2 {
+                return (username: parts[0], password: parts[1])
+            }
+        }
+        throw KeychainError.invalidData
+    }
 }
 
 enum KeychainError: LocalizedError {
