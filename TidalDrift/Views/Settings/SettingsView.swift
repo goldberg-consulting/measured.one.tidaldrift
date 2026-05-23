@@ -334,12 +334,42 @@ struct SecuritySettingsView: View {
     @EnvironmentObject var appState: AppState
     @State private var trustedDeviceCount: Int = 0
     @State private var savedCredentialsCount: Int = 0
-    
+    @State private var isMigrating: Bool = false
+    @State private var migrationResult: String?
+
+    /// Bridge `useBiometrics` through this binding so we can run the
+    /// keychain re-save migration when the user flips the switch. Without
+    /// the migration, items saved while biometrics were enabled keep
+    /// prompting for Touch ID forever — the saved ACL outlives the setting.
+    private var biometricsBinding: Binding<Bool> {
+        Binding(
+            get: { appState.settings.useBiometrics },
+            set: { newValue in
+                appState.settings.useBiometrics = newValue
+                runBiometricMigration(newValue: newValue)
+            }
+        )
+    }
+
     var body: some View {
         Form {
             Section("Authentication") {
-                Toggle("Use Touch ID when available", isOn: $appState.settings.useBiometrics)
-                
+                Toggle("Use Touch ID when available", isOn: biometricsBinding)
+                    .disabled(isMigrating)
+
+                if isMigrating {
+                    HStack(spacing: 6) {
+                        ProgressView().scaleEffect(0.6)
+                        Text("Updating saved credentials...")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                } else if let migrationResult {
+                    Text(migrationResult)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+
                 Toggle("Log connection attempts", isOn: $appState.settings.enableConnectionLogging)
             }
             
@@ -397,6 +427,45 @@ struct SecuritySettingsView: View {
         trustedDeviceCount = appState.trustedDevices.count
         if let ids = try? KeychainService.shared.getAllSavedDeviceIds() {
             savedCredentialsCount = ids.count
+        }
+    }
+
+    /// Re-save every keychain item under the new biometric policy. Runs once
+    /// per toggle change. Without this, an item saved while biometrics were
+    /// on keeps prompting for Touch ID even after the user turns biometrics
+    /// off, because the ACL stamped on the item is independent of the
+    /// app's current setting.
+    private func runBiometricMigration(newValue: Bool) {
+        guard savedCredentialsCount > 0 else { return }
+        isMigrating = true
+        migrationResult = nil
+
+        Task {
+            do {
+                let summary = try await KeychainService.shared.migrateCredentialsToCurrentBiometricSetting()
+                let message: String
+                if summary.processed == 0 {
+                    message = "No saved credentials to update."
+                } else if summary.failed == 0 && summary.migrated == summary.processed {
+                    message = "Updated \(summary.migrated) saved credential\(summary.migrated == 1 ? "" : "s")."
+                } else {
+                    var parts: [String] = []
+                    if summary.migrated > 0 { parts.append("\(summary.migrated) updated") }
+                    if summary.skipped > 0 { parts.append("\(summary.skipped) skipped") }
+                    if summary.failed > 0 { parts.append("\(summary.failed) failed") }
+                    message = parts.joined(separator: ", ") + "."
+                }
+                await MainActor.run {
+                    migrationResult = message
+                    isMigrating = false
+                    loadCounts()
+                }
+            } catch {
+                await MainActor.run {
+                    migrationResult = "Could not update credentials: \(error.localizedDescription)"
+                    isMigrating = false
+                }
+            }
         }
     }
 }

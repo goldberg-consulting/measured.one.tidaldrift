@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 import OSLog
 import UserNotifications
 
@@ -8,6 +9,21 @@ private let menuBarLogger = Logger(subsystem: "com.tidaldrift", category: "MenuB
 private final class MenuStatusPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
+}
+
+/// Content view for the menu panel that forwards the first click in the
+/// panel directly to the SwiftUI control under the cursor.
+///
+/// Background: the panel uses `.nonactivatingPanel` so opening it does not
+/// pull TidalDrift to the foreground (an accessory app activating itself
+/// reorders everyone else's windows). The trade-off is that the first click
+/// inside the panel after another app was frontmost is normally absorbed
+/// by AppKit just to make our panel key. Overriding `acceptsFirstMouse(_:)`
+/// to return `true` here tells AppKit "deliver that click to the view
+/// hierarchy on the first try" — so the user's first tap on a Button or
+/// Toggle inside the menu actually fires, instead of looking like a freeze.
+private final class FirstMouseHostingView: NSView {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
 
 // Manual entry point. We used to launch via `@main struct TidalDriftApp: App`
@@ -52,12 +68,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
     private var statusItem: NSStatusItem?
     private var menuPanel: NSPanel?
+    private var menuPanelHostingController: NSHostingController<AnyView>?
     private var localMenuPanelMonitor: Any?
     private var globalMenuPanelMonitor: Any?
 
     private var onboardingWindow: NSWindow?
     private var settingsWindow: NSWindow?
     private var permissionRepairWindow: NSWindow?
+    private var wakeProgressWindow: NSWindow?
+    private var wakeProgressCancellable: AnyCancellable?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         menuBarLogger.info("applicationDidFinishLaunching")
@@ -76,6 +95,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         // every version upgrade. Permission repair is now an explicit action
         // surfaced in Settings > Troubleshooting.
         startNetworkServices()
+        observeWakeProgress()
 
         // Show onboarding on first launch
         if !AppState.shared.hasCompletedOnboarding {
@@ -276,15 +296,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
         // Rounded corners on the panel's content background so the SwiftUI
         // view's edges don't look square against the transparent panel.
-        let host = NSHostingController(
-            rootView: MenuBarView()
+        let rootView = AnyView(
+            MenuBarView()
                 .environmentObject(AppState.shared)
                 .frame(width: Self.menuPanelSize.width, height: Self.menuPanelSize.height)
                 .background(.background)
                 .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         )
+        let host = NSHostingController(rootView: rootView)
         host.view.frame = NSRect(origin: .zero, size: Self.menuPanelSize)
-        panel.contentViewController = host
+        host.view.autoresizingMask = [.width, .height]
+        self.menuPanelHostingController = host
+
+        // Wrap the SwiftUI hosting view in an NSView that accepts first mouse.
+        // Without this, the panel's nonactivating style causes the first click
+        // after switching from another app to be swallowed by AppKit, reading
+        // to the user as "the menu is frozen."
+        let firstMouseContainer = FirstMouseHostingView(frame: NSRect(origin: .zero, size: Self.menuPanelSize))
+        firstMouseContainer.autoresizingMask = [.width, .height]
+        firstMouseContainer.addSubview(host.view)
+        panel.contentView = firstMouseContainer
 
         self.menuPanel = panel
         menuBarLogger.info("setupStatusItem: done")
@@ -510,10 +541,64 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         }
     }
 
+    /// Show a small HUD whenever a Wake-on-LAN connect is pending. Without
+    /// this, the user clicks Metal Stream / Screen Share on a sleeping Mac,
+    /// the menu dismisses, and nothing visible happens for up to 30 seconds
+    /// while we wait for the host to come up — which reads as a freeze.
+    @MainActor
+    private func observeWakeProgress() {
+        wakeProgressCancellable = WakeProgressTracker.shared.$current
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] wake in
+                guard let self else { return }
+                if wake == nil {
+                    self.hideWakeProgressHUD()
+                } else if self.wakeProgressWindow == nil {
+                    self.showWakeProgressHUD()
+                }
+            }
+    }
+
+    private func showWakeProgressHUD() {
+        let window = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 320, height: 110),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.hasShadow = true
+        window.level = .statusBar
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+        window.contentView = NSHostingView(rootView: WakeProgressHUDView())
+
+        if let screen = NSScreen.main {
+            let visible = screen.visibleFrame
+            let origin = NSPoint(
+                x: visible.maxX - 320 - 16,
+                y: visible.maxY - 110 - 16
+            )
+            window.setFrameOrigin(origin)
+        }
+
+        window.orderFrontRegardless()
+        wakeProgressWindow = window
+    }
+
+    private func hideWakeProgressHUD() {
+        wakeProgressWindow?.orderOut(nil)
+        wakeProgressWindow = nil
+    }
+
     private func startNetworkServices() {
-        // Defer slightly so the status bar item paints and AppState finishes
-        // its first run-loop init before any background sockets fire.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+        // Run the network bring-up on a background queue. Each of the three
+        // services forks `dns-sd` via Process.run() and although individual
+        // launches are quick, stacking three on main right at launch was a
+        // visible hitch on the menu bar. The services already marshal their
+        // @Published mutations back to main internally.
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.3) {
             NetworkDiscoveryService.shared.startBrowsing()
             TidalDriftPeerService.shared.startAdvertising()
             TidalDriftPeerService.shared.startDiscovery()

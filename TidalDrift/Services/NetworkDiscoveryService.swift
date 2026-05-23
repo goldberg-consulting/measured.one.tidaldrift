@@ -274,43 +274,50 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
     func startBrowsing() {
         guard browsers.isEmpty else { return }
 
-        for serviceType in serviceTypes {
-            // Skip UDP services in NWBrowser - use NetServiceBrowser instead
-            if serviceType.contains("_udp") {
-                logger.info("🌊 Skipping \(serviceType) for NWBrowser - will use NetServiceBrowser")
-                continue
-            }
+        // Build NWBrowsers and fork the LocalCast dns-sd helper on the
+        // discovery queue. Process.run() is fast (~10ms) but stacking it
+        // with the peer service's two dns-sd forks on the main thread
+        // produced a visible launch hitch.
+        queue.async { [weak self] in
+            guard let self else { return }
 
-            // Use parameters that enable better discovery
-            let params = NWParameters()
-            params.includePeerToPeer = true
-
-            // Try both local. domain and nil for broader discovery
-            for domain in ["local.", ""] {
-                let actualDomain = domain.isEmpty ? nil : domain
-                let browser = NWBrowser(for: .bonjour(type: serviceType, domain: actualDomain), using: params)
-
-                browser.stateUpdateHandler = { [weak self] state in
-                    self?.handleBrowserState(state, for: serviceType)
+            var newBrowsers: [NWBrowser] = []
+            for serviceType in self.serviceTypes {
+                if serviceType.contains("_udp") {
+                    self.logger.info("🌊 Skipping \(serviceType) for NWBrowser - will use NetServiceBrowser")
+                    continue
                 }
 
-                browser.browseResultsChangedHandler = { [weak self] results, changes in
-                    self?.handleBrowseResults(results, changes: changes, serviceType: serviceType)
+                let params = NWParameters()
+                params.includePeerToPeer = true
+
+                for domain in ["local.", ""] {
+                    let actualDomain = domain.isEmpty ? nil : domain
+                    let browser = NWBrowser(for: .bonjour(type: serviceType, domain: actualDomain), using: params)
+
+                    browser.stateUpdateHandler = { [weak self] state in
+                        self?.handleBrowserState(state, for: serviceType)
+                    }
+                    browser.browseResultsChangedHandler = { [weak self] results, changes in
+                        self?.handleBrowseResults(results, changes: changes, serviceType: serviceType)
+                    }
+
+                    browser.start(queue: self.queue)
+                    newBrowsers.append(browser)
                 }
-
-                browser.start(queue: queue)
-                browsers.append(browser)
             }
-        }
 
-        // Use NetServiceBrowser for LocalCast (UDP) - more reliable
-        startNetServiceBrowserForLocalCast()
+            self.startNetServiceBrowserForLocalCast()
 
-        lastScanDate = Date()
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.browsers = newBrowsers
+                self.lastScanDate = Date()
+            }
 
-        // Also do an initial ARP scan to find devices that might not advertise services
-        Task {
-            await scanARPTable()
+            Task {
+                await self.scanARPTable()
+            }
         }
     }
 
