@@ -21,25 +21,29 @@ struct MenuBarView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             headerSection
-            
+
             Divider().padding(.vertical, 6)
-            
+
             localCastSection
-            
+
             Divider().padding(.vertical, 6)
-            
+
             devicesSection
-            
+
             Divider().padding(.vertical, 6)
-            
+
             quickSettingsSection
-            
+
             Divider().padding(.vertical, 6)
-            
+
             actionsSection
         }
         .padding(12)
-        .frame(width: 340)
+        // Fill the panel width and pin to the top. Previously the view had
+        // .frame(width: 340) which left 20pt of whitespace inside the 360-wide
+        // panel, and the outer host frame defaulted to .center alignment
+        // which floated the whole menu down to the middle of a 520pt panel.
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
     
     // MARK: - Header
