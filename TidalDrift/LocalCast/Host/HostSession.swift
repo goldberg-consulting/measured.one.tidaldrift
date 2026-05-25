@@ -71,6 +71,12 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     private var lastClientPacketAt: Date?
     private static let clientIdleTimeout: TimeInterval = 10
 
+    /// True once we have actually transmitted at least one encoded video
+    /// packet to the current client. Used to log the first send so it's
+    /// trivial to confirm in a log capture whether the host pipeline
+    /// reached the network.
+    private var hasSentFirstVideoPacket: Bool = false
+
     /// True when the client is on the same machine (127.0.0.1 or local IP).
     /// On loopback, input injection is skipped because CGEvent.post() moves the
     /// real cursor, which yanks it out of the viewer window creating a feedback loop.
@@ -330,6 +336,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         clientConnection = nil
         clientEndpoint = nil
         lastClientPacketAt = nil
+        hasSentFirstVideoPacket = false
         isRunning = false
         logger.info("Host session stopped")
     }
@@ -356,6 +363,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             clientEndpoint = nil
             clientConnection = nil
             lastClientPacketAt = nil
+            hasSentFirstVideoPacket = false
             return
         }
 
@@ -391,6 +399,18 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             transport.send(packet: castPacket, on: connection)
         } else if let endpoint = clientEndpoint {
             transport.send(packet: castPacket, to: endpoint)
+        }
+
+        if !hasSentFirstVideoPacket {
+            hasSentFirstVideoPacket = true
+            let target: String
+            if let endpoint = clientEndpoint {
+                target = String(describing: endpoint)
+            } else {
+                target = "unknown"
+            }
+            logger.info("📤 LocalCast: first video packet sent (\(packet.count) bytes, keyframe=\(isKeyFrame), to \(target))")
+            print("📤 LocalCast: first video packet sent (\(packet.count) bytes, keyframe=\(isKeyFrame), to \(target))")
         }
     }
 
