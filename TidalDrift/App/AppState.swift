@@ -31,6 +31,7 @@ class AppState: ObservableObject {
     private init() {
         self.hasCompletedOnboarding = UserDefaults.standard.bool(forKey: "hasCompletedOnboarding")
         self.settings = SettingsService.shared.loadSettings()
+        SettingsService.shared.applyTheme(self.settings.theme)
         
         setupBindings()
         refreshLocalInfo()
@@ -136,5 +137,17 @@ class AppState: ObservableObject {
     func clearConnectionHistory() {
         connectionHistory.removeAll()
         UserDefaults.standard.removeObject(forKey: "connectionHistory")
+    }
+
+    func resetAllSettingsAndShowOnboarding() {
+        settings = .default
+        trustedDevices.removeAll()
+        connectionHistory.removeAll()
+        hasCompletedOnboarding = false
+        saveTrustedDevices()
+        UserDefaults.standard.removeObject(forKey: "connectionHistory")
+        SettingsService.shared.resetToDefaults()
+        refreshLocalInfo()
+        (NSApp.delegate as? AppDelegate)?.showOnboarding()
     }
 }

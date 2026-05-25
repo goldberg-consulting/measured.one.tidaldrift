@@ -543,9 +543,13 @@ class TidalDropService: ObservableObject {
     private func setupIncomingTransfer(_ connection: NWConnection, metadata: FileMetadata, remoteIP: String) {
         let transferId = UUID()
         let destinationFolder = AppState.shared.settings.tidalDropFolder
+        let didStartDestinationAccess = destinationFolder.startAccessingSecurityScopedResource()
         
         guard let safeName = Self.sanitizeFilename(metadata.fileName) else {
             print("❌ TidalDrop: Rejected unsafe filename: \(metadata.fileName)")
+            if didStartDestinationAccess {
+                destinationFolder.stopAccessingSecurityScopedResource()
+            }
             connection.cancel()
             return
         }
@@ -597,15 +601,30 @@ class TidalDropService: ObservableObject {
         print("🌊 TidalDrop: Created empty file: \(created)")
         
         print("🌊 TidalDrop: Starting to receive file data...")
-        receiveFileData(connection, transferId: transferId, fileURL: fileURL, fileSize: metadata.fileSize, receivedSoFar: 0)
+        receiveFileData(
+            connection,
+            transferId: transferId,
+            fileURL: fileURL,
+            fileSize: metadata.fileSize,
+            receivedSoFar: 0,
+            securityScopedDestination: didStartDestinationAccess ? destinationFolder : nil
+        )
     }
     
-    private func receiveFileData(_ connection: NWConnection, transferId: UUID, fileURL: URL, fileSize: Int64, receivedSoFar: Int64) {
+    private func receiveFileData(
+        _ connection: NWConnection,
+        transferId: UUID,
+        fileURL: URL,
+        fileSize: Int64,
+        receivedSoFar: Int64,
+        securityScopedDestination: URL?
+    ) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
             guard let self = self else { return }
             
             if let e = error {
                 print("❌ TidalDrop: Error receiving file data: \(e)")
+                securityScopedDestination?.stopAccessingSecurityScopedResource()
                 DispatchQueue.main.async {
                     self.activeTransfers[transferId]?.status = .failed(e.localizedDescription)
                 }
@@ -621,6 +640,7 @@ class TidalDropService: ObservableObject {
                     try handle.close()
                 } catch {
                     print("❌ TidalDrop: Error writing to file: \(error)")
+                    securityScopedDestination?.stopAccessingSecurityScopedResource()
                     DispatchQueue.main.async {
                         self.activeTransfers[transferId]?.status = .failed("Write error: \(error.localizedDescription)")
                     }
@@ -642,14 +662,23 @@ class TidalDropService: ObservableObject {
                 }
                 
                 if newReceived < fileSize {
-                    self.receiveFileData(connection, transferId: transferId, fileURL: fileURL, fileSize: fileSize, receivedSoFar: newReceived)
+                    self.receiveFileData(
+                        connection,
+                        transferId: transferId,
+                        fileURL: fileURL,
+                        fileSize: fileSize,
+                        receivedSoFar: newReceived,
+                        securityScopedDestination: securityScopedDestination
+                    )
                 } else {
                     print("✅ TidalDrop: File received completely! Saved to: \(fileURL.path)")
+                    securityScopedDestination?.stopAccessingSecurityScopedResource()
                     self.completeTransfer(transferId: transferId, fileName: fileURL.lastPathComponent, isIncoming: true)
                     connection.cancel()
                 }
             } else if isComplete {
                 print("⚠️ TidalDrop: Connection completed but only received \(receivedSoFar)/\(fileSize) bytes")
+                securityScopedDestination?.stopAccessingSecurityScopedResource()
             }
         }
     }

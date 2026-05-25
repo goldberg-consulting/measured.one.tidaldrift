@@ -39,11 +39,11 @@ struct MenuBarView: View {
             actionsSection
         }
         .padding(12)
-        // Fill the panel width and pin to the top. Previously the view had
-        // .frame(width: 340) which left 20pt of whitespace inside the 360-wide
-        // panel, and the outer host frame defaulted to .center alignment
-        // which floated the whole menu down to the middle of a 520pt panel.
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        // Fill the panel width, but keep the natural vertical size. AppDelegate
+        // asks the hosting view for `fittingSize` and sizes the NSPanel to
+        // match; forcing maxHeight here reintroduces a blank tail.
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .fixedSize(horizontal: false, vertical: true)
     }
     
     // MARK: - Header

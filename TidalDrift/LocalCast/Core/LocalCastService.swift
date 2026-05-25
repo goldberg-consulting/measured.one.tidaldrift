@@ -208,9 +208,8 @@ class LocalCastService: ObservableObject {
             "auth=\(authEnabled ? "1" : "0")"
         ]
 
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
 
         do {
             try process.run()

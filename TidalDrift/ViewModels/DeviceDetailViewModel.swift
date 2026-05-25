@@ -24,7 +24,7 @@ class DeviceDetailViewModel: ObservableObject {
     }
 
     var hasCredentials: Bool {
-        KeychainService.shared.hasCredential(for: device)
+        KeychainService.shared.peekCredential(for: device) != nil
     }
 
     var connectionHistory: [ConnectionRecord] {
@@ -37,18 +37,12 @@ class DeviceDetailViewModel: ObservableObject {
     }
 
     func loadSavedCredentials() {
-        do {
-            guard let credentials = try KeychainService.shared.getCredential(for: device) else {
-                return
-            }
-            username = credentials.username
-            password = credentials.password
-            credentialError = nil
-        } catch KeychainError.authenticationFailed {
-            credentialError = "Credential access was cancelled. Retry to use the saved password."
-        } catch {
-            credentialError = error.localizedDescription
+        guard let credentials = KeychainService.shared.peekCredential(for: device) else {
+            return
         }
+        username = credentials.username
+        password = credentials.password
+        credentialError = nil
     }
 
     func saveCredentialsIfNeeded() {

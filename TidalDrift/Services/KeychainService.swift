@@ -203,7 +203,8 @@ class KeychainService {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: serviceName,
             kSecAttrAccount as String: deviceId,
-            kSecReturnData as String: false
+            kSecReturnData as String: false,
+            kSecUseAuthenticationUI as String: kSecUseAuthenticationUIFail
         ]
 
         let status = SecItemCopyMatching(query as CFDictionary, nil)

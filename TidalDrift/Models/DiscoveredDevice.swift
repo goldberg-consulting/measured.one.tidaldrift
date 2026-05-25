@@ -156,6 +156,15 @@ struct DiscoveredDevice: Identifiable, Codable, Hashable {
     
     /// Check if this device is the current Mac (by IP address)
     var isCurrentDevice: Bool {
+        if peerId == TidalDriftPeerService.localPeerId {
+            return true
+        }
+
+        let localIPs = Set(NetworkUtils.getAllIPAddresses().values)
+        if localIPs.contains(ipAddress) {
+            return true
+        }
+
         guard let localIP = NetworkUtils.getLocalIPAddress() else { return false }
         return ipAddress == localIP
     }

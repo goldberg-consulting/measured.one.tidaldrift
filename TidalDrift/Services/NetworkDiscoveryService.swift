@@ -63,6 +63,7 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
     private let deviceCacheLock = NSLock()  // Thread-safe access to deviceCache
     private var scanTimer: Timer?
     private var pathMonitor: NWPathMonitor?
+    private var hasObservedInitialPath = false
     private let queue = DispatchQueue(label: "com.tidaldrift.discovery", qos: .userInitiated)
 
     private var publishDebounceWorkItem: DispatchWorkItem?
@@ -262,8 +263,13 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         pathMonitor = NWPathMonitor()
         pathMonitor?.pathUpdateHandler = { [weak self] path in
             if path.status == .satisfied {
+                guard let self else { return }
+                if !self.hasObservedInitialPath {
+                    self.hasObservedInitialPath = true
+                    return
+                }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
-                    self?.refreshScan()
+                    self.refreshScan()
                     TidalDriftPeerService.shared.restartAll()
                 }
             }
@@ -274,50 +280,42 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
     func startBrowsing() {
         guard browsers.isEmpty else { return }
 
-        // Build NWBrowsers and fork the LocalCast dns-sd helper on the
-        // discovery queue. Process.run() is fast (~10ms) but stacking it
-        // with the peer service's two dns-sd forks on the main thread
-        // produced a visible launch hitch.
+        for serviceType in serviceTypes {
+            // Skip UDP services in NWBrowser - use dns-sd instead.
+            if serviceType.contains("_udp") {
+                logger.info("🌊 Skipping \(serviceType) for NWBrowser - will use dns-sd")
+                continue
+            }
+
+            let params = NWParameters()
+            params.includePeerToPeer = true
+
+            for domain in ["local.", ""] {
+                let actualDomain = domain.isEmpty ? nil : domain
+                let browser = NWBrowser(for: .bonjour(type: serviceType, domain: actualDomain), using: params)
+
+                browser.stateUpdateHandler = { [weak self] state in
+                    self?.handleBrowserState(state, for: serviceType)
+                }
+                browser.browseResultsChangedHandler = { [weak self] results, changes in
+                    self?.handleBrowseResults(results, changes: changes, serviceType: serviceType)
+                }
+
+                browser.start(queue: queue)
+                browsers.append(browser)
+            }
+        }
+
+        // The helper forks `dns-sd`; keep the Process.run off main, but keep
+        // the service lifecycle itself main-owned.
         queue.async { [weak self] in
-            guard let self else { return }
+            self?.startNetServiceBrowserForLocalCast()
+        }
 
-            var newBrowsers: [NWBrowser] = []
-            for serviceType in self.serviceTypes {
-                if serviceType.contains("_udp") {
-                    self.logger.info("🌊 Skipping \(serviceType) for NWBrowser - will use NetServiceBrowser")
-                    continue
-                }
+        lastScanDate = Date()
 
-                let params = NWParameters()
-                params.includePeerToPeer = true
-
-                for domain in ["local.", ""] {
-                    let actualDomain = domain.isEmpty ? nil : domain
-                    let browser = NWBrowser(for: .bonjour(type: serviceType, domain: actualDomain), using: params)
-
-                    browser.stateUpdateHandler = { [weak self] state in
-                        self?.handleBrowserState(state, for: serviceType)
-                    }
-                    browser.browseResultsChangedHandler = { [weak self] results, changes in
-                        self?.handleBrowseResults(results, changes: changes, serviceType: serviceType)
-                    }
-
-                    browser.start(queue: self.queue)
-                    newBrowsers.append(browser)
-                }
-            }
-
-            self.startNetServiceBrowserForLocalCast()
-
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.browsers = newBrowsers
-                self.lastScanDate = Date()
-            }
-
-            Task {
-                await self.scanARPTable()
-            }
+        Task {
+            await scanARPTable()
         }
     }
 
@@ -453,19 +451,9 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
     }
 
     func stopBrowsing() {
-        browsers.forEach { $0.cancel() }
-        browsers.removeAll()
+        stopServiceBrowsing()
 
-        // Also stop dns-sd browse for LocalCast
-        if let process = dnsSdBrowseProcess, process.isRunning {
-            process.terminate()
-        }
-        dnsSdBrowseProcess = nil
-
-        // Also stop NetServiceBrowser for LocalCast
-        netServiceBrowser?.stop()
-        netServiceBrowser = nil
-        discoveredLocalCastServices.removeAll()
+        stopLocalCastBrowsing()
 
         pathMonitor?.cancel()
         pathMonitor = nil
@@ -474,8 +462,25 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         udpListener = nil
     }
 
+    private func stopServiceBrowsing() {
+        browsers.forEach { $0.cancel() }
+        browsers.removeAll()
+    }
+
+    private func stopLocalCastBrowsing() {
+        if let process = dnsSdBrowseProcess, process.isRunning {
+            process.terminate()
+        }
+        dnsSdBrowseProcess = nil
+
+        netServiceBrowser?.stop()
+        netServiceBrowser = nil
+        discoveredLocalCastServices.removeAll()
+    }
+
     func refreshScan() {
-        stopBrowsing()
+        stopServiceBrowsing()
+        stopLocalCastBrowsing()
 
         deviceCacheLock.lock()
         // Preserve TidalDrift peer info before clearing cache
@@ -834,6 +839,14 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         // Parse output for host info
         // Example: "hostname.local.:5900"
         let lines = output.split(separator: "\n")
+        if let advertisedIP = advertisedIPAddress(in: output) {
+            let service = mapServiceType(serviceType)
+            DispatchQueue.main.async { [weak self] in
+                self?.addOrUpdateDevice(name: name, ipAddress: advertisedIP, port: 5900, service: service)
+            }
+            return
+        }
+
         for line in lines {
             let lineStr = String(line)
             if lineStr.contains("can be reached at") {
@@ -845,6 +858,14 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
                 }
             }
         }
+    }
+
+    private func advertisedIPAddress(in dnsSdOutput: String) -> String? {
+        guard let match = dnsSdOutput.range(of: #"ip=\d+\.\d+\.\d+\.\d+"#, options: .regularExpression) else {
+            return nil
+        }
+        let value = dnsSdOutput[match].dropFirst(3)
+        return String(value)
     }
 
     /// Resolve a hostname to IP address
