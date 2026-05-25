@@ -324,6 +324,13 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
     /// Use dns-sd command for UDP service discovery (more reliable than NWBrowser/NetServiceBrowser for UDP)
     private var dnsSdBrowseProcess: Process?
     private var peerDnsSdBrowseProcess: Process?
+
+    /// Cooldown for LocalCast resolves; the dns-sd browse emits Add events
+    /// on every interface change which would otherwise schedule a blocking
+    /// `dns-sd -L` + `getaddrinfo` on the serial discovery queue forever.
+    private var localCastResolveDebounce: [String: Date] = [:]
+    private let localCastResolveLock = NSLock()
+    private static let localCastResolveCooldown: TimeInterval = 60
     private var peerResolveDebounce: [String: Date] = [:]
     private let peerResolveLock = NSLock()
     private static let peerResolveCooldown: TimeInterval = 60
@@ -473,6 +480,7 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         // Timestamp     A/R    Flags  if Domain               Service Type         Instance Name
         // 21:46:09.297  Add        3   1 local.               _tidaldrift-cast._udp. Eli's-MacBook-Pro
 
+        var seenThisChunk: Set<String> = []
         let lines = output.split(separator: "\n")
         for line in lines {
             let lineStr = String(line)
@@ -487,17 +495,28 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
                 // Extract the instance name (everything after the service type)
                 if let range = lineStr.range(of: "_tidaldrift-cast._udp.") {
                     let instanceName = String(lineStr[range.upperBound...]).trimmingCharacters(in: .whitespaces)
-                    if !instanceName.isEmpty {
-                        logger.info("🌊 dns-sd found LocalCast service: '\(instanceName)'")
+                    guard !instanceName.isEmpty,
+                          seenThisChunk.insert(instanceName).inserted else { continue }
 
-                        // Try to match by name and resolve
-                        DispatchQueue.main.async { [weak self] in
-                            self?.markDeviceAsLocalCastHost(name: instanceName, authRequired: nil)
-                        }
-
-                        // Also resolve via dns-sd -L
-                        resolveLocalCastViaDnsSd(name: instanceName)
+                    // Cooldown so repeated Add events on every interface change
+                    // don't pile up blocking dns-sd resolves on the discovery queue.
+                    localCastResolveLock.lock()
+                    let now = Date()
+                    if let last = localCastResolveDebounce[instanceName],
+                       now.timeIntervalSince(last) < Self.localCastResolveCooldown {
+                        localCastResolveLock.unlock()
+                        continue
                     }
+                    localCastResolveDebounce[instanceName] = now
+                    localCastResolveLock.unlock()
+
+                    logger.info("🌊 dns-sd found LocalCast service: '\(instanceName)'")
+
+                    DispatchQueue.main.async { [weak self] in
+                        self?.markDeviceAsLocalCastHost(name: instanceName, authRequired: nil)
+                    }
+
+                    resolveLocalCastViaDnsSd(name: instanceName)
                 }
             }
         }
@@ -609,6 +628,10 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         peerResolveLock.lock()
         peerResolveDebounce.removeAll()
         peerResolveLock.unlock()
+
+        localCastResolveLock.lock()
+        localCastResolveDebounce.removeAll()
+        localCastResolveLock.unlock()
 
         deviceCacheLock.lock()
         // Preserve TidalDrift peer info before clearing cache
