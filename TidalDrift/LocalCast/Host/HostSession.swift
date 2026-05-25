@@ -63,6 +63,14 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     private var clientEndpoint: NWEndpoint?
     private var clientConnection: NWConnection?
 
+    /// Last time we received any packet from the client. Used to drop the
+    /// client endpoint if heartbeats stop arriving, so the encoder can idle
+    /// when nobody is actually watching anymore. UDP doesn't notify us of
+    /// disconnect, so without this we keep encoding forever after the
+    /// viewer window closes.
+    private var lastClientPacketAt: Date?
+    private static let clientIdleTimeout: TimeInterval = 10
+
     /// True when the client is on the same machine (127.0.0.1 or local IP).
     /// On loopback, input injection is skipped because CGEvent.post() moves the
     /// real cursor, which yanks it out of the viewer window creating a feedback loop.
@@ -321,6 +329,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
 
         clientConnection = nil
         clientEndpoint = nil
+        lastClientPacketAt = nil
         isRunning = false
         logger.info("Host session stopped")
     }
@@ -338,6 +347,18 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         // VTCompressionSessionEncodeFrame just to discard the encoded output.
         guard clientConnection != nil || clientEndpoint != nil else { return }
         guard authState == .authenticated else { return }
+
+        // Drop the client endpoint when no packets have arrived for the
+        // idle timeout. UDP gives us no disconnect signal, so we rely on
+        // missed heartbeats to notice the viewer has gone away.
+        if let last = lastClientPacketAt, Date().timeIntervalSince(last) > Self.clientIdleTimeout {
+            logger.info("🛑 LocalCast: client idle > \(Self.clientIdleTimeout)s, dropping endpoint")
+            clientEndpoint = nil
+            clientConnection = nil
+            lastClientPacketAt = nil
+            return
+        }
+
         encoder.encode(sampleBuffer)
     }
 
@@ -440,6 +461,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             logger.info("LocalCast: Client connected from \(String(describing: endpoint))")
             print("🔌 HostSession: Client connected from \(endpoint)")
         }
+        lastClientPacketAt = Date()
 
         // --- Auth gate ---
         // While waiting for auth, only auth packets are allowed through.
