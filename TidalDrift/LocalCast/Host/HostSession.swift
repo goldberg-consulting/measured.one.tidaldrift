@@ -332,6 +332,12 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     // MARK: - ScreenCaptureManagerDelegate
 
     func screenCaptureManager(_ manager: ScreenCaptureManager, didOutput sampleBuffer: CMSampleBuffer) {
+        // Skip the encode pipeline when no client is connected and authenticated.
+        // ScreenCaptureKit delivers frames at the configured frame rate even
+        // with zero viewers; without this guard the host burns ~300-900% CPU on
+        // VTCompressionSessionEncodeFrame just to discard the encoded output.
+        guard clientConnection != nil || clientEndpoint != nil else { return }
+        guard authState == .authenticated else { return }
         encoder.encode(sampleBuffer)
     }
 
