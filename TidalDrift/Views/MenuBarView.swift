@@ -380,6 +380,10 @@ struct MenuBarDeviceRow: View {
     private var showSSH: Bool {
         device.services.contains(.ssh) || device.isTidalDriftPeer
     }
+
+    private var rowTint: Color {
+        device.isTidalDriftPeer ? .red : .accentColor
+    }
     
     /// Non-prompting peek used to decide whether we have something to send.
     /// Computed properties are evaluated on every SwiftUI re-render; calling
@@ -397,14 +401,28 @@ struct MenuBarDeviceRow: View {
             HStack(spacing: 8) {
                 Image(systemName: device.deviceIcon)
                     .font(.system(size: 11))
-                    .foregroundColor(device.isTidalDriftPeer ? .red : .accentColor)
+                    .foregroundColor(rowTint)
                     .frame(width: 16)
                 
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(device.displayName)
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundColor(device.isTidalDriftPeer ? .red : .primary)
-                        .lineLimit(1)
+                    HStack(spacing: 5) {
+                        Text(device.displayName)
+                            .font(.system(size: 12, weight: device.isTidalDriftPeer ? .bold : .medium))
+                            .foregroundColor(device.isTidalDriftPeer ? .red : .primary)
+                            .lineLimit(1)
+
+                        if device.isTidalDriftPeer {
+                            Text("TD")
+                                .font(.system(size: 8, weight: .bold, design: .rounded))
+                                .foregroundColor(.red)
+                                .padding(.horizontal, 4)
+                                .padding(.vertical, 1)
+                                .background(
+                                    Capsule()
+                                        .fill(Color.red.opacity(0.14))
+                                )
+                        }
+                    }
                     Text(device.ipAddress)
                         .font(.system(size: 9, design: .monospaced))
                         .foregroundColor(.secondary)
@@ -463,7 +481,7 @@ struct MenuBarDeviceRow: View {
                         if device.isTidalDriftPeer {
                             Image(systemName: "wave.3.right")
                                 .font(.system(size: 8))
-                                .foregroundColor(.blue)
+                                .foregroundColor(.red)
                         }
                         Circle()
                             .fill(device.isOnline ? Color.green : Color.secondary.opacity(0.3))
@@ -475,7 +493,22 @@ struct MenuBarDeviceRow: View {
             .padding(.horizontal, 6)
             .background(
                 RoundedRectangle(cornerRadius: 5)
-                    .fill(isHovering ? Color.accentColor.opacity(0.08) : Color.clear)
+                    .fill(
+                        device.isTidalDriftPeer
+                            ? Color.red.opacity(isHovering ? 0.18 : 0.10)
+                            : (isHovering ? Color.accentColor.opacity(0.08) : Color.clear)
+                    )
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 5)
+                    .stroke(
+                        device.isTidalDriftPeer ? Color.red.opacity(0.55) : Color.clear,
+                        lineWidth: 1
+                    )
+            )
+            .shadow(
+                color: device.isTidalDriftPeer ? Color.red.opacity(0.35) : Color.clear,
+                radius: device.isTidalDriftPeer ? 6 : 0
             )
             .contentShape(Rectangle())
             .onHover { hovering in

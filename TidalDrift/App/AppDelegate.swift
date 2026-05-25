@@ -149,8 +149,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     func showOnboarding() {
         NSApp.activate(ignoringOtherApps: true)
         if let existing = onboardingWindow {
+            existing.level = .floating
+            existing.collectionBehavior.insert(.moveToActiveSpace)
             existing.orderFrontRegardless()
             existing.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
             return
         }
 
@@ -170,7 +173,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         window.minSize = NSSize(width: 700, height: 620)
         window.center()
         window.isReleasedWhenClosed = false
+        window.level = .floating
+        window.collectionBehavior.insert(.moveToActiveSpace)
         window.delegate = self
+        window.orderFrontRegardless()
         window.makeKeyAndOrderFront(nil)
 
         NSApp.activate(ignoringOtherApps: true)
@@ -648,7 +654,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         // services (published state, timers, settings bindings). Expensive
         // probes/fallbacks run on their own queues inside those services.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-            NetworkDiscoveryService.shared.startBrowsing()
+            NetworkDiscoveryService.shared.startPeriodicScanning(
+                interval: AppState.shared.settings.scanInterval
+            )
             TidalDriftPeerService.shared.startAdvertising()
             TidalDriftPeerService.shared.startDiscovery()
             _ = TidalDropService.shared
