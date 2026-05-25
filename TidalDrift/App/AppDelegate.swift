@@ -165,7 +165,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             backing: .buffered,
             defer: false
         )
-        window.title = "TidalDrift Setup"
+        window.title = "TidalDrift Setup v\(Bundle.main.fullVersion)"
         window.contentView = hostingView
         window.minSize = NSSize(width: 700, height: 620)
         window.center()
@@ -179,8 +179,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     }
 
     func closeOnboardingWindow() {
+        onboardingWindow?.orderOut(nil)
         onboardingWindow?.close()
         onboardingWindow = nil
+    }
+
+    func finishOnboarding() {
+        AppState.shared.hasCompletedOnboarding = true
+        NetworkDiscoveryService.shared.startBrowsing()
+        closeOnboardingWindow()
     }
 
     // MARK: - Settings Window

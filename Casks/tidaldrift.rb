@@ -16,6 +16,8 @@ cask "tidaldrift" do
 
   app "TidalDrift.app"
 
+  uninstall quit: "com.goldbergconsulting.tidaldrift"
+
   # Strip Gatekeeper quarantine. Required while notarization is pending
   # agreement renewal for team 97UY84BV45; the DMG is Developer ID signed
   # but not yet notarized. Re-notarization will be restored in a follow-up.
