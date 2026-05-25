@@ -159,6 +159,35 @@ class SharingConfigurationService: ObservableObject, @unchecked Sendable {
         let result = await runProcess("/usr/libexec/ApplicationFirewall/socketfilterfw", arguments: ["--getblockall"])
         return result.output.lowercased().contains("enabled")
     }
+
+    func isTidalDriftAllowedThroughFirewall() async -> Bool {
+        let appPath = Bundle.main.bundlePath
+        let result = await runProcess(
+            "/usr/libexec/ApplicationFirewall/socketfilterfw",
+            arguments: ["--listapps"]
+        )
+        let output = result.output.lowercased()
+        return output.contains(appPath.lowercased()) &&
+            (output.contains("allow incoming connections") || output.contains("allow"))
+    }
+
+    func allowTidalDriftThroughFirewall() async -> Bool {
+        let appPath = Bundle.main.bundlePath
+        guard FileManager.default.fileExists(atPath: appPath) else {
+            logger.error("Firewall exception failed: app path does not exist: \(appPath)")
+            return false
+        }
+
+        let escapedPath = Self.shellEscaped(appPath)
+        let command = """
+        /usr/libexec/ApplicationFirewall/socketfilterfw --add \(escapedPath); \
+        /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp \(escapedPath)
+        """
+        let script = """
+        do shell script "\(Self.appleScriptEscaped(command))" with administrator privileges
+        """
+        return await runAppleScript(script)
+    }
     
     // MARK: - Toggle Sharing Services
     
@@ -372,5 +401,15 @@ class SharingConfigurationService: ObservableObject, @unchecked Sendable {
         }
         
         return addresses
+    }
+
+    private static func shellEscaped(_ value: String) -> String {
+        "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
+    }
+
+    private static func appleScriptEscaped(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
     }
 }
