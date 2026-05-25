@@ -511,8 +511,15 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
 
         startBrowsing()
 
+        Task {
+            await scanSubnet(baseIP: NetworkUtils.getLocalIPAddress() ?? "192.168.1.1")
+        }
+
         scanTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             self?.refreshScan()
+            Task {
+                await self?.scanSubnet(baseIP: NetworkUtils.getLocalIPAddress() ?? "192.168.1.1")
+            }
         }
     }
 

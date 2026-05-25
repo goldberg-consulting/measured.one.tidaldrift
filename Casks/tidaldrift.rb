@@ -24,6 +24,16 @@ cask "tidaldrift" do
   postflight do
     system_command "/usr/bin/xattr",
                    args: ["-dr", "com.apple.quarantine", "#{appdir}/TidalDrift.app"]
+
+    # Brew upgrades replace the signed app bundle, but macOS TCC permissions
+    # remain keyed to the bundle identity and can get stuck on the prior build.
+    # Reset only on install/upgrade, not app launch, so the next app start gets
+    # fresh visible prompts without blocking the menu bar UI.
+    ["ScreenCapture", "Accessibility", "ListenEvent", "LocalNetwork"].each do |service|
+      system_command "/usr/bin/tccutil",
+                     args: ["reset", service, "com.goldbergconsulting.tidaldrift"],
+                     must_succeed: false
+    end
   end
 
   zap trash: [
