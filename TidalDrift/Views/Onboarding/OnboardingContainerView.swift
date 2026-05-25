@@ -9,8 +9,22 @@ struct OnboardingContainerView: View {
             backgroundGradient
             
             VStack(spacing: 0) {
-                progressIndicator
-                    .padding(.top, 24)
+                HStack(alignment: .center) {
+                    progressIndicator
+                        .frame(maxWidth: .infinity)
+
+                    Text("v\(Bundle.main.fullVersion)")
+                        .font(.caption2.monospacedDigit())
+                        .foregroundColor(.secondary)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(
+                            Capsule()
+                                .fill(Color.secondary.opacity(0.12))
+                        )
+                        .help("Installed TidalDrift version and build")
+                }
+                .padding(.top, 18)
                 
                 currentStepView
                     .frame(maxHeight: .infinity)
@@ -88,11 +102,7 @@ struct OnboardingContainerView: View {
             
             if viewModel.currentStep == .completion {
                 Button("Get Started") {
-                    withAnimation {
-                        appState.hasCompletedOnboarding = true
-                        NetworkDiscoveryService.shared.startBrowsing()
-                    }
-                    (NSApp.delegate as? AppDelegate)?.closeOnboardingWindow()
+                    (NSApp.delegate as? AppDelegate)?.finishOnboarding()
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
