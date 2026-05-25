@@ -7,6 +7,7 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
     private let clientSession: ClientSession
     private var localMonitors: [Any] = []
     private var remoteResolution: CGSize = CGSize(width: 1280, height: 720)
+    private var didCleanup = false
     
     /// Called when the window is closed so the owner can release its strong reference.
     var onClose: ((LocalCastViewerWindowController) -> Void)?
@@ -221,14 +222,13 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
     }
     
     deinit {
-        for monitor in localMonitors {
-            NSEvent.removeMonitor(monitor)
-        }
-        localMonitors.removeAll()
-        clientSession.disconnect()
+        cleanup()
     }
-    
-    override func close() {
+
+    private func cleanup() {
+        guard !didCleanup else { return }
+        didCleanup = true
+
         for monitor in localMonitors {
             NSEvent.removeMonitor(monitor)
         }
@@ -236,6 +236,10 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
         clientSession.disconnect()
         onClose?(self)
         onClose = nil
+    }
+
+    override func close() {
+        cleanup()
         super.close()
     }
     
@@ -253,6 +257,10 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
 // MARK: - NSWindowDelegate (resize sync)
 
 extension LocalCastViewerWindowController: NSWindowDelegate {
+    func windowWillClose(_ notification: Notification) {
+        cleanup()
+    }
+
     /// Fires at the end of a drag-to-resize.
     func windowDidEndLiveResize(_ notification: Notification) {
         sendViewerSize()

@@ -1,5 +1,6 @@
 import Foundation
 import ServiceManagement
+import AppKit
 
 class SettingsService {
     static let shared = SettingsService()
@@ -25,10 +26,15 @@ class SettingsService {
     }
     
     private func applySettings(_ settings: AppSettings) {
-        setLaunchAtLogin(settings.launchAtLogin)
+        _ = setLaunchAtLogin(settings.launchAtLogin)
+        applyTheme(settings.theme)
+        DispatchQueue.main.async {
+            (NSApp.delegate as? AppDelegate)?.setMenuBarIconVisible(settings.showMenuBarIcon)
+        }
     }
     
-    func setLaunchAtLogin(_ enabled: Bool) {
+    @discardableResult
+    func setLaunchAtLogin(_ enabled: Bool) -> Bool {
         if #available(macOS 13.0, *) {
             do {
                 if enabled {
@@ -36,10 +42,13 @@ class SettingsService {
                 } else {
                     try SMAppService.mainApp.unregister()
                 }
+                return true
             } catch {
                 // Failed to set launch at login - requires app to be in Applications folder
+                return false
             }
         }
+        return false
     }
     
     func isLaunchAtLoginEnabled() -> Bool {
@@ -51,6 +60,19 @@ class SettingsService {
     
     func resetToDefaults() {
         saveSettings(.default)
+    }
+
+    func applyTheme(_ theme: AppSettings.AppTheme) {
+        DispatchQueue.main.async {
+            switch theme {
+            case .system:
+                NSApp.appearance = nil
+            case .light:
+                NSApp.appearance = NSAppearance(named: .aqua)
+            case .dark:
+                NSApp.appearance = NSAppearance(named: .darkAqua)
+            }
+        }
     }
     
     func exportSettings() -> Data? {

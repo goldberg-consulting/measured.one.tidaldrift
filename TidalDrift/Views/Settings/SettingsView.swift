@@ -131,22 +131,39 @@ struct MaintenanceSettingsView: View {
     }
     
     private func resetApp() {
-        UserDefaults.standard.removePersistentDomain(forName: Bundle.main.bundleIdentifier ?? "")
-        UserDefaults.standard.synchronize()
-        
-        // Restart onboarding
-        AppState.shared.hasCompletedOnboarding = false
+        AppState.shared.resetAllSettingsAndShowOnboarding()
     }
 }
 
 struct GeneralSettingsView: View {
     @EnvironmentObject var appState: AppState
     @ObservedObject private var clipboardService = ClipboardSyncService.shared
+    @State private var launchAtLoginError: String?
+
+    private var launchAtLoginBinding: Binding<Bool> {
+        Binding(
+            get: { appState.settings.launchAtLogin },
+            set: { enabled in
+                appState.settings.launchAtLogin = enabled
+                if !SettingsService.shared.setLaunchAtLogin(enabled) {
+                    appState.settings.launchAtLogin = SettingsService.shared.isLaunchAtLoginEnabled()
+                    launchAtLoginError = "Launch at login could not be changed. Make sure TidalDrift is installed in /Applications."
+                } else {
+                    launchAtLoginError = nil
+                }
+            }
+        )
+    }
     
     var body: some View {
         Form {
             Section {
-                Toggle("Launch at login", isOn: $appState.settings.launchAtLogin)
+                Toggle("Launch at login", isOn: launchAtLoginBinding)
+                if let launchAtLoginError {
+                    Text(launchAtLoginError)
+                        .font(.caption)
+                        .foregroundColor(.orange)
+                }
                 
                 Toggle("Show menu bar icon", isOn: $appState.settings.showMenuBarIcon)
                 
@@ -212,18 +229,21 @@ struct GeneralSettingsView: View {
                         Text(theme.displayName).tag(theme)
                     }
                 }
+                .onChange(of: appState.settings.theme) { theme in
+                    SettingsService.shared.applyTheme(theme)
+                }
             }
             
             Section {
                 Button {
                     appState.hasCompletedOnboarding = false
+                    (NSApp.delegate as? AppDelegate)?.showOnboarding()
                 } label: {
                     Label("Run Setup Wizard Again", systemImage: "arrow.counterclockwise")
                 }
                 
                 Button(role: .destructive) {
-                    SettingsService.shared.resetToDefaults()
-                    appState.settings = .default
+                    appState.resetAllSettingsAndShowOnboarding()
                 } label: {
                     Label("Reset All Settings", systemImage: "trash")
                 }
@@ -231,6 +251,10 @@ struct GeneralSettingsView: View {
         }
         .formStyle(.grouped)
         .padding()
+        .onAppear {
+            appState.settings.launchAtLogin = SettingsService.shared.isLaunchAtLoginEnabled()
+            SettingsService.shared.applyTheme(appState.settings.theme)
+        }
     }
 }
 
@@ -674,6 +698,14 @@ struct TidalDropFolderPicker: View {
         ) { result in
             if case .success(let urls) = result, let url = urls.first {
                 appState.settings.tidalDropDestination = url.path
+                appState.settings.tidalDropDestinationBookmark = try? url.bookmarkData(
+                    options: [.withSecurityScope],
+                    includingResourceValuesForKeys: nil,
+                    relativeTo: nil
+                )
+                _ = url.startAccessingSecurityScopedResource()
+                try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+                url.stopAccessingSecurityScopedResource()
             }
         }
     }

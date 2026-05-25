@@ -82,6 +82,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         menuBarLogger.info("applicationDidFinishLaunching")
         configureAppearance()
         setupStatusItem()
+        setMenuBarIconVisible(AppState.shared.settings.showMenuBarIcon)
 
         UNUserNotificationCenter.current().delegate = self
 
@@ -159,13 +160,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         let hostingView = NSHostingView(rootView: onboardingView)
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 700, height: 520),
-            styleMask: [.titled, .closable],
+            contentRect: NSRect(x: 0, y: 0, width: 760, height: 680),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "TidalDrift Setup"
         window.contentView = hostingView
+        window.minSize = NSSize(width: 700, height: 620)
         window.center()
         window.isReleasedWhenClosed = false
         window.delegate = self
@@ -174,6 +176,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         NSApp.activate(ignoringOtherApps: true)
 
         onboardingWindow = window
+    }
+
+    func closeOnboardingWindow() {
+        onboardingWindow?.close()
+        onboardingWindow = nil
     }
 
     // MARK: - Settings Window
@@ -251,10 +258,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
     // MARK: - Status item + panel
 
-    /// Content size of the menu panel. Matches the SwiftUI view's natural
-    /// bounds; the popover mis-sized when we let NSHostingController
-    /// compute it, so we just pin it.
-    private static let menuPanelSize = NSSize(width: 360, height: 520)
+    /// Width of the menu panel. Height is computed from current content so
+    /// we do not leave a giant blank tail when there are no nearby devices.
+    private static let menuPanelWidth: CGFloat = 360
+    private static let maxMenuPanelHeight: CGFloat = 520
 
     /// Creates the menu-bar status item (the "TD" icon) and the panel that
     /// hosts `MenuBarView`. Called once from `applicationDidFinishLaunching`.
@@ -278,7 +285,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         // build this up front (not lazily on first click) so the SwiftUI
         // content view has time to layout before the first show.
         let panel = MenuStatusPanel(
-            contentRect: NSRect(origin: .zero, size: Self.menuPanelSize),
+            contentRect: NSRect(origin: .zero, size: NSSize(width: Self.menuPanelWidth, height: Self.maxMenuPanelHeight)),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -294,24 +301,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         panel.acceptsMouseMovedEvents = true
         panel.delegate = self
 
-        // Rounded corners on the panel's content background so the SwiftUI
-        // view's edges don't look square against the transparent panel.
-        // Use `.topLeading` alignment so the menu content sits flush at the
-        // top of the panel rather than getting vertically centered, which
-        // produced a ~100pt whitespace cap on shorter device lists.
-        let rootView = AnyView(
-            MenuBarView()
-                .environmentObject(AppState.shared)
-                .frame(
-                    width: Self.menuPanelSize.width,
-                    height: Self.menuPanelSize.height,
-                    alignment: .topLeading
-                )
-                .background(.background)
-                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        let host = NSHostingController(rootView: makeMenuRootView())
+        host.view.frame = NSRect(
+            origin: .zero,
+            size: NSSize(width: Self.menuPanelWidth, height: Self.maxMenuPanelHeight)
         )
-        let host = NSHostingController(rootView: rootView)
-        host.view.frame = NSRect(origin: .zero, size: Self.menuPanelSize)
         host.view.autoresizingMask = [.width, .height]
         self.menuPanelHostingController = host
 
@@ -319,13 +313,28 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         // Without this, the panel's nonactivating style causes the first click
         // after switching from another app to be swallowed by AppKit, reading
         // to the user as "the menu is frozen."
-        let firstMouseContainer = FirstMouseHostingView(frame: NSRect(origin: .zero, size: Self.menuPanelSize))
+        let firstMouseContainer = FirstMouseHostingView(
+            frame: NSRect(
+                origin: .zero,
+                size: NSSize(width: Self.menuPanelWidth, height: Self.maxMenuPanelHeight)
+            )
+        )
         firstMouseContainer.autoresizingMask = [.width, .height]
         firstMouseContainer.addSubview(host.view)
         panel.contentView = firstMouseContainer
 
         self.menuPanel = panel
         menuBarLogger.info("setupStatusItem: done")
+    }
+
+    private func makeMenuRootView() -> AnyView {
+        AnyView(
+            MenuBarView()
+                .environmentObject(AppState.shared)
+                .frame(width: Self.menuPanelWidth, alignment: .topLeading)
+                .background(.background)
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        )
     }
 
     /// Primary click handler for the status item. Acts as an on/off toggle
@@ -385,6 +394,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         }
     }
 
+    func setMenuBarIconVisible(_ visible: Bool) {
+        statusItem?.isVisible = visible
+        if !visible {
+            hideMenuPanel()
+        }
+    }
+
     /// Position the panel directly below the status item, horizontally
     /// centered under it, clamped to the screen's visible frame so the
     /// right edge never falls off-screen. This is the whole point of
@@ -394,11 +410,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         let buttonFrameInScreen = buttonWindow.convertToScreen(button.frame)
         let screenFrame = (buttonWindow.screen ?? NSScreen.main ?? NSScreen.screens.first!).visibleFrame
 
-        let panelHeight = min(Self.menuPanelSize.height, max(240, screenFrame.height - 16))
-        let panelSize = NSSize(width: Self.menuPanelSize.width, height: panelHeight)
+        let desiredHeight = currentMenuPanelHeight(maxScreenHeight: screenFrame.height - 16)
+        let panelSize = NSSize(width: Self.menuPanelWidth, height: desiredHeight)
         if panel.frame.size != panelSize {
             panel.setContentSize(panelSize)
         }
+        updateMenuPanelContentFrame(size: panelSize)
         var origin = NSPoint(
             x: buttonFrameInScreen.midX - panelSize.width / 2,
             // In AppKit coords (origin bottom-left), "below" the button is
@@ -417,6 +434,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         if origin.y < minY { origin.y = minY }
 
         panel.setFrameOrigin(origin)
+    }
+
+    private func updateMenuPanelContentFrame(size: NSSize) {
+        let frame = NSRect(origin: .zero, size: size)
+        menuPanelHostingController?.rootView = makeMenuRootView()
+        menuPanelHostingController?.view.frame = frame
+        menuPanel?.contentView?.frame = frame
+    }
+
+    private func currentMenuPanelHeight(maxScreenHeight: CGFloat) -> CGFloat {
+        guard let host = menuPanelHostingController else {
+            return min(Self.maxMenuPanelHeight, maxScreenHeight)
+        }
+
+        let fitting = host.sizeThatFits(
+            in: NSSize(width: Self.menuPanelWidth, height: CGFloat.greatestFiniteMagnitude)
+        )
+        let desired = max(280, min(ceil(fitting.height), Self.maxMenuPanelHeight))
+        return min(desired, maxScreenHeight)
     }
 
     @objc func hideMenuPanel() {
@@ -600,12 +636,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     }
 
     private func startNetworkServices() {
-        // Run the network bring-up on a background queue. Each of the three
-        // services forks `dns-sd` via Process.run() and although individual
-        // launches are quick, stacking three on main right at launch was a
-        // visible hitch on the menu bar. The services already marshal their
-        // @Published mutations back to main internally.
-        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.3) {
+        // Keep service ownership on the main actor/runloop. Moving the whole
+        // bring-up to a background queue broke assumptions in the discovery
+        // services (published state, timers, settings bindings). Expensive
+        // probes/fallbacks run on their own queues inside those services.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
             NetworkDiscoveryService.shared.startBrowsing()
             TidalDriftPeerService.shared.startAdvertising()
             TidalDriftPeerService.shared.startDiscovery()

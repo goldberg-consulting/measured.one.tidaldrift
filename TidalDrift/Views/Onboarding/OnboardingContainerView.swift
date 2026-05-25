@@ -25,7 +25,7 @@ struct OnboardingContainerView: View {
             }
             .padding(.horizontal, 50)
         }
-        .frame(minWidth: 700, minHeight: 500)
+        .frame(minWidth: 700, minHeight: 620)
     }
     
     private var backgroundGradient: some View {
@@ -92,6 +92,7 @@ struct OnboardingContainerView: View {
                         appState.hasCompletedOnboarding = true
                         NetworkDiscoveryService.shared.startBrowsing()
                     }
+                    (NSApp.delegate as? AppDelegate)?.closeOnboardingWindow()
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)

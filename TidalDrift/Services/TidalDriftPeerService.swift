@@ -134,6 +134,7 @@ class TidalDriftPeerService: NSObject, ObservableObject {
         AppState.shared.$settings
             .map { $0.peerDiscoveryEnabled }
             .removeDuplicates()
+            .dropFirst()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] enabled in
                 Self.log("Peer discovery setting changed: \(enabled)")
@@ -387,11 +388,42 @@ class TidalDriftPeerService: NSObject, ObservableObject {
         }
         browseProcess = nil
         browseOutputPipe = nil
+
+        clearResolveState()
         
         peerPruneTimer?.invalidate()
         peerPruneTimer = nil
         
         Self.log("Stopped discovery")
+    }
+
+    private func clearResolveState() {
+        resolveLock.lock()
+        for pipe in resolvePipes.values {
+            pipe.fileHandleForReading.readabilityHandler = nil
+        }
+        for process in resolveProcesses.values where process.isRunning {
+            process.terminate()
+        }
+        resolvePipes.removeAll()
+        resolveProcesses.removeAll()
+        resolveLock.unlock()
+
+        lookupLock.lock()
+        for pipe in lookupPipes.values {
+            pipe.fileHandleForReading.readabilityHandler = nil
+        }
+        for process in lookupProcesses.values where process.isRunning {
+            process.terminate()
+        }
+        lookupPipes.removeAll()
+        lookupProcesses.removeAll()
+        lookupCompleted.removeAll()
+        lookupLock.unlock()
+
+        txtRecordsLock.lock()
+        resolvedTXTRecords.removeAll()
+        txtRecordsLock.unlock()
     }
     
     private func pruneStaleDiscoveredPeers() {
@@ -523,6 +555,8 @@ class TidalDriftPeerService: NSObject, ObservableObject {
     
     private func parseResolveOutput(_ output: String, name: String) {
         let lines = output.components(separatedBy: "\n")
+        var resolvedHostname: String?
+
         for line in lines {
             if line.contains("=") && !line.contains("can be reached at") {
                 let parts = line.trimmingCharacters(in: .whitespaces).components(separatedBy: " ")
@@ -553,28 +587,30 @@ class TidalDriftPeerService: NSObject, ObservableObject {
                 if let hostRange = line.range(of: "at "), let portRange = line.range(of: ":5959") ?? line.range(of: ":\\d+", options: .regularExpression) {
                     let hostStart = hostRange.upperBound
                     let hostEnd = portRange.lowerBound
-                    let hostname = String(line[hostStart..<hostEnd])
-                    
-                    Self.log("Resolved \(name) -> host: \(hostname)")
-                    
-                    // If TXT record already contains an IP, skip the slow dns-sd -G lookup
-                    txtRecordsLock.lock()
-                    let txtIP = resolvedTXTRecords[name]?["ip"]
-                    let txt = resolvedTXTRecords[name]
-                    txtRecordsLock.unlock()
-                    
-                    if let txt = txt {
-                        Self.log("  TXT: \(txt)")
-                    }
-                    
-                    if let ip = txtIP, !ip.isEmpty, ip != "Unknown" {
-                        Self.log("✅ Using IP from TXT record: \(ip)")
-                        addDiscoveredPeer(name: name, ip: ip)
-                    } else {
-                        lookupIP(for: name, hostname: hostname)
-                    }
+                    resolvedHostname = String(line[hostStart..<hostEnd])
                 }
             }
+        }
+
+        // dns-sd often emits the "can be reached at" line before the TXT
+        // record line. The old code decided immediately, missed the TXT `ip=`,
+        // then fell back to dns-sd -G. Parse the whole chunk first so the
+        // advertised IP wins deterministically.
+        txtRecordsLock.lock()
+        let txtIP = resolvedTXTRecords[name]?["ip"]
+        let txt = resolvedTXTRecords[name]
+        txtRecordsLock.unlock()
+
+        if let txt = txt {
+            Self.log("  TXT: \(txt)")
+        }
+
+        if let ip = txtIP, !ip.isEmpty, ip != "Unknown" {
+            Self.log("✅ Using IP from TXT record: \(ip)")
+            addDiscoveredPeer(name: name, ip: ip)
+        } else if let resolvedHostname {
+            Self.log("Resolved \(name) -> host: \(resolvedHostname)")
+            lookupIP(for: name, hostname: resolvedHostname)
         }
     }
     

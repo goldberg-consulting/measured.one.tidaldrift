@@ -21,6 +21,7 @@ struct AppSettings: Codable, Equatable {
     
     // TidalDrop settings
     var tidalDropDestination: String
+    var tidalDropDestinationBookmark: Data?
     
     // Bonjour display name (persists across IP changes)
     var tidalDriftDisplayName: String
@@ -41,6 +42,7 @@ struct AppSettings: Codable, Equatable {
          wakeOnLANRetries: Int = 3,
          autoWakeBeforeConnect: Bool = true,
          tidalDropDestination: String = "",
+         tidalDropDestinationBookmark: Data? = nil,
          tidalDriftDisplayName: String = "") {
         self.launchAtLogin = launchAtLogin
         self.scanIntervalSeconds = scanIntervalSeconds
@@ -58,11 +60,24 @@ struct AppSettings: Codable, Equatable {
         self.wakeOnLANRetries = wakeOnLANRetries
         self.autoWakeBeforeConnect = autoWakeBeforeConnect
         self.tidalDropDestination = tidalDropDestination
+        self.tidalDropDestinationBookmark = tidalDropDestinationBookmark
         self.tidalDriftDisplayName = tidalDriftDisplayName
     }
     
     /// Returns the TidalDrop destination folder, defaulting to ~/Public/Drop Box
     var tidalDropFolder: URL {
+        if let data = tidalDropDestinationBookmark {
+            var isStale = false
+            if let url = try? URL(
+                resolvingBookmarkData: data,
+                options: [.withSecurityScope],
+                relativeTo: nil,
+                bookmarkDataIsStale: &isStale
+            ), !isStale {
+                return url
+            }
+        }
+
         if tidalDropDestination.isEmpty {
             // Default to Public Drop Box which is standard for incoming files
             return FileManager.default.homeDirectoryForCurrentUser

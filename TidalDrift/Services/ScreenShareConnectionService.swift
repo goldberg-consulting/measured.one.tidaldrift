@@ -410,13 +410,24 @@ class ScreenShareConnectionService: @unchecked Sendable {
                 return
             }
             
-            // Use Process to run osascript for more reliable Terminal control
-            let sshCommand = "ssh -o StrictHostKeyChecking=accept-new \(user)@\(host)"
+            guard Self.isSafeSSHComponent(user),
+                  Self.isSafeSSHComponent(host) else {
+                logger.error("❌ SSH: Rejected unsafe SSH target")
+                return
+            }
+
+            let target = "\(user)@\(host)"
+            let sshCommand = [
+                "ssh",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                Self.shellSingleQuoted(target)
+            ].joined(separator: " ")
             
             let appleScript = """
             tell application "Terminal"
                 activate
-                set newWindow to do script "\(sshCommand)"
+                set newWindow to do script "\(Self.appleScriptEscaped(sshCommand))"
                 set current settings of newWindow to settings set "Basic"
             end tell
             """
@@ -433,12 +444,31 @@ class ScreenShareConnectionService: @unchecked Sendable {
                 
                 // Fallback: try opening terminal URL
                 await MainActor.run {
-                    if let url = URL(string: "ssh://\(user)@\(host)") {
+                    var components = URLComponents()
+                    components.scheme = "ssh"
+                    components.user = user
+                    components.host = host
+                    if let url = components.url {
                         NSWorkspace.shared.open(url)
                     }
                 }
             }
         }
+    }
+
+    private static func isSafeSSHComponent(_ value: String) -> Bool {
+        let pattern = #"^[A-Za-z0-9._%+\-@]+$"#
+        return value.range(of: pattern, options: .regularExpression) != nil
+    }
+
+    private static func shellSingleQuoted(_ value: String) -> String {
+        "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
+    }
+
+    private static func appleScriptEscaped(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
     }
     
     /// Test connection to a specific address and port

@@ -33,6 +33,8 @@ struct ShellExecutor {
     static func execute(_ command: String, arguments: [String] = []) -> (output: String, exitCode: Int32) {
         let task = Process()
         let pipe = Pipe()
+        let outputLock = NSLock()
+        var outputData = Data()
         
         task.standardOutput = pipe
         task.standardError = pipe
@@ -44,16 +46,68 @@ struct ShellExecutor {
             task.arguments = ["-c", fullCommand]
         }
         
+        pipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            outputLock.lock()
+            outputData.append(data)
+            outputLock.unlock()
+        }
+
         do {
             try task.run()
             task.waitUntilExit()
         } catch {
+            pipe.fileHandleForReading.readabilityHandler = nil
             return (output: "Failed to execute: \(error.localizedDescription)", exitCode: -1)
         }
-        
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+
+        pipe.fileHandleForReading.readabilityHandler = nil
+        let remaining = pipe.fileHandleForReading.availableData
+        outputLock.lock()
+        outputData.append(remaining)
+        let data = outputData
+        outputLock.unlock()
         let output = String(data: data, encoding: .utf8) ?? ""
         
+        return (output: output.trimmingCharacters(in: .whitespacesAndNewlines), exitCode: task.terminationStatus)
+    }
+
+    @discardableResult
+    static func execute(executable: String, arguments: [String]) -> (output: String, exitCode: Int32) {
+        let task = Process()
+        let pipe = Pipe()
+        let outputLock = NSLock()
+        var outputData = Data()
+
+        task.executableURL = URL(fileURLWithPath: executable)
+        task.arguments = arguments
+        task.standardOutput = pipe
+        task.standardError = pipe
+
+        pipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            outputLock.lock()
+            outputData.append(data)
+            outputLock.unlock()
+        }
+
+        do {
+            try task.run()
+            task.waitUntilExit()
+        } catch {
+            pipe.fileHandleForReading.readabilityHandler = nil
+            return (output: "Failed to execute: \(error.localizedDescription)", exitCode: -1)
+        }
+
+        pipe.fileHandleForReading.readabilityHandler = nil
+        let remaining = pipe.fileHandleForReading.availableData
+        outputLock.lock()
+        outputData.append(remaining)
+        let data = outputData
+        outputLock.unlock()
+        let output = String(data: data, encoding: .utf8) ?? ""
         return (output: output.trimmingCharacters(in: .whitespacesAndNewlines), exitCode: task.terminationStatus)
     }
     
