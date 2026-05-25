@@ -40,3 +40,6 @@ build-xcode/
 dist/
 drop/
 
+# Swift profiling output
+*.profraw
+
