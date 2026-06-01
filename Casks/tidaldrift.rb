@@ -16,8 +16,6 @@ cask "tidaldrift" do
 
   app "TidalDrift.app"
 
-  uninstall quit: "com.goldbergconsulting.tidaldrift"
-
   # Strip Gatekeeper quarantine. Required while notarization is pending
   # agreement renewal for team 97UY84BV45; the DMG is Developer ID signed
   # but not yet notarized. Re-notarization will be restored in a follow-up.
@@ -33,12 +31,14 @@ cask "tidaldrift" do
     # Local Network is intentionally omitted. macOS Local Network Privacy is
     # not resettable via tccutil, even though it appears in Privacy & Security.
     # Users must toggle it manually if it gets stuck.
-    ["All", "ScreenCapture", "Accessibility", "ListenEvent"].each do |service|
+    %w[All ScreenCapture Accessibility ListenEvent].each do |service|
       system_command "/usr/bin/tccutil",
-                     args: ["reset", service, "com.goldbergconsulting.tidaldrift"],
+                     args:         ["reset", service, "com.goldbergconsulting.tidaldrift"],
                      must_succeed: false
     end
   end
+
+  uninstall quit: "com.goldbergconsulting.tidaldrift"
 
   zap trash: [
     "~/Library/Application Support/TidalDrift",

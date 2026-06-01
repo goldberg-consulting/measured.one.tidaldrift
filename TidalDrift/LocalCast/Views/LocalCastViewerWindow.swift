@@ -13,8 +13,7 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
     var onClose: ((LocalCastViewerWindowController) -> Void)?
     
     init(device: DiscoveredDevice, session: ClientSession) {
-        print("🎮 LocalCastViewerWindowController: INIT START for \(device.name)")
-        NSLog("🎮 LocalCastViewerWindowController: INIT START for %@", device.name)
+        lcDebug("🎮 LocalCastViewerWindowController: INIT START for \(device.name)")
         
         self.device = device
         self.clientSession = session
@@ -51,14 +50,12 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
         session.renderer = MetalRenderer(mtkView: mtkView)
         session.delegate = self
         
-        print("🎮 LocalCastViewerWindowController: Calling setupInputCapture()...")
-        NSLog("🎮 LocalCastViewerWindowController: Calling setupInputCapture()...")
+        lcDebug("🎮 LocalCastViewerWindowController: Calling setupInputCapture()...")
         
         // Set up input capture
         setupInputCapture()
         
-        print("🎮 LocalCastViewerWindowController: INIT COMPLETE ✓")
-        NSLog("🎮 LocalCastViewerWindowController: INIT COMPLETE ✓")
+        lcDebug("🎮 LocalCastViewerWindowController: INIT COMPLETE ✓")
     }
     
     required init?(coder: NSCoder) {
@@ -79,7 +76,7 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
             
             // Adjust window aspect ratio or size if needed
             // For now, let's just update the internal resolution for coordinate mapping
-            print("🌊 LocalCast: Remote resolution updated to \(size.width)x\(size.height)")
+            lcDebug("🌊 LocalCast: Remote resolution updated to \(size.width)x\(size.height)")
             
             // If the window is still the default size, maybe resize it to fit the remote screen (scaled down if too big)
             if window.frame.width == 1280 && window.frame.height == 720 {
@@ -118,10 +115,7 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
             let isOurs = event.window == window
             self.diagCount += 1
             if self.diagCount <= 20 || self.diagCount % 500 == 0 {
-                NSLog("🖱️ MONITOR #%d: type=%ld ours=%d capture=%d overlay=%d",
-                      self.diagCount, event.type.rawValue, isOurs ? 1 : 0,
-                      self.clientSession.inputCaptureEnabled ? 1 : 0,
-                      self.clientSession.isOverlayActive ? 1 : 0)
+                lcDebug("🖱️ MONITOR #\(self.diagCount): type=\(event.type.rawValue) ours=\(isOurs) capture=\(self.clientSession.inputCaptureEnabled) overlay=\(self.clientSession.isOverlayActive)")
             }
             
             guard isOurs else { return event }
@@ -135,13 +129,13 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
             let isInToolbar = y > (contentHeight - self.toolbarRegionHeight)
             let isInBottomBar = y < self.bottomBarRegionHeight
             if isInToolbar || isInBottomBar {
-                if self.diagCount <= 20 { NSLog("🖱️ PASS-THROUGH: toolbar=%d bottomBar=%d y=%.0f h=%.0f", isInToolbar ? 1 : 0, isInBottomBar ? 1 : 0, y, contentHeight) }
+                if self.diagCount <= 20 { lcDebug("🖱️ PASS-THROUGH: toolbar=\(isInToolbar) bottomBar=\(isInBottomBar) y=\(Int(y)) h=\(Int(contentHeight))") }
                 return event
             }
             
             let point = contentView.convert(event.locationInWindow, from: nil)
             self.handleMouseEvent(event, at: point)
-            if self.diagCount <= 20 { NSLog("🖱️ FORWARDED to remote at (%.2f, %.2f)", point.x / contentView.frame.width, point.y / contentView.frame.height) }
+            if self.diagCount <= 20 { lcDebug("🖱️ FORWARDED to remote at (\(point.x / contentView.frame.width), \(point.y / contentView.frame.height))") }
             return nil
         }
         
@@ -249,7 +243,7 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
         guard let contentView = window?.contentView else { return }
         let size = contentView.frame.size
         guard size.width > 0 && size.height > 0 else { return }
-        print("📐 Viewer content resized to \(size.width)x\(size.height) — forwarding to host")
+        lcDebug("📐 Viewer content resized to \(size.width)x\(size.height) — forwarding to host")
         clientSession.sendWindowResize(width: size.width, height: size.height)
     }
 }

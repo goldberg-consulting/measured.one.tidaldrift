@@ -175,14 +175,14 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     func update(with imageBuffer: CVImageBuffer) {
         guard let cache = textureCache else {
             if !hasLoggedSuccess {
-                print("🖥️ MetalRenderer: ❌ No texture cache available")
+                lcDebug("🖥️ MetalRenderer: ❌ No texture cache available")
             }
             return
         }
         
         guard pipelineState != nil else {
             if !hasLoggedSuccess {
-                print("🖥️ MetalRenderer: ❌ No valid pipeline state - cannot render")
+                lcDebug("🖥️ MetalRenderer: ❌ No valid pipeline state - cannot render")
             }
             return
         }
@@ -212,7 +212,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
             // Try BGRA as default
             mtlPixelFormat = .bgra8Unorm
             if frameCount < 5 {
-                print("🖥️ MetalRenderer: Unknown pixel format \(pixelFormat), using BGRA")
+                lcDebug("🖥️ MetalRenderer: Unknown pixel format \(pixelFormat), using BGRA")
             }
         }
         

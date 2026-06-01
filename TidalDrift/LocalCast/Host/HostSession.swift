@@ -77,6 +77,23 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     /// reached the network.
     private var hasSentFirstVideoPacket: Bool = false
 
+    /// ScreenCaptureKit only runs while a viewer is connected. Hosting
+    /// without a client used to capture at full frame rate and burn CPU
+    /// even though the encoder guard discarded every frame.
+    private var captureActive = false
+    private let captureStateLock = NSLock()
+
+    /// Run `body` while holding the capture-state lock. Synchronous generic so
+    /// it is callable from async contexts (stop, stream-request handling)
+    /// without the "NSLock used from async context" warning; the lock is never
+    /// held across a suspension point.
+    @discardableResult
+    private func withCaptureState<T>(_ body: () -> T) -> T {
+        captureStateLock.lock()
+        defer { captureStateLock.unlock() }
+        return body()
+    }
+
     /// True when the client is on the same machine (127.0.0.1 or local IP).
     /// On loopback, input injection is skipped because CGEvent.post() moves the
     /// real cursor, which yanks it out of the viewer window creating a feedback loop.
@@ -147,38 +164,62 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             throw error
         }
 
-        do {
-            switch target {
-            case .fullDisplay:
-                try await startFullDisplayCapture()
-
-            #if DEBUG
-            case .window(let windowID, let title):
-                logger.info("🪟 Starting window capture: '\(title)' (ID: \(windowID))")
-                try await startWindowCapture(windowID: windowID)
-
-            case .app(let processID, let name):
-                logger.info("📱 Starting app capture: '\(name)' (PID: \(processID))")
-                try await startAppCapture(processID: processID)
-            #else
-            case .window, .app:
-                logger.error("Per-app/per-window capture is only available in debug builds")
-                throw LocalCastError.noDisplayAvailable
-            #endif
-            }
-
-            // Update input injector with capture bounds for proper coordinate mapping
-            updateInputBounds()
-
-            logger.info("✅ Capture started")
-        } catch {
-            logger.error("❌ Failed to start capture: \(error.localizedDescription)")
-            transport.stopListening()
-            throw error
-        }
-
         isRunning = true
-        logger.info("✅ Host session started successfully - listening on port \(LocalCastConfiguration.hostPort)")
+        logger.info("✅ Host session listening on port \(LocalCastConfiguration.hostPort) (capture deferred until client connects)")
+    }
+
+    /// Start ScreenCaptureKit once a client is connected and authenticated.
+    private func beginCaptureForClient() {
+        // Claim the capture slot synchronously. ScreenCaptureKit setup happens
+        // in the async task below, so without claiming up front a burst of
+        // client packets (heartbeat + keyframe request arriving together) would
+        // each pass this guard and start a second SCStream on top of the first.
+        let alreadyActive = withCaptureState { () -> Bool in
+            if captureActive { return true }
+            captureActive = true
+            return false
+        }
+        if alreadyActive { return }
+
+        Task {
+            do {
+                switch captureTarget {
+                case .fullDisplay:
+                    try await startFullDisplayCapture()
+                #if DEBUG
+                case .window(let windowID, let title):
+                    logger.info("🪟 Starting window capture: '\(title)' (ID: \(windowID))")
+                    try await startWindowCapture(windowID: windowID)
+                case .app(let processID, let name):
+                    logger.info("📱 Starting app capture: '\(name)' (PID: \(processID))")
+                    try await startAppCapture(processID: processID)
+                #else
+                case .window, .app:
+                    throw LocalCastError.noDisplayAvailable
+                #endif
+                }
+                updateInputBounds()
+                logger.info("✅ Capture started for connected client")
+            } catch {
+                logger.error("❌ Failed to start capture for client: \(error.localizedDescription)")
+                withCaptureState { captureActive = false }
+            }
+        }
+    }
+
+    /// Stop ScreenCaptureKit when the viewer goes idle but keep UDP listening.
+    private func suspendCaptureForIdleClient() {
+        let wasActive = withCaptureState { () -> Bool in
+            guard captureActive else { return false }
+            captureActive = false
+            return true
+        }
+        guard wasActive else { return }
+
+        Task {
+            await captureManager.stopCapture()
+            logger.info("⏸️ LocalCast: suspended capture (no active viewer)")
+        }
     }
 
     /// Update the input injector with the current capture bounds
@@ -317,7 +358,8 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             keyframeIntervalSeconds: kfi
         )
 
-        // Update capture frame rate
+        guard withCaptureState({ captureActive }) else { return }
+
         Task {
             await captureManager.updateFrameRate(fps)
         }
@@ -325,6 +367,8 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
 
     func stop() async {
         guard isRunning else { return }
+
+        withCaptureState { captureActive = false }
 
         await captureManager.stopCapture()
         encoder.invalidate()
@@ -364,6 +408,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             clientConnection = nil
             lastClientPacketAt = nil
             hasSentFirstVideoPacket = false
+            suspendCaptureForIdleClient()
             return
         }
 
@@ -410,7 +455,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
                 target = "unknown"
             }
             logger.info("📤 LocalCast: first video packet sent (\(packet.count) bytes, keyframe=\(isKeyFrame), to \(target))")
-            print("📤 LocalCast: first video packet sent (\(packet.count) bytes, keyframe=\(isKeyFrame), to \(target))")
+            lcDebug("📤 LocalCast: first video packet sent (\(packet.count) bytes, keyframe=\(isKeyFrame), to \(target))")
         }
     }
 
@@ -426,11 +471,11 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
 
         let localIP = NetworkUtils.getLocalIPAddress() ?? "unknown"
         logger.info("LocalCast: Client connected from \(String(describing: endpoint)) (loopback: \(self.isLoopbackConnection))")
-        print("[INPUT-DIAG] 🔌 CLIENT CONNECTED from \(endpoint)")
-        print("[INPUT-DIAG]    isLoopback=\(isLoopbackConnection), localIP=\(localIP)")
-        print("[INPUT-DIAG]    Accessibility=\(inputInjector.hasAccessibilityPermission)")
+        lcDebug("[INPUT-DIAG] 🔌 CLIENT CONNECTED from \(endpoint)")
+        lcDebug("[INPUT-DIAG]    isLoopback=\(isLoopbackConnection), localIP=\(localIP)")
+        lcDebug("[INPUT-DIAG]    Accessibility=\(inputInjector.hasAccessibilityPermission)")
         if isLoopbackConnection {
-            print("[INPUT-DIAG] ⚠️ LOOPBACK DETECTED — all input injection will be SKIPPED")
+            lcDebug("[INPUT-DIAG] ⚠️ LOOPBACK DETECTED — all input injection will be SKIPPED")
         }
 
         // If auth is still pending, don't prime any keyframes. The encoder
@@ -439,10 +484,11 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         // nothing. forceInitialKeyframes() is invoked from handleAuthComplete
         // once the session is authenticated.
         guard authState == .authenticated else {
-            logger.info("🔐 Deferring initial keyframe burst until auth completes")
+            logger.info("🔐 Deferring capture and keyframes until auth completes")
             return
         }
 
+        beginCaptureForClient()
         forceInitialKeyframes()
     }
 
@@ -479,9 +525,16 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         if clientEndpoint == nil {
             clientEndpoint = endpoint
             logger.info("LocalCast: Client connected from \(String(describing: endpoint))")
-            print("🔌 HostSession: Client connected from \(endpoint)")
+            lcDebug("🔌 HostSession: Client connected from \(endpoint)")
         }
         lastClientPacketAt = Date()
+
+        if authState == .authenticated,
+           clientConnection != nil || clientEndpoint != nil {
+            // beginCaptureForClient is idempotent (it re-checks and claims the
+            // slot under the lock), so just call it; no need to pre-check here.
+            beginCaptureForClient()
+        }
 
         // --- Auth gate ---
         // While waiting for auth, only auth packets are allowed through.
@@ -516,7 +569,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             // Rate limit check
             if let limiter = inputRateLimiter, !limiter.shouldAllow() {
                 if receivedInputCount % 100 == 0 {
-                    print("[INPUT-DIAG] ⚠️ RATE LIMITED: dropped input #\(receivedInputCount)")
+                    lcDebug("[INPUT-DIAG] ⚠️ RATE LIMITED: dropped input #\(receivedInputCount)")
                 }
                 return
             }
@@ -532,22 +585,22 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
                 }
 
                 if isSignificant {
-                    print("[INPUT-DIAG] 📥 RECEIVED input #\(receivedInputCount) from \(endpoint): \(input)")
-                    print("[INPUT-DIAG]    isLoopback=\(isLoopbackConnection), hasAccessibility=\(inputInjector.hasAccessibilityPermission)")
+                    lcDebug("[INPUT-DIAG] 📥 RECEIVED input #\(receivedInputCount) from \(endpoint): \(input)")
+                    lcDebug("[INPUT-DIAG]    isLoopback=\(isLoopbackConnection), hasAccessibility=\(inputInjector.hasAccessibilityPermission)")
                 }
 
                 if isLoopbackConnection {
                     if isSignificant {
-                        print("[INPUT-DIAG] ⛔ BLOCKED: loopback connection — injection skipped to prevent cursor feedback")
+                        lcDebug("[INPUT-DIAG] ⛔ BLOCKED: loopback connection — injection skipped to prevent cursor feedback")
                     }
                 } else {
                     if isSignificant {
-                        print("[INPUT-DIAG] ✅ INJECTING input #\(receivedInputCount)")
+                        lcDebug("[INPUT-DIAG] ✅ INJECTING input #\(receivedInputCount)")
                     }
                     inputInjector.inject(input)
                 }
             } else {
-                print("[INPUT-DIAG] ❌ DESERIALIZE FAILED: input #\(receivedInputCount), payload: \(packet.payload.count) bytes, first byte: \(packet.payload.first ?? 0)")
+                lcDebug("[INPUT-DIAG] ❌ DESERIALIZE FAILED: input #\(receivedInputCount), payload: \(packet.payload.count) bytes, first byte: \(packet.payload.first ?? 0)")
             }
 
         case .heartbeat:
@@ -558,20 +611,20 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         case .keyframeRequest:
             // Client requested a keyframe
             logger.info("🔑 LocalCast: Received keyframe request from client")
-            print("🔑 HostSession: Received keyframe request")
+            lcDebug("🔑 HostSession: Received keyframe request")
             encoder.forceKeyFrame()
 
         #if DEBUG
         case .appListRequest:
             // Client wants to know what apps are available to stream (dormant)
-            print("📋 HostSession: Received app list request from client")
+            lcDebug("📋 HostSession: Received app list request from client")
             Task {
                 await handleAppListRequest(replyTo: endpoint)
             }
 
         case .streamAppRequest:
             // Client wants to stream a specific app/window (dormant)
-            print("🎬 HostSession: Received stream request from client")
+            lcDebug("🎬 HostSession: Received stream request from client")
             Task {
                 await handleStreamRequest(payload: packet.payload, replyTo: endpoint)
             }
@@ -593,7 +646,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             handleQualityUpdate(payload: packet.payload)
 
         default:
-            print("❓ HostSession: Received unknown packet type: \(packet.type)")
+            lcDebug("❓ HostSession: Received unknown packet type: \(packet.type)")
         }
     }
 
@@ -607,7 +660,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     #if DEBUG
     /// Gather available apps and send to client
     private func handleAppListRequest(replyTo endpoint: NWEndpoint) async {
-        print("📋 HostSession: Gathering available apps...")
+        lcDebug("📋 HostSession: Gathering available apps...")
 
         do {
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
@@ -692,7 +745,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             allowedAppPIDs = Set(apps.map(\.processID))
             allowedWindowIDs = Set(apps.flatMap { $0.windows.map { CGWindowID($0.windowID) } })
 
-            print("📋 HostSession: Found \(apps.count) streamable apps")
+            lcDebug("📋 HostSession: Found \(apps.count) streamable apps")
 
             // Encode and send
             let encoder = JSONEncoder()
@@ -706,11 +759,11 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             )
 
             transport.send(packet: packet, to: endpoint)
-            print("📋 HostSession: Sent app list to client (\(payload.count) bytes)")
+            lcDebug("📋 HostSession: Sent app list to client (\(payload.count) bytes)")
 
         } catch {
             logger.warning("Failed to get app list: \(error.localizedDescription) — sending empty list so client can stop loading")
-            print("❌ HostSession: Failed to get app list: \(error)")
+            lcDebug("❌ HostSession: Failed to get app list: \(error)")
             allowedAppPIDs.removeAll()
             allowedWindowIDs.removeAll()
             // Always send a response so the client can clear isLoadingApps (e.g. Screen Recording denied on host)
@@ -758,8 +811,8 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
 
     /// Handle a request to stream a specific app/window
     private func handleStreamRequest(payload: Data, replyTo endpoint: NWEndpoint) async {
-        print("🎬 HostSession: Processing stream request...")
-        print("🎬 HostSession: Payload size: \(payload.count) bytes")
+        lcDebug("🎬 HostSession: Processing stream request...")
+        lcDebug("🎬 HostSession: Payload size: \(payload.count) bytes")
 
         do {
             // Cap payload size to prevent memory exhaustion from malicious packets
@@ -769,63 +822,66 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             let decoder = JSONDecoder()
             let request = try decoder.decode(StreamRequest.self, from: payload)
             if let validationError = streamRequestValidationError(request) {
-                print("❌ HostSession: Stream request rejected: \(validationError)")
+                lcDebug("❌ HostSession: Stream request rejected: \(validationError)")
                 sendStreamError(validationError, to: endpoint)
                 return
             }
 
-            print("🎬 HostSession: Stream request decoded:")
-            print("   Type: \(request.type)")
-            print("   ProcessID: \(request.processID ?? -1)")
-            print("   WindowID: \(request.windowID ?? 0)")
-            print("   AppName: \(request.appName ?? "nil")")
+            lcDebug("🎬 HostSession: Stream request decoded:")
+            lcDebug("   Type: \(request.type)")
+            lcDebug("   ProcessID: \(request.processID ?? -1)")
+            lcDebug("   WindowID: \(request.windowID ?? 0)")
+            lcDebug("   AppName: \(request.appName ?? "nil")")
 
-            // Stop any existing capture
-            if isRunning {
-                print("🎬 HostSession: Stopping existing capture...")
+            let hadCapture = withCaptureState { () -> Bool in
+                let had = captureActive
+                captureActive = false
+                return had
+            }
+            if hadCapture {
+                lcDebug("🎬 HostSession: Stopping existing capture...")
                 await captureManager.stopCapture()
                 encoder.invalidate()
-                isRunning = false
-                print("🎬 HostSession: Existing capture stopped")
+                lcDebug("🎬 HostSession: Existing capture stopped")
             }
 
             // Start the requested capture
-            print("🎬 HostSession: Starting new capture...")
+            lcDebug("🎬 HostSession: Starting new capture...")
             switch request.type {
             case .fullDisplay:
-                print("🎬 HostSession: Starting FULL DISPLAY capture")
+                lcDebug("🎬 HostSession: Starting FULL DISPLAY capture")
                 try await startFullDisplayCapture()
                 captureTarget = .fullDisplay
 
             case .window:
                 guard let windowID = request.windowID else {
-                    print("❌ HostSession: No window ID in request!")
+                    lcDebug("❌ HostSession: No window ID in request!")
                     throw LocalCastError.connectionFailed("No window ID provided")
                 }
                 let title = request.appName ?? "Window"
-                print("🎬 HostSession: Starting WINDOW capture: '\(title)' (ID: \(windowID))")
+                lcDebug("🎬 HostSession: Starting WINDOW capture: '\(title)' (ID: \(windowID))")
                 try await startWindowCapture(windowID: CGWindowID(windowID))
                 captureTarget = .window(CGWindowID(windowID), title: title)
 
             case .app:
                 guard let processID = request.processID else {
-                    print("❌ HostSession: No process ID in request!")
+                    lcDebug("❌ HostSession: No process ID in request!")
                     throw LocalCastError.connectionFailed("No process ID provided")
                 }
                 let name = request.appName ?? "App"
-                print("🎬 HostSession: Starting APP capture: '\(name)' (PID: \(processID))")
+                lcDebug("🎬 HostSession: Starting APP capture: '\(name)' (PID: \(processID))")
                 try await startAppCapture(processID: processID)
                 captureTarget = .app(processID, name: name)
             }
 
             updateInputBounds()
-            isRunning = true
+            withCaptureState { captureActive = true }
 
             // Force a keyframe so the client decoder can sync to the new stream.
             // The encoder was already primed with forceKeyFrame() before capture started,
             // but send another just in case frames slipped through.
             encoder.forceKeyFrame()
-            print("🎬 HostSession: ✅ New capture running, keyframe forced")
+            lcDebug("🎬 HostSession: ✅ New capture running, keyframe forced")
 
             // Send success response
             let response = StreamResponse(
@@ -843,23 +899,23 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             )
             transport.send(packet: packet, to: endpoint)
 
-            print("🎬 HostSession: ✅ Started streaming '\(request.appName ?? "Display")'")
-            print("🎬 HostSession: Response sent to client")
+            lcDebug("🎬 HostSession: ✅ Started streaming '\(request.appName ?? "Display")'")
+            lcDebug("🎬 HostSession: Response sent to client")
 
         } catch {
-            print("❌ HostSession: Stream request failed: \(error.localizedDescription)")
+            lcDebug("❌ HostSession: Stream request failed: \(error.localizedDescription)")
 
             // Try to recover by falling back to full display capture
-            print("🔄 HostSession: Recovering -- falling back to full display capture")
+            lcDebug("🔄 HostSession: Recovering -- falling back to full display capture")
             do {
                 try await startFullDisplayCapture()
                 captureTarget = .fullDisplay
                 updateInputBounds()
                 isRunning = true
                 encoder.forceKeyFrame()
-                print("🔄 HostSession: ✅ Recovered to full display")
+                lcDebug("🔄 HostSession: ✅ Recovered to full display")
             } catch {
-                print("❌ HostSession: Recovery also failed: \(error.localizedDescription)")
+                lcDebug("❌ HostSession: Recovery also failed: \(error.localizedDescription)")
             }
 
             sendStreamError(error.localizedDescription, to: endpoint)
@@ -941,10 +997,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         )
         transport.send(packet: successPacket, to: endpoint)
 
-        // Now that the client is authenticated, run the initial keyframe
-        // burst. This is the symmetrical path to the no-auth flow in
-        // udpTransport(clientDidConnect:), which bursts keyframes as soon
-        // as the client first appears.
+        beginCaptureForClient()
         forceInitialKeyframes()
     }
 
@@ -972,7 +1025,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
 
         if isLoopbackConnection {
             // On loopback, resizing would fight with the user's own window.
-            print("📐 HostSession: Loopback — skipping remote resize")
+            lcDebug("📐 HostSession: Loopback — skipping remote resize")
             return
         }
 

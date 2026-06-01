@@ -3,6 +3,21 @@ import Network
 import CryptoKit
 import OSLog
 
+/// Debug-only console logging for the realtime LocalCast pipeline.
+///
+/// The capture, encode, transport, decode, and input-injection paths run on
+/// latency-sensitive queues at up to the stream frame rate. Plain `print`
+/// performs synchronous stdio on those queues, which shows up as sustained
+/// CPU and stutter under load. Routing those diagnostics through this helper
+/// keeps them in DEBUG builds while compiling them (and the cost of building
+/// their interpolated strings) entirely out of release.
+@inline(__always)
+func lcDebug(_ message: @autoclosure () -> String) {
+    #if DEBUG
+    print(message())
+    #endif
+}
+
 protocol UDPTransportDelegate: AnyObject {
     func udpTransport(_ transport: UDPTransport, didReceivePacket packet: LocalCastPacket, from endpoint: NWEndpoint)
     func udpTransport(_ transport: UDPTransport, clientDidConnect endpoint: NWEndpoint, connection: NWConnection)
@@ -187,13 +202,13 @@ class UDPTransport {
         
         // Log non-video packets (input events, heartbeats, etc.)
         if packet.type != .videoFrame {
-            print("📡 UDPTransport.send(on:): \(packet.type) #\(count), \(data.count) bytes, conn state: \(connection.state)")
+            lcDebug("📡 UDPTransport.send(on:): \(packet.type) #\(count), \(data.count) bytes, conn state: \(connection.state)")
         }
         
         // Warn if connection not ready
         if connection.state != .ready {
             if packet.type == .inputEvent {
-                print("⚠️ UDPTransport: Connection NOT READY for input! State: \(connection.state)")
+                lcDebug("⚠️ UDPTransport: Connection NOT READY for input! State: \(connection.state)")
             }
         }
         
@@ -211,9 +226,9 @@ class UDPTransport {
             connection.send(content: noFragmentData, completion: .contentProcessed { [weak self] error in
                 if let error = error {
                     self?.logger.error("UDP send error: \(error.localizedDescription)")
-                    print("❌ UDPTransport: Send error for \(packetType): \(error.localizedDescription)")
+                    lcDebug("❌ UDPTransport: Send error for \(packetType): \(error.localizedDescription)")
                 } else if packetType == .inputEvent {
-                    print("✅ UDPTransport: Input packet sent successfully")
+                    lcDebug("✅ UDPTransport: Input packet sent successfully")
                 }
             })
         }
@@ -261,7 +276,7 @@ class UDPTransport {
         
         // Verbose logging for input events
         if packet.type == .inputEvent {
-            print("📡 UDPTransport.send(to:): Sending INPUT to \(endpointKey)")
+            lcDebug("📡 UDPTransport.send(to:): Sending INPUT to \(endpointKey)")
         }
         
         connectionsLock.lock()
@@ -269,7 +284,7 @@ class UDPTransport {
         if let incomingConn = incomingConnections[endpointKey] {
             connectionsLock.unlock()
             if packet.type == .inputEvent {
-                print("   Using INCOMING connection, state: \(incomingConn.state)")
+                lcDebug("   Using INCOMING connection, state: \(incomingConn.state)")
             }
             send(packet: packet, on: incomingConn)
             return
@@ -282,7 +297,7 @@ class UDPTransport {
             connection = existing
             connectionsLock.unlock()
             if packet.type == .inputEvent {
-                print("   Using EXISTING outgoing connection, state: \(connection.state)")
+                lcDebug("   Using EXISTING outgoing connection, state: \(connection.state)")
             }
         } else {
             connectionsLock.unlock()
@@ -296,7 +311,7 @@ class UDPTransport {
             connectionsLock.unlock()
             
             if packet.type == .inputEvent {
-                print("   Created NEW outgoing connection, state: \(connection.state)")
+                lcDebug("   Created NEW outgoing connection, state: \(connection.state)")
             }
         }
         
@@ -305,7 +320,7 @@ class UDPTransport {
             // Give the connection a moment to establish
             DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) { [weak self] in
                 if packet.type == .inputEvent {
-                    print("   Delayed send, connection state now: \(connection.state)")
+                    lcDebug("   Delayed send, connection state now: \(connection.state)")
                 }
                 self?.send(packet: packet, on: connection)
             }
@@ -349,7 +364,7 @@ class UDPTransport {
         statsLock.unlock()
         
         if count <= 10 || count % 500 == 0 {
-            print("📨 UDPTransport: handleReceivedData #\(count), \(data.count) bytes from \(describeEndpoint(endpoint))")
+            lcDebug("📨 UDPTransport: handleReceivedData #\(count), \(data.count) bytes from \(describeEndpoint(endpoint))")
         }
         
         // Parse fragment header
@@ -357,14 +372,14 @@ class UDPTransport {
             // Try parsing as raw packet (for backwards compatibility)
             if let packet = decryptAndParse(data) {
                 if packet.type != .videoFrame {
-                    print("📨 UDPTransport: Received \(packet.type) packet (raw, no fragment header)")
+                    lcDebug("📨 UDPTransport: Received \(packet.type) packet (raw, no fragment header)")
                 }
                 if packet.type == .inputEvent {
-                    print("🎮 UDPTransport: *** INPUT EVENT RECEIVED *** from \(describeEndpoint(endpoint))")
+                    lcDebug("🎮 UDPTransport: *** INPUT EVENT RECEIVED *** from \(describeEndpoint(endpoint))")
                 }
                 delegate?.udpTransport(self, didReceivePacket: packet, from: endpoint)
             } else {
-                print("⚠️ UDPTransport: Could not parse received data (\(data.count) bytes)")
+                lcDebug("⚠️ UDPTransport: Could not parse received data (\(data.count) bytes)")
             }
             return
         }
@@ -376,14 +391,14 @@ class UDPTransport {
             if let packet = decryptAndParse(Data(payload)) {
                 // Log non-video packets
                 if packet.type != .videoFrame {
-                    print("📨 UDPTransport: Received \(packet.type) packet #\(count), payload: \(packet.payload.count) bytes")
+                    lcDebug("📨 UDPTransport: Received \(packet.type) packet #\(count), payload: \(packet.payload.count) bytes")
                 }
                 if packet.type == .inputEvent {
-                    print("🎮 UDPTransport: *** INPUT EVENT RECEIVED *** from \(describeEndpoint(endpoint))")
+                    lcDebug("🎮 UDPTransport: *** INPUT EVENT RECEIVED *** from \(describeEndpoint(endpoint))")
                 }
                 delegate?.udpTransport(self, didReceivePacket: packet, from: endpoint)
             } else {
-                print("⚠️ UDPTransport: Could not parse packet from payload (\(payload.count) bytes)")
+                lcDebug("⚠️ UDPTransport: Could not parse packet from payload (\(payload.count) bytes)")
             }
             return
         }
