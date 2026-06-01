@@ -186,17 +186,12 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
                 switch captureTarget {
                 case .fullDisplay:
                     try await startFullDisplayCapture()
-                #if DEBUG
                 case .window(let windowID, let title):
                     logger.info("🪟 Starting window capture: '\(title)' (ID: \(windowID))")
                     try await startWindowCapture(windowID: windowID)
                 case .app(let processID, let name):
                     logger.info("📱 Starting app capture: '\(name)' (PID: \(processID))")
                     try await startAppCapture(processID: processID)
-                #else
-                case .window, .app:
-                    throw LocalCastError.noDisplayAvailable
-                #endif
                 }
                 updateInputBounds()
                 logger.info("✅ Capture started for connected client")
@@ -277,7 +272,6 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         )
     }
 
-    #if DEBUG
     /// Start window-specific capture
     private func startWindowCapture(windowID: CGWindowID) async throws {
         // Look up the owning PID so we can resize the window later via Accessibility
@@ -330,7 +324,6 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             maxDimension: configuration.maxCaptureDimension
         )
     }
-    #endif
 
     // MARK: - Live Quality Tuning
 
@@ -614,16 +607,15 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             lcDebug("🔑 HostSession: Received keyframe request")
             encoder.forceKeyFrame()
 
-        #if DEBUG
         case .appListRequest:
-            // Client wants to know what apps are available to stream (dormant)
+            // Client wants to know what apps are available to stream
             lcDebug("📋 HostSession: Received app list request from client")
             Task {
                 await handleAppListRequest(replyTo: endpoint)
             }
 
         case .streamAppRequest:
-            // Client wants to stream a specific app/window (dormant)
+            // Client wants to stream a specific app/window
             lcDebug("🎬 HostSession: Received stream request from client")
             Task {
                 await handleStreamRequest(payload: packet.payload, replyTo: endpoint)
@@ -640,7 +632,6 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
 
         case .restoreAppsRequest:
             handleRestoreAppsRequest()
-        #endif
 
         case .qualityUpdate:
             handleQualityUpdate(payload: packet.payload)
@@ -650,14 +641,12 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         }
     }
 
-    // MARK: - App List & Stream Request Handling (dormant)
+    // MARK: - App List & Stream Request Handling
     //
-    // Per-app / per-window enumeration and retargeting. The full-desktop
-    // Metal pipeline never invokes any of this; kept behind #if DEBUG so
-    // the dormant path can be finished in a later pass without having to
-    // re-derive the SCShareableContent filtering rules.
+    // Per-app / per-window enumeration and retargeting, used by the viewer's
+    // app picker to switch the LocalCast stream from the full desktop to a
+    // single app or window (and back).
 
-    #if DEBUG
     /// Gather available apps and send to client
     private func handleAppListRequest(replyTo endpoint: NWEndpoint) async {
         lcDebug("📋 HostSession: Gathering available apps...")
@@ -921,7 +910,6 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             sendStreamError(error.localizedDescription, to: endpoint)
         }
     }
-    #endif
 
     // MARK: - Auth Handshake (Host Side)
 
@@ -1001,9 +989,8 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         forceInitialKeyframes()
     }
 
-    // MARK: - Window Resize (dormant per-app)
+    // MARK: - Window Resize
 
-    #if DEBUG
     private func handleWindowResize(payload: Data) {
         guard payload.count >= 16 else { return }
 
@@ -1080,7 +1067,6 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         logger.info("🔓 Restore apps request")
         inputInjector.restoreApps()
     }
-    #endif
 
     private func handleQualityUpdate(payload: Data) {
         guard let update = try? JSONDecoder().decode(QualityUpdatePayload.self, from: payload) else {

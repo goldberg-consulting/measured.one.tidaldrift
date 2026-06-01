@@ -9,19 +9,15 @@ import CoreVideo
 protocol ClientSessionDelegate: AnyObject {
     func clientSession(_ session: ClientSession, didDisconnectWithReason reason: String)
     func clientSession(_ session: ClientSession, didUpdateResolution size: CGSize)
-    #if DEBUG
-    /// Per-app streaming — dormant. The host no longer enumerates apps.
+    /// Per-app streaming callbacks.
     func clientSession(_ session: ClientSession, didReceiveAppList apps: [RemoteAppInfo])
     func clientSession(_ session: ClientSession, didReceiveStreamResponse response: StreamResponse)
-    #endif
 }
 
 // Default implementations for optional delegate methods
 extension ClientSessionDelegate {
-    #if DEBUG
     func clientSession(_ session: ClientSession, didReceiveAppList apps: [RemoteAppInfo]) {}
     func clientSession(_ session: ClientSession, didReceiveStreamResponse response: StreamResponse) {}
-    #endif
 }
 
     /// Connection phase for diagnostics
@@ -78,10 +74,9 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
     private var heartbeatsSent: Int = 0
     private var heartbeatsReceived: Int = 0
 
-    #if DEBUG
-    // App list surface — dormant. Previously races against the auth handshake
-    // produced most of the misleading "firewall blocked / auth required" UI
-    // state. With per-app streaming off, none of this is reachable.
+    // App list surface for the viewer's app picker. The auth-handshake race
+    // that previously produced misleading "firewall blocked / auth required"
+    // state is gated by the timeout heuristics below.
     @Published var remoteApps: [RemoteAppInfo] = []
     @Published var isLoadingApps = false
     @Published var appListLoadFailed: Bool = false
@@ -89,7 +84,6 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
     @Published var appListResponseReceived: Bool = false
     private var appListTimeoutWorkItem: DispatchWorkItem?
     private var pendingAppListRequest = false
-    #endif
 
     // MARK: - Auth
 
@@ -327,12 +321,10 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         // Start the normal post-auth flow
         startPostAuthFlow()
 
-        #if DEBUG
         if pendingAppListRequest {
             pendingAppListRequest = false
             requestAppList()
         }
-        #endif
     }
 
     deinit {
@@ -426,13 +418,12 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         logger.info("Requested keyframe from host")
     }
 
-    // MARK: - Remote App Streaming (dormant)
+    // MARK: - Remote App Streaming
 
-    #if DEBUG
     private static let appListTimeoutSeconds: TimeInterval = 8
 
-    /// Request list of available apps from the host. Dormant — per-app
-    /// streaming is not part of the full-desktop Metal path.
+    /// Request the list of available apps/windows from the host so the viewer
+    /// can offer them in its app picker.
     func requestAppList() {
         guard let endpoint = hostEndpoint else {
             lcDebug("❌ ClientSession: Cannot request app list - no host endpoint")
@@ -582,7 +573,6 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             lcDebug("❌ ClientSession: Failed to encode stream request: \(error)")
         }
     }
-    #endif
 
     /// Send streaming quality tuning to the host so it can adjust encoder/capture.
     func sendQualityUpdate(_ tuning: StreamingTuning) {
@@ -680,17 +670,15 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             // Update UI stats from host
             break
 
-        #if DEBUG
         case .appListResponse:
-            // Host sent us a list of available apps (per-app, dormant)
+            // Host sent us a list of available apps
             lcDebug("📋 ClientSession: Received app list response (\(packet.payload.count) bytes)")
             handleAppListResponse(packet.payload)
 
         case .streamAppResponse:
-            // Host confirmed stream started (or failed) (per-app, dormant)
+            // Host confirmed stream started (or failed)
             lcDebug("🎬 ClientSession: Received stream response")
             handleStreamResponse(packet.payload)
-        #endif
 
         case .authChallenge:
             handleAuthChallenge(payload: packet.payload)
@@ -703,7 +691,6 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         }
     }
 
-    #if DEBUG
     private func handleAppListResponse(_ payload: Data) {
         appListTimeoutWorkItem?.cancel()
         appListTimeoutWorkItem = nil
@@ -755,7 +742,6 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             lcDebug("❌ ClientSession: Failed to decode stream response: \(error)")
         }
     }
-    #endif
 
     func udpTransport(_ transport: UDPTransport, clientDidConnect endpoint: NWEndpoint, connection: NWConnection) {
         // Not used on client side
