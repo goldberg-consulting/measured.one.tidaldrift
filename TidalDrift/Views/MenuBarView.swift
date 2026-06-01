@@ -221,18 +221,16 @@ struct MenuBarView: View {
                     Spacer()
                 }
             } else {
-                let rowHeight: CGFloat = 38
-                let listHeight = min(CGFloat(otherDevices.count) * rowHeight, 240)
-                
-                ScrollView(.vertical, showsIndicators: true) {
-                    VStack(spacing: 2) {
-                        ForEach(otherDevices) { device in
-                            MenuBarDeviceRow(device: device)
-                        }
+                // The whole menu lives in a single scroll view owned by the
+                // panel (AppDelegate.makeMenuRootView), so the device list grows
+                // to its natural height and the panel scrolls as one unit. A
+                // nested fixed-height scroll here caused the total content to
+                // exceed the panel and clip the header off the top.
+                VStack(spacing: 2) {
+                    ForEach(otherDevices) { device in
+                        MenuBarDeviceRow(device: device)
                     }
                 }
-                .frame(height: listHeight)
-                .clipped()
             }
         }
     }
@@ -476,8 +474,18 @@ struct MenuBarDeviceRow: View {
                     }
                     .transition(.opacity.combined(with: .scale(scale: 0.9)))
                 } else {
-                    // Status indicators when not hovering
-                    HStack(spacing: 3) {
+                    // Status indicators when not hovering. The Metal Stream
+                    // affordance stays visible for LocalCast hosts so it is
+                    // discoverable without hovering (the hover cluster above
+                    // still offers the full set of actions).
+                    HStack(spacing: 5) {
+                        if showLocalCast {
+                            QuickActionIcon(icon: "bolt.fill", color: .purple, tooltip: "Metal Stream (high-fps)") {
+                                (NSApp.delegate as? AppDelegate)?.runAfterMenuDismissed {
+                                    startMetalStreaming()
+                                }
+                            }
+                        }
                         if device.isTidalDriftPeer {
                             Image(systemName: "wave.3.right")
                                 .font(.system(size: 8))

@@ -275,7 +275,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     /// Width of the menu panel. Height is computed from current content so
     /// we do not leave a giant blank tail when there are no nearby devices.
     private static let menuPanelWidth: CGFloat = 360
-    private static let maxMenuPanelHeight: CGFloat = 520
+    private static let maxMenuPanelHeight: CGFloat = 600
 
     /// Creates the menu-bar status item (the "TD" icon) and the panel that
     /// hosts `MenuBarView`. Called once from `applicationDidFinishLaunching`.
@@ -353,13 +353,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         }
     }
 
+    /// The menu content at its natural size. Used both as the scroll-view
+    /// content for display and, unwrapped, for measuring the panel height.
+    private func menuContentView() -> some View {
+        MenuBarView()
+            .environmentObject(AppState.shared)
+            .frame(width: Self.menuPanelWidth, alignment: .topLeading)
+    }
+
     private func makeMenuRootView() -> AnyView {
         AnyView(
-            MenuBarView()
-                .environmentObject(AppState.shared)
-                .frame(width: Self.menuPanelWidth, alignment: .topLeading)
-                .background(.background)
-                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            ScrollView(.vertical, showsIndicators: false) {
+                menuContentView()
+            }
+            .frame(width: Self.menuPanelWidth)
+            .background(.background)
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         )
     }
 
@@ -470,11 +479,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     }
 
     private func currentMenuPanelHeight(maxScreenHeight: CGFloat) -> CGFloat {
-        guard let host = menuPanelHostingController else {
-            return min(Self.maxMenuPanelHeight, maxScreenHeight)
-        }
-
-        let fitting = host.sizeThatFits(
+        // Measure the natural height of the unscrolled menu content. The panel
+        // displays this wrapped in a ScrollView, so when the content is taller
+        // than the cap (or the screen) the panel scrolls instead of clipping.
+        let measuring = NSHostingController(rootView: menuContentView())
+        let fitting = measuring.sizeThatFits(
             in: NSSize(width: Self.menuPanelWidth, height: CGFloat.greatestFiniteMagnitude)
         )
         let desired = max(280, min(ceil(fitting.height), Self.maxMenuPanelHeight))
