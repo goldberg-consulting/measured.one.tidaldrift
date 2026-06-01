@@ -502,11 +502,13 @@ struct MenuBarDeviceRow: View {
                             }
                         }
                         
-                        if showLocalCast {
-                            QuickActionIcon(icon: "bolt.fill", color: .purple, tooltip: "Metal Stream (high-fps)") {
-                                (NSApp.delegate as? AppDelegate)?.runAfterMenuDismissed {
-                                    startMetalStreaming()
-                                }
+                        // Always offer Start Cast, like Screen Share / File.
+                        // If the remote isn't hosting LocalCast yet, the connect
+                        // attempt surfaces the "Metal Stream Unavailable" alert
+                        // explaining the host must enable Metal Streaming Host.
+                        QuickActionIcon(icon: "bolt.fill", color: .purple, tooltip: showLocalCast ? "Start Cast (Metal Stream)" : "Start Cast (remote must enable Metal Streaming Host)") {
+                            (NSApp.delegate as? AppDelegate)?.runAfterMenuDismissed {
+                                startMetalStreaming()
                             }
                         }
                         
