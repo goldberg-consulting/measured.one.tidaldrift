@@ -192,24 +192,24 @@ class InputInjector {
         if inputCount == 1 || inputCount % 100 == 0 {
             let hasPermission = hasAccessibilityPermission
             if !hasPermission && !hasLoggedPermissionWarning {
-                print("🚨 InputInjector: Accessibility permission DENIED - input will not work!")
-                print("🚨 InputInjector: Go to System Settings > Privacy & Security > Accessibility and enable TidalDrift")
+                lcDebug("🚨 InputInjector: Accessibility permission DENIED - input will not work!")
+                lcDebug("🚨 InputInjector: Go to System Settings > Privacy & Security > Accessibility and enable TidalDrift")
                 logger.error("🚨 InputInjector: Accessibility permission DENIED - input will not work!")
                 hasLoggedPermissionWarning = true
             } else if hasPermission && inputCount == 1 {
-                print("✅ InputInjector: Accessibility permission granted")
+                lcDebug("✅ InputInjector: Accessibility permission granted")
                 logger.info("✅ InputInjector: Accessibility permission granted")
             }
         }
         
         // Log first few inputs and then periodically to verify receipt and coordinate mapping
         if inputCount <= 10 || inputCount % 200 == 0 {
-            print("🎮 InputInjector: Injecting input #\(self.inputCount): \(String(describing: input))")
+            lcDebug("🎮 InputInjector: Injecting input #\(self.inputCount): \(String(describing: input))")
             if let bounds = captureBounds {
-                print("🎮 InputInjector: captureBounds: origin=(\(Int(bounds.origin.x)),\(Int(bounds.origin.y))) size=(\(Int(bounds.width))x\(Int(bounds.height)))")
+                lcDebug("🎮 InputInjector: captureBounds: origin=(\(Int(bounds.origin.x)),\(Int(bounds.origin.y))) size=(\(Int(bounds.width))x\(Int(bounds.height)))")
             } else {
                 let db = CGDisplayBounds(CGMainDisplayID())
-                print("🎮 InputInjector: Full display mode, displayBounds=(\(Int(db.origin.x)),\(Int(db.origin.y)),\(Int(db.width))x\(Int(db.height)))")
+                lcDebug("🎮 InputInjector: Full display mode, displayBounds=(\(Int(db.origin.x)),\(Int(db.origin.y)),\(Int(db.width))x\(Int(db.height)))")
             }
         }
         
@@ -226,38 +226,38 @@ class InputInjector {
             let point = normalizedToScreenCoordinates(x: x, y: y)
             let type: CGEventType = button == 0 ? .leftMouseDown : (button == 1 ? .rightMouseDown : .otherMouseDown)
             guard let event = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: point, mouseButton: CGMouseButton(rawValue: UInt32(button))!) else {
-                print("[INPUT-DIAG] ❌ INJECT FAILED: could not create mouseDown CGEvent at norm(\(x), \(y))")
+                lcDebug("[INPUT-DIAG] ❌ INJECT FAILED: could not create mouseDown CGEvent at norm(\(x), \(y))")
                 return
             }
-            print("[INPUT-DIAG] 💉 INJECTING mouseDown button=\(button) at screen(\(Int(point.x)), \(Int(point.y))) from norm(\(String(format: "%.3f", x)), \(String(format: "%.3f", y))) bounds=\(String(describing: captureBounds))")
+            lcDebug("[INPUT-DIAG] 💉 INJECTING mouseDown button=\(button) at screen(\(Int(point.x)), \(Int(point.y))) from norm(\(String(format: "%.3f", x)), \(String(format: "%.3f", y))) bounds=\(String(describing: captureBounds))")
             event.post(tap: .cghidEventTap)
             
         case .mouseUp(let button, let x, let y):
             let point = normalizedToScreenCoordinates(x: x, y: y)
             let type: CGEventType = button == 0 ? .leftMouseUp : (button == 1 ? .rightMouseUp : .otherMouseUp)
             guard let event = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: point, mouseButton: CGMouseButton(rawValue: UInt32(button))!) else {
-                print("[INPUT-DIAG] ❌ INJECT FAILED: could not create mouseUp CGEvent at norm(\(x), \(y))")
+                lcDebug("[INPUT-DIAG] ❌ INJECT FAILED: could not create mouseUp CGEvent at norm(\(x), \(y))")
                 return
             }
-            print("[INPUT-DIAG] 💉 INJECTING mouseUp button=\(button) at screen(\(Int(point.x)), \(Int(point.y)))")
+            lcDebug("[INPUT-DIAG] 💉 INJECTING mouseUp button=\(button) at screen(\(Int(point.x)), \(Int(point.y)))")
             event.post(tap: .cghidEventTap)
             
         case .keyDown(let keyCode, let modifiers):
             guard let event = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: true) else {
-                print("[INPUT-DIAG] ❌ INJECT FAILED: could not create keyDown CGEvent for keyCode \(keyCode)")
+                lcDebug("[INPUT-DIAG] ❌ INJECT FAILED: could not create keyDown CGEvent for keyCode \(keyCode)")
                 return
             }
             event.flags = CGEventFlags(rawValue: modifiers)
-            print("[INPUT-DIAG] 💉 INJECTING keyDown keyCode=\(keyCode) modifiers=\(modifiers)")
+            lcDebug("[INPUT-DIAG] 💉 INJECTING keyDown keyCode=\(keyCode) modifiers=\(modifiers)")
             event.post(tap: .cghidEventTap)
             
         case .keyUp(let keyCode, let modifiers):
             guard let event = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false) else {
-                print("[INPUT-DIAG] ❌ INJECT FAILED: could not create keyUp CGEvent for keyCode \(keyCode)")
+                lcDebug("[INPUT-DIAG] ❌ INJECT FAILED: could not create keyUp CGEvent for keyCode \(keyCode)")
                 return
             }
             event.flags = CGEventFlags(rawValue: modifiers)
-            print("[INPUT-DIAG] 💉 INJECTING keyUp keyCode=\(keyCode)")
+            lcDebug("[INPUT-DIAG] 💉 INJECTING keyUp keyCode=\(keyCode)")
             event.post(tap: .cghidEventTap)
             
         case .scroll(let deltaX, let deltaY):

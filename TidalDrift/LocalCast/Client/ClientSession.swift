@@ -359,7 +359,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
 
     func sendInput(_ input: InputInjector.RemoteInput) {
         guard let endpoint = hostEndpoint else {
-            print("[INPUT-DIAG] ❌ SEND BLOCKED: no host endpoint set!")
+            lcDebug("[INPUT-DIAG] ❌ SEND BLOCKED: no host endpoint set!")
             return
         }
 
@@ -375,8 +375,8 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         }
 
         if shouldLog {
-            print("[INPUT-DIAG] 📤 SENDING input #\(self.inputSendCount) → \(endpoint)")
-            print("[INPUT-DIAG]    \(String(describing: input))")
+            lcDebug("[INPUT-DIAG] 📤 SENDING input #\(self.inputSendCount) → \(endpoint)")
+            lcDebug("[INPUT-DIAG]    \(String(describing: input))")
         }
 
         let payload = input.serialize()
@@ -388,7 +388,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         )
 
         if shouldLog {
-            print("[INPUT-DIAG]    payload: \(payload.count) bytes, seq: \(inputSendCount)")
+            lcDebug("[INPUT-DIAG]    payload: \(payload.count) bytes, seq: \(inputSendCount)")
         }
 
         transport.send(packet: packet, to: endpoint)
@@ -435,7 +435,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
     /// streaming is not part of the full-desktop Metal path.
     func requestAppList() {
         guard let endpoint = hostEndpoint else {
-            print("❌ ClientSession: Cannot request app list - no host endpoint")
+            lcDebug("❌ ClientSession: Cannot request app list - no host endpoint")
             return
         }
         if isAuthenticating {
@@ -447,7 +447,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         appListLoadFailed = false
         appListAuthRequiredHint = false
 
-        print("📋 ClientSession: Requesting app list from host...")
+        lcDebug("📋 ClientSession: Requesting app list from host...")
 
         DispatchQueue.main.async { [weak self] in
             self?.isLoadingApps = true
@@ -488,7 +488,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
     /// Request to stream a specific window. Dormant.
     func requestStreamWindow(windowID: UInt32, windowTitle: String) {
         guard let endpoint = hostEndpoint else { return }
-        print("🎬 ClientSession: Requesting window stream: '\(windowTitle)' (ID: \(windowID))")
+        lcDebug("🎬 ClientSession: Requesting window stream: '\(windowTitle)' (ID: \(windowID))")
         streamingTargetName = windowTitle
         let request = StreamRequest(type: .window, processID: nil, windowID: windowID, appName: windowTitle)
         sendStreamRequest(request, to: endpoint)
@@ -497,7 +497,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
     /// Request to stream a specific app. Dormant.
     func requestStreamApp(processID: Int32, appName: String) {
         guard let endpoint = hostEndpoint else { return }
-        print("🎬 ClientSession: Requesting app stream: '\(appName)' (PID: \(processID))")
+        lcDebug("🎬 ClientSession: Requesting app stream: '\(appName)' (PID: \(processID))")
         streamingTargetName = appName
         let request = StreamRequest(type: .app, processID: processID, windowID: nil, appName: appName)
         sendStreamRequest(request, to: endpoint)
@@ -508,7 +508,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
     /// kept for symmetry with per-app request methods.
     func requestStreamFullDisplay() {
         guard let endpoint = hostEndpoint else { return }
-        print("🎬 ClientSession: Requesting full display stream")
+        lcDebug("🎬 ClientSession: Requesting full display stream")
         streamingTargetName = "Full Display"
         let request = StreamRequest(type: .fullDisplay, processID: nil, windowID: nil, appName: "Full Display")
         sendStreamRequest(request, to: endpoint)
@@ -531,7 +531,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             )
             transport.send(packet: packet, to: endpoint)
         } catch {
-            print("❌ ClientSession: Failed to encode focus request: \(error)")
+            lcDebug("❌ ClientSession: Failed to encode focus request: \(error)")
         }
     }
 
@@ -552,7 +552,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             )
             transport.send(packet: packet, to: endpoint)
         } catch {
-            print("❌ ClientSession: Failed to encode isolate request: \(error)")
+            lcDebug("❌ ClientSession: Failed to encode isolate request: \(error)")
         }
     }
 
@@ -579,7 +579,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             )
             transport.send(packet: packet, to: endpoint)
         } catch {
-            print("❌ ClientSession: Failed to encode stream request: \(error)")
+            lcDebug("❌ ClientSession: Failed to encode stream request: \(error)")
         }
     }
     #endif
@@ -597,7 +597,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             )
             transport.send(packet: packet, to: endpoint)
         } catch {
-            print("❌ ClientSession: Failed to encode quality update: \(error)")
+            lcDebug("❌ ClientSession: Failed to encode quality update: \(error)")
         }
     }
 
@@ -631,7 +631,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         case .videoFrame:
             frameCount += 1
             if frameCount == 1 || frameCount % 60 == 0 {
-                print("📦 ClientSession: Received video frame #\(frameCount), size: \(packet.payload.count) bytes")
+                lcDebug("📦 ClientSession: Received video frame #\(frameCount), size: \(packet.payload.count) bytes")
             }
             decoder.decode(packet.payload)
 
@@ -683,12 +683,12 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         #if DEBUG
         case .appListResponse:
             // Host sent us a list of available apps (per-app, dormant)
-            print("📋 ClientSession: Received app list response (\(packet.payload.count) bytes)")
+            lcDebug("📋 ClientSession: Received app list response (\(packet.payload.count) bytes)")
             handleAppListResponse(packet.payload)
 
         case .streamAppResponse:
             // Host confirmed stream started (or failed) (per-app, dormant)
-            print("🎬 ClientSession: Received stream response")
+            lcDebug("🎬 ClientSession: Received stream response")
             handleStreamResponse(packet.payload)
         #endif
 
@@ -699,7 +699,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             handleAuthSuccess(payload: packet.payload)
 
         default:
-            print("❓ ClientSession: Received unknown packet type: \(packet.type)")
+            lcDebug("❓ ClientSession: Received unknown packet type: \(packet.type)")
         }
     }
 
@@ -709,7 +709,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         appListTimeoutWorkItem = nil
 
         guard payload.count < 512_000 else {
-            print("❌ ClientSession: App list payload too large (\(payload.count) bytes), ignoring")
+            lcDebug("❌ ClientSession: App list payload too large (\(payload.count) bytes), ignoring")
             DispatchQueue.main.async { [weak self] in
                 self?.isLoadingApps = false
             }
@@ -727,7 +727,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
                 self.delegate?.clientSession(self, didReceiveAppList: apps)
             }
         } catch {
-            print("❌ ClientSession: Failed to decode app list: \(error)")
+            lcDebug("❌ ClientSession: Failed to decode app list: \(error)")
             DispatchQueue.main.async { [weak self] in
                 self?.isLoadingApps = false
                 self?.appListAuthRequiredHint = false
@@ -752,7 +752,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
                 }
             }
         } catch {
-            print("❌ ClientSession: Failed to decode stream response: \(error)")
+            lcDebug("❌ ClientSession: Failed to decode stream response: \(error)")
         }
     }
     #endif

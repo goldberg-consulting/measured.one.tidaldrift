@@ -113,6 +113,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
     func applicationWillTerminate(_ notification: Notification) {
         hideMenuPanel()
+        tearDownStatusItem()
         NotificationCenter.default.removeObserver(self)
         NetworkDiscoveryService.shared.stopBrowsing()
         TidalDriftPeerService.shared.stopAdvertising()
@@ -279,6 +280,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     /// Creates the menu-bar status item (the "TD" icon) and the panel that
     /// hosts `MenuBarView`. Called once from `applicationDidFinishLaunching`.
     private func setupStatusItem() {
+        if statusItem != nil {
+            menuBarLogger.warning("setupStatusItem: already configured, skipping duplicate")
+            return
+        }
         menuBarLogger.info("setupStatusItem: starting")
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = item.button {
@@ -338,6 +343,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
         self.menuPanel = panel
         menuBarLogger.info("setupStatusItem: done")
+    }
+
+    private func tearDownStatusItem() {
+        if let item = statusItem {
+            NSStatusBar.system.removeStatusItem(item)
+            statusItem = nil
+            menuBarLogger.info("tearDownStatusItem: removed menu bar icon")
+        }
     }
 
     private func makeMenuRootView() -> AnyView {

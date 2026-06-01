@@ -51,7 +51,7 @@ class VideoDecoder {
             // Parse NAL units from Annex B format
             let nalUnits = parseNALUnits(from: data)
             if nalUnits.isEmpty && frameCount < 10 {
-                print("🎬 VideoDecoder: No NAL units parsed from Annex B data")
+                lcDebug("🎬 VideoDecoder: No NAL units parsed from Annex B data")
             }
             for nal in nalUnits {
                 handleNALUnit(nal)
@@ -62,69 +62,64 @@ class VideoDecoder {
         }
     }
     
-    /// Parse NAL units from AVCC format (4-byte length prefix)
+    /// Parse NAL units from AVCC format (4-byte length prefix).
+    /// Scans the buffer in place and copies only the NAL payloads, avoiding a
+    /// full-frame `[UInt8]` allocation per frame.
     private func parseAVCCNALUnits(from data: Data) {
-        let bytes = [UInt8](data)
-        var offset = 0
-        
-        while offset + 4 < bytes.count {
-            // Read 4-byte length (big endian)
-            let length = Int(bytes[offset]) << 24 | Int(bytes[offset+1]) << 16 | Int(bytes[offset+2]) << 8 | Int(bytes[offset+3])
-            offset += 4
-            
-            if length <= 0 || offset + length > bytes.count {
-                if frameCount < 10 {
-                    print("🎬 VideoDecoder: Invalid AVCC NAL length \(length) at offset \(offset-4)")
+        var nalUnits: [Data] = []
+        data.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
+            guard let base = buf.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+            let count = buf.count
+            var offset = 0
+            while offset + 4 < count {
+                let length = Int(base[offset]) << 24 | Int(base[offset+1]) << 16 | Int(base[offset+2]) << 8 | Int(base[offset+3])
+                offset += 4
+                if length <= 0 || offset + length > count {
+                    if frameCount < 10 {
+                        lcDebug("🎬 VideoDecoder: Invalid AVCC NAL length \(length) at offset \(offset-4)")
+                    }
+                    break
                 }
-                break
+                nalUnits.append(Data(bytes: base + offset, count: length))
+                offset += length
             }
-            
-            let nalData = Data(bytes[offset..<(offset + length)])
-            handleNALUnit(nalData)
-            offset += length
+        }
+        for nal in nalUnits {
+            handleNALUnit(nal)
         }
     }
     
-    /// Parse NAL units from Annex B format (start code prefixed)
+    /// Parse NAL units from Annex B format (start code prefixed).
+    /// Scans for start codes over the raw buffer and copies only the NAL
+    /// payloads, avoiding a full-frame `[UInt8]` allocation per frame.
     private func parseNALUnits(from data: Data) -> [Data] {
         var nalUnits: [Data] = []
-        let bytes = [UInt8](data)
-        var i = 0
         
-        // Find all start code positions
-        var startPositions: [Int] = []
-        
-        while i < bytes.count - 3 {
-            // Check for 4-byte start code (00 00 00 01)
-            if bytes[i] == 0 && bytes[i+1] == 0 && bytes[i+2] == 0 && bytes[i+3] == 1 {
-                startPositions.append(i)
-                i += 4
-            }
-            // Check for 3-byte start code (00 00 01)
-            else if bytes[i] == 0 && bytes[i+1] == 0 && bytes[i+2] == 1 {
-                startPositions.append(i)
-                i += 3
-            } else {
-                i += 1
-            }
-        }
-        
-        // Extract NAL units between start codes
-        for j in 0..<startPositions.count {
-            let startCodePos = startPositions[j]
-            let startCodeLen = (bytes[startCodePos+2] == 1) ? 3 : 4
-            let nalStart = startCodePos + startCodeLen
+        data.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
+            guard let base = buf.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+            let count = buf.count
             
-            let nalEnd: Int
-            if j + 1 < startPositions.count {
-                nalEnd = startPositions[j + 1]
-            } else {
-                nalEnd = bytes.count
+            // Record (position, startCodeLength) for every start code.
+            var starts: [(pos: Int, codeLen: Int)] = []
+            var i = 0
+            while i + 3 < count {
+                if base[i] == 0 && base[i+1] == 0 && base[i+2] == 0 && base[i+3] == 1 {
+                    starts.append((i, 4))
+                    i += 4
+                } else if base[i] == 0 && base[i+1] == 0 && base[i+2] == 1 {
+                    starts.append((i, 3))
+                    i += 3
+                } else {
+                    i += 1
+                }
             }
             
-            if nalStart < nalEnd {
-                let nalData = Data(bytes[nalStart..<nalEnd])
-                nalUnits.append(nalData)
+            for j in 0..<starts.count {
+                let nalStart = starts[j].pos + starts[j].codeLen
+                let nalEnd = (j + 1 < starts.count) ? starts[j + 1].pos : count
+                if nalStart < nalEnd {
+                    nalUnits.append(Data(bytes: base + nalStart, count: nalEnd - nalStart))
+                }
             }
         }
         
@@ -150,7 +145,7 @@ class VideoDecoder {
         
         // Debug first few NAL units
         if frameCount < 5 {
-            print("🎬 VideoDecoder: NAL unit - firstByte=0x\(String(format: "%02X", firstByte)), H264Type=\(h264NalType), size=\(nalUnit.count)")
+            lcDebug("🎬 VideoDecoder: NAL unit - firstByte=0x\(String(format: "%02X", firstByte)), H264Type=\(h264NalType), size=\(nalUnit.count)")
         }
         
         // Try H.264 first (default codec)
@@ -187,7 +182,7 @@ class VideoDecoder {
         case 5:  // IDR slice (H.264)
             frameCount += 1
             if !hasLoggedFirstFrame {
-                print("🎬 VideoDecoder: ✅ Decoding first H.264 IDR frame!")
+                lcDebug("🎬 VideoDecoder: ✅ Decoding first H.264 IDR frame!")
                 hasLoggedFirstFrame = true
             }
             decodeVideoFrame(nalUnit)
@@ -211,20 +206,20 @@ class VideoDecoder {
             
             switch hevcNalType {
             case 32:  // VPS
-                print("🎬 VideoDecoder: ✅ Received HEVC VPS (\(nalUnit.count) bytes)")
+                lcDebug("🎬 VideoDecoder: ✅ Received HEVC VPS (\(nalUnit.count) bytes)")
                 vps = nalUnit
                 isHEVC = true
                 return
                 
             case 33:  // SPS
-                print("🎬 VideoDecoder: ✅ Received HEVC SPS (\(nalUnit.count) bytes)")
+                lcDebug("🎬 VideoDecoder: ✅ Received HEVC SPS (\(nalUnit.count) bytes)")
                 sps = nalUnit
                 isHEVC = true
                 tryCreateSession()
                 return
                 
             case 34:  // PPS
-                print("🎬 VideoDecoder: ✅ Received HEVC PPS (\(nalUnit.count) bytes)")
+                lcDebug("🎬 VideoDecoder: ✅ Received HEVC PPS (\(nalUnit.count) bytes)")
                 pps = nalUnit
                 isHEVC = true
                 tryCreateSession()
@@ -234,7 +229,7 @@ class VideoDecoder {
                 if isHEVC {
                     frameCount += 1
                     if !hasLoggedFirstFrame {
-                        print("🎬 VideoDecoder: ✅ Decoding first HEVC frame!")
+                        lcDebug("🎬 VideoDecoder: ✅ Decoding first HEVC frame!")
                         hasLoggedFirstFrame = true
                     }
                     decodeVideoFrame(nalUnit)
@@ -251,7 +246,7 @@ class VideoDecoder {
             frameCount += 1
             decodeVideoFrame(nalUnit)
         } else if frameCount < 10 {
-            print("🎬 VideoDecoder: Unknown NAL type \(h264NalType), size=\(nalUnit.count)")
+            lcDebug("🎬 VideoDecoder: Unknown NAL type \(h264NalType), size=\(nalUnit.count)")
         }
     }
     
@@ -295,9 +290,9 @@ class VideoDecoder {
                 )
                 
                 if status != noErr {
-                    print("🎬 VideoDecoder: ❌ Failed to create H.264 format description: \(status)")
+                    lcDebug("🎬 VideoDecoder: ❌ Failed to create H.264 format description: \(status)")
                 } else {
-                    print("🎬 VideoDecoder: ✅ Created H.264 format description")
+                    lcDebug("🎬 VideoDecoder: ✅ Created H.264 format description")
                 }
             }
         }
@@ -340,9 +335,9 @@ class VideoDecoder {
                         )
                         
                         if status != noErr {
-                            print("🎬 VideoDecoder: ❌ Failed to create HEVC format description: \(status)")
+                            lcDebug("🎬 VideoDecoder: ❌ Failed to create HEVC format description: \(status)")
                         } else {
-                            print("🎬 VideoDecoder: ✅ Created HEVC format description")
+                            lcDebug("🎬 VideoDecoder: ✅ Created HEVC format description")
                         }
                     }
                 }
@@ -371,9 +366,9 @@ class VideoDecoder {
                     )
                     
                     if status != noErr {
-                        print("🎬 VideoDecoder: ❌ Failed to create HEVC format description (no VPS): \(status)")
+                        lcDebug("🎬 VideoDecoder: ❌ Failed to create HEVC format description (no VPS): \(status)")
                     } else {
-                        print("🎬 VideoDecoder: ✅ Created HEVC format description (no VPS)")
+                        lcDebug("🎬 VideoDecoder: ✅ Created HEVC format description (no VPS)")
                     }
                 }
             }
@@ -411,9 +406,9 @@ class VideoDecoder {
         
         if status == noErr {
             decompressionSession = session
-            print("🎬 VideoDecoder: ✅ Created decompression session successfully (HEVC: \(isHEVC))")
+            lcDebug("🎬 VideoDecoder: ✅ Created decompression session successfully (HEVC: \(isHEVC))")
         } else {
-            print("🎬 VideoDecoder: ❌ Failed to create decompression session: \(status)")
+            lcDebug("🎬 VideoDecoder: ❌ Failed to create decompression session: \(status)")
         }
     }
     
@@ -448,7 +443,7 @@ class VideoDecoder {
         )
         
         guard status == kCMBlockBufferNoErr, let buffer = blockBuffer else {
-            print("🎬 VideoDecoder: ❌ Failed to create block buffer: \(status)")
+            lcDebug("🎬 VideoDecoder: ❌ Failed to create block buffer: \(status)")
             return
         }
         
@@ -474,7 +469,7 @@ class VideoDecoder {
         )
         
         guard createStatus == noErr, let sample = sampleBuffer else {
-            print("🎬 VideoDecoder: ❌ Failed to create sample buffer: \(createStatus)")
+            lcDebug("🎬 VideoDecoder: ❌ Failed to create sample buffer: \(createStatus)")
             return
         }
         
@@ -491,7 +486,7 @@ class VideoDecoder {
         )
         
         if decodeStatus != noErr && frameCount < 10 {
-            print("🎬 VideoDecoder: ❌ Decode error: \(decodeStatus)")
+            lcDebug("🎬 VideoDecoder: ❌ Decode error: \(decodeStatus)")
         }
     }
     
@@ -511,7 +506,7 @@ class VideoDecoder {
     private let decompressionCallback: VTDecompressionOutputCallback = { (decompressionOutputRefCon, sourceFrameRefCon, status, infoFlags, imageBuffer, presentationTimeStamp, presentationDuration) in
         guard status == noErr, let buffer = imageBuffer else {
             if status != noErr {
-                print("🎬 VideoDecoder: ❌ Decompression callback error: \(status)")
+                lcDebug("🎬 VideoDecoder: ❌ Decompression callback error: \(status)")
             }
             return
         }
@@ -520,9 +515,9 @@ class VideoDecoder {
         if VideoDecoder.decodedFrameCount == 1 {
             let width = CVPixelBufferGetWidth(buffer)
             let height = CVPixelBufferGetHeight(buffer)
-            print("🎬 VideoDecoder: ✅✅✅ FIRST DECODED FRAME! \(width)x\(height)")
+            lcDebug("🎬 VideoDecoder: ✅✅✅ FIRST DECODED FRAME! \(width)x\(height)")
         } else if VideoDecoder.decodedFrameCount % 60 == 0 {
-            print("🎬 VideoDecoder: Decoded \(VideoDecoder.decodedFrameCount) frames")
+            lcDebug("🎬 VideoDecoder: Decoded \(VideoDecoder.decodedFrameCount) frames")
         }
         
         let decoder = Unmanaged<VideoDecoder>.fromOpaque(decompressionOutputRefCon!).takeUnretainedValue()

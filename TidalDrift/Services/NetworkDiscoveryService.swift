@@ -58,7 +58,6 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
 
     private var browsers: [NWBrowser] = []
     private var netServiceBrowser: NetServiceBrowser?
-    private var udpListener: NWListener?
     private var deviceCache: [String: DiscoveredDevice] = [:]
     private let deviceCacheLock = NSLock()  // Thread-safe access to deviceCache
     private var scanTimer: Timer?
@@ -98,43 +97,6 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         // Defer network setup to avoid blocking on init
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
             self?.setupNetworkMonitor()
-            self?.startUDPListener()
-        }
-    }
-
-    func startUDPListener() {
-        let params = NWParameters.udp
-
-        do {
-            udpListener = try NWListener(using: params, on: 5903)
-            udpListener?.stateUpdateHandler = { state in
-                if case .ready = state { print("🌊 UDP Listener: Ready on port 5903") }
-            }
-
-            udpListener?.newConnectionHandler = { [weak self] connection in
-                connection.start(queue: self?.queue ?? .main)
-                self?.receiveMessages(on: connection)
-            }
-            udpListener?.start(queue: queue)
-        } catch {
-            print("❌ UDP Listener: Initialization failed: \(error)")
-        }
-    }
-
-    private func receiveMessages(on connection: NWConnection) {
-        connection.receiveMessage { [weak self] data, context, isComplete, error in
-            if let data = data, !data.isEmpty {
-                if let peerInfo = try? JSONDecoder().decode(TidalDriftPeerService.PeerInfo.self, from: data) {
-                    print("🌊 UDP Heartbeat: Received from \(peerInfo.hostname) (\(peerInfo.ipAddress))")
-                    self?.markAsTidalDriftPeer(hostname: peerInfo.hostname, peerInfo: peerInfo)
-                }
-            }
-
-            if error == nil {
-                self?.receiveMessages(on: connection)
-            } else {
-                connection.cancel()
-            }
         }
     }
 
@@ -270,7 +232,7 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
                     return
                 }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
-                    self.refreshScan()
+                    self.restartBrowsingPreservingCache()
                     TidalDriftPeerService.shared.restartAll()
                 }
             }
@@ -291,31 +253,51 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             let params = NWParameters()
             params.includePeerToPeer = true
 
-            for domain in ["local.", ""] {
-                let actualDomain = domain.isEmpty ? nil : domain
-                let browser = NWBrowser(for: .bonjour(type: serviceType, domain: actualDomain), using: params)
+            let browser = NWBrowser(for: .bonjour(type: serviceType, domain: "local."), using: params)
 
-                browser.stateUpdateHandler = { [weak self] state in
-                    self?.handleBrowserState(state, for: serviceType)
-                }
-                browser.browseResultsChangedHandler = { [weak self] results, changes in
-                    self?.handleBrowseResults(results, changes: changes, serviceType: serviceType)
-                }
-
-                browser.start(queue: queue)
-                browsers.append(browser)
+            browser.stateUpdateHandler = { [weak self] state in
+                self?.handleBrowserState(state, for: serviceType)
             }
+            browser.browseResultsChangedHandler = { [weak self] results, changes in
+                self?.handleBrowseResults(results, changes: changes, serviceType: serviceType)
+            }
+
+            browser.start(queue: queue)
+            browsers.append(browser)
         }
 
         // The helper forks `dns-sd`; keep the Process.run off main, but keep
-        // the service lifecycle itself main-owned.
+        // the service lifecycle itself main-owned. TidalDrift peers
+        // (_tidaldrift._tcp) are covered by the NWBrowser loop above and by
+        // TidalDriftPeerService's dedicated discovery, so we do not fork a
+        // third dns-sd browse for them here.
         queue.async { [weak self] in
             self?.startNetServiceBrowserForLocalCast()
-            self?.startDnsSdBrowserForTidalDriftPeers()
         }
 
         lastScanDate = Date()
+    }
 
+    /// Restart Bonjour browsers after a network path change without wiping
+    /// the device cache or re-running a subnet scan.
+    private func restartBrowsingPreservingCache() {
+        stopServiceBrowsing()
+        stopLocalCastBrowsing()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.startBrowsing()
+        }
+    }
+
+    /// Lightweight periodic upkeep: prune stale entries only. Full
+    /// `refreshScan()` is reserved for explicit user action.
+    private func performPeriodicMaintenance() {
+        clearStaleDevices()
+    }
+
+    /// ARP-assisted discovery for devices that do not advertise Bonjour.
+    /// Runs on manual refresh and the one-time post-launch subnet scan, not
+    /// on every browser restart.
+    private func runSupplementalDiscovery() {
         Task {
             await scanARPTable()
         }
@@ -323,7 +305,6 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
 
     /// Use dns-sd command for UDP service discovery (more reliable than NWBrowser/NetServiceBrowser for UDP)
     private var dnsSdBrowseProcess: Process?
-    private var peerDnsSdBrowseProcess: Process?
 
     /// Cooldown for LocalCast resolves; the dns-sd browse emits Add events
     /// on every interface change which would otherwise schedule a blocking
@@ -331,9 +312,6 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
     private var localCastResolveDebounce: [String: Date] = [:]
     private let localCastResolveLock = NSLock()
     private static let localCastResolveCooldown: TimeInterval = 60
-    private var peerResolveDebounce: [String: Date] = [:]
-    private let peerResolveLock = NSLock()
-    private static let peerResolveCooldown: TimeInterval = 60
 
     /// Cooldown for the generic Bonjour `resolveService` path so repeated
     /// NWBrowser results (one per interface, plus path-change replays) do not
@@ -341,6 +319,10 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
     private var resolveServiceDebounce: [String: Date] = [:]
     private let resolveServiceLock = NSLock()
     private static let resolveServiceCooldown: TimeInterval = 30
+
+    private var hostnameResolveDebounce: [String: Date] = [:]
+    private let hostnameResolveLock = NSLock()
+    private static let hostnameResolveCooldown: TimeInterval = 60
 
     private func startNetServiceBrowserForLocalCast() {
         guard dnsSdBrowseProcess == nil else { return }
@@ -371,107 +353,6 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         } catch {
             logger.error("🌊 Failed to start dns-sd browse: \(error.localizedDescription)")
         }
-    }
-
-    private func startDnsSdBrowserForTidalDriftPeers() {
-        guard peerDnsSdBrowseProcess == nil else { return }
-        logger.info("🌊 Starting dns-sd browse for _tidaldrift._tcp")
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/dns-sd")
-        process.arguments = ["-B", "_tidaldrift._tcp", "local."]
-
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
-        peerDnsSdBrowseProcess = process
-
-        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            guard !data.isEmpty, let output = String(data: data, encoding: .utf8) else { return }
-            self?.parseTidalDriftPeerBrowseOutput(output)
-        }
-
-        do {
-            try process.run()
-            logger.info("🌊 TidalDrift peer dns-sd browse started (PID: \(process.processIdentifier))")
-        } catch {
-            peerDnsSdBrowseProcess = nil
-            logger.error("🌊 Failed to start TidalDrift peer dns-sd browse: \(error.localizedDescription)")
-        }
-    }
-
-    private func parseTidalDriftPeerBrowseOutput(_ output: String) {
-        var seen: Set<String> = []
-        for line in output.split(separator: "\n") {
-            let lineString = String(line)
-            guard lineString.contains("Add"),
-                  let range = lineString.range(of: "_tidaldrift._tcp.") else {
-                continue
-            }
-
-            let name = String(lineString[range.upperBound...]).trimmingCharacters(in: .whitespaces)
-            guard !name.isEmpty, seen.insert(name).inserted else { continue }
-            resolveTidalDriftPeerViaDnsSd(name: name)
-        }
-    }
-
-    /// Dispatches a peer TXT lookup at most once per cooldown window per name.
-    /// Without this, `dns-sd -B` repeats Add lines on every interface change
-    /// and we end up forking dns-sd processes nonstop.
-    private func resolveTidalDriftPeerViaDnsSd(name: String) {
-        peerResolveLock.lock()
-        let now = Date()
-        if let last = peerResolveDebounce[name],
-           now.timeIntervalSince(last) < Self.peerResolveCooldown {
-            peerResolveLock.unlock()
-            return
-        }
-        peerResolveDebounce[name] = now
-        peerResolveLock.unlock()
-
-        queue.async { [weak self] in
-            guard let self else { return }
-            let output = runDnsSdLookup(
-                name: name,
-                type: "_tidaldrift._tcp",
-                domain: "local.",
-                timeout: 3,
-                maxLines: 20,
-                logger: self.logger
-            )
-            let txt = self.parseDnsSdTXT(output)
-            let ipAddress = txt["ip"] ?? self.advertisedIPAddress(in: output) ?? "Unknown"
-            let peerInfo = TidalDriftPeerService.PeerInfo(
-                peerId: txt["peerId"],
-                hostname: name,
-                ipAddress: ipAddress,
-                modelName: txt["model"] ?? "TidalDrift Peer",
-                modelIdentifier: txt["modelId"] ?? "",
-                processorInfo: txt["cpu"] ?? "",
-                memoryGB: Int(txt["mem"] ?? "0") ?? 0,
-                macOSVersion: txt["os"] ?? "macOS",
-                userName: txt["user"] ?? "",
-                uptimeHours: Int(txt["uptime"] ?? "0") ?? 0,
-                tidalDriftVersion: txt["version"] ?? "Unknown",
-                screenSharingEnabled: txt["screen"] == "1",
-                fileSharingEnabled: txt["file"] == "1",
-                tidalDriftName: txt["tdname"]
-            )
-            self.markAsTidalDriftPeer(hostname: name, peerInfo: peerInfo)
-        }
-    }
-
-    private func parseDnsSdTXT(_ output: String) -> [String: String] {
-        var values: [String: String] = [:]
-        for token in output.split(whereSeparator: { $0.isWhitespace }) {
-            let parts = token.split(separator: "=", maxSplits: 1).map(String.init)
-            guard parts.count == 2 else { continue }
-            values[parts[0]] = parts[1]
-                .replacingOccurrences(of: "\\", with: "")
-                .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
-        }
-        return values
     }
 
     /// Parse dns-sd -B output to find LocalCast services
@@ -591,9 +472,6 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
 
         pathMonitor?.cancel()
         pathMonitor = nil
-
-        udpListener?.cancel()
-        udpListener = nil
     }
 
     private func stopServiceBrowsing() {
@@ -607,11 +485,6 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         }
         dnsSdBrowseProcess = nil
 
-        if let process = peerDnsSdBrowseProcess, process.isRunning {
-            process.terminate()
-        }
-        peerDnsSdBrowseProcess = nil
-
         netServiceBrowser?.stop()
         netServiceBrowser = nil
         discoveredLocalCastServices.removeAll()
@@ -624,10 +497,6 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         resolveServiceLock.lock()
         resolveServiceDebounce.removeAll()
         resolveServiceLock.unlock()
-
-        peerResolveLock.lock()
-        peerResolveDebounce.removeAll()
-        peerResolveLock.unlock()
 
         localCastResolveLock.lock()
         localCastResolveDebounce.removeAll()
@@ -647,6 +516,7 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             self?.startBrowsing()
+            self?.runSupplementalDiscovery()
 
             // Also trigger TidalDrift peer re-discovery
             if AppState.shared.settings.peerDiscoveryEnabled {
@@ -672,11 +542,14 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             await scanSubnet(baseIP: NetworkUtils.getLocalIPAddress() ?? "192.168.1.1")
         }
 
-        // Lightweight refresh: just bounce the Bonjour browse loop. Subnet
-        // re-scans happen only when the user taps Discover Devices.
+        runSupplementalDiscovery()
+
+        // Prune stale devices on a timer. Do not call refreshScan() here;
+        // that tore down every NWBrowser and dns-sd process on a fixed
+        // interval and pegged CPU even when the network was idle.
         let refreshInterval = max(interval, 60)
         scanTimer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
-            self?.refreshScan()
+            self?.performPeriodicMaintenance()
         }
     }
 
@@ -783,6 +656,17 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
 
     /// Resolve hostname to IP and mark device as LocalCast host
     private func resolveHostnameAndMarkLocalCast(_ hostname: String, originalName: String, authRequired: Bool?) {
+        let key = hostname.lowercased()
+        hostnameResolveLock.lock()
+        let now = Date()
+        if let last = hostnameResolveDebounce[key],
+           now.timeIntervalSince(last) < Self.hostnameResolveCooldown {
+            hostnameResolveLock.unlock()
+            return
+        }
+        hostnameResolveDebounce[key] = now
+        hostnameResolveLock.unlock()
+
         let cleanHostname = hostname.hasSuffix(".local") ? hostname : "\(hostname).local"
 
         var hints = addrinfo()
