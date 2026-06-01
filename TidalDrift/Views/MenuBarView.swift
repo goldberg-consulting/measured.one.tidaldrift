@@ -8,6 +8,8 @@ struct MenuBarView: View {
     @State private var isTogglingLocalCast = false
     @State private var isEditingName = false
     @State private var editingNameText = ""
+    @State private var hostApps: [RemoteAppInfo] = []
+    @State private var isLoadingHostApps = false
     
     private var otherDevices: [DiscoveredDevice] {
         appState.discoveredDevices.filter { !$0.isCurrentDevice }
@@ -165,6 +167,8 @@ struct MenuBarView: View {
                 }
             }
             if localCast.isHosting {
+                shareTargetPicker
+
                 if !localCast.activeConnections.isEmpty {
                     ForEach(localCast.activeConnections) { conn in
                         HStack(spacing: 4) {
@@ -181,6 +185,64 @@ struct MenuBarView: View {
                         .italic()
                         .padding(.leading, 20)
                 }
+            }
+        }
+    }
+
+    /// Host-side picker: choose whether to share the whole desktop or a single
+    /// app. Apps are enumerated on this Mac (requires Screen Recording).
+    private var shareTargetPicker: some View {
+        Menu {
+            Button {
+                Task { await localCast.shareEntireDesktop() }
+            } label: {
+                Label("Entire Desktop", systemImage: "display")
+            }
+
+            if !hostApps.isEmpty {
+                Divider()
+                ForEach(hostApps) { app in
+                    Button {
+                        Task { await localCast.shareApp(processID: app.processID, appName: app.name) }
+                    } label: {
+                        Text(app.name)
+                    }
+                }
+            }
+
+            Divider()
+            Button {
+                loadHostApps()
+            } label: {
+                Label(isLoadingHostApps ? "Refreshing…" : "Refresh App List", systemImage: "arrow.clockwise")
+            }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "rectangle.inset.filled.on.rectangle")
+                    .font(.system(size: 10))
+                Text("Sharing: \(localCast.shareTargetName)")
+                    .font(.system(size: 11))
+                    .lineLimit(1)
+                Spacer()
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.system(size: 8))
+                    .foregroundColor(.secondary)
+            }
+        }
+        .menuStyle(.borderlessButton)
+        .padding(.leading, 20)
+        .padding(.trailing, 4)
+        .onAppear { if hostApps.isEmpty { loadHostApps() } }
+    }
+
+    private func loadHostApps() {
+        guard !isLoadingHostApps else { return }
+        isLoadingHostApps = true
+        Task {
+            let apps = await localCast.listShareableApps()
+            await MainActor.run {
+                hostApps = apps
+                isLoadingHostApps = false
             }
         }
     }

@@ -64,6 +64,10 @@ class LocalCastService: ObservableObject {
     
     /// Whether authentication is active for the current hosting session.
     @Published var isAuthEnabled = false
+
+    /// Human-readable name of what this host is currently sharing
+    /// ("Entire Desktop" or an app/window name). Drives the menu-bar label.
+    @Published var shareTargetName = "Entire Desktop"
     
     /// Live-adjustable streaming quality. Changes are pushed to the active
     /// host session immediately via Combine observation.
@@ -110,17 +114,54 @@ class LocalCastService: ObservableObject {
         try await startHosting(target: .fullDisplay)
     }
 
-    #if DEBUG
-    /// Per-window hosting. Dormant — surfaced for future per-app pass.
+    /// Per-window hosting: share a single window.
     func startHostingWindow(windowID: CGWindowID, windowTitle: String) async throws {
         try await startHosting(target: .window(windowID, title: windowTitle))
     }
 
-    /// Per-app hosting. Dormant — surfaced for future per-app pass.
+    /// Per-app hosting: share a single app.
     func startHostingApp(processID: pid_t, appName: String) async throws {
         try await startHosting(target: .app(processID, name: appName))
     }
-    #endif
+
+    // MARK: - Host-side share target selection
+
+    /// Apps on this Mac that can be shared (have a visible, titled window).
+    /// Requires Screen Recording permission; returns [] if denied.
+    func listShareableApps() async -> [RemoteAppInfo] {
+        (try? await HostSession.enumerateShareableApps()) ?? []
+    }
+
+    /// Share the entire desktop. Starts hosting if not already running, otherwise
+    /// retargets the live stream.
+    func shareEntireDesktop() async {
+        await setShareTarget(.fullDisplay, name: "Entire Desktop")
+    }
+
+    /// Share a single app. Starts hosting if not already running, otherwise
+    /// retargets the live stream.
+    func shareApp(processID: pid_t, appName: String) async {
+        await setShareTarget(.app(processID, name: appName), name: appName)
+    }
+
+    /// Share a single window.
+    func shareWindow(windowID: CGWindowID, windowTitle: String) async {
+        await setShareTarget(.window(windowID, title: windowTitle), name: windowTitle)
+    }
+
+    private func setShareTarget(_ target: HostCaptureTarget, name: String) async {
+        if isHosting, let session = hostSession {
+            await session.retarget(to: target)
+            shareTargetName = name
+        } else {
+            do {
+                try await startHosting(target: target)
+                shareTargetName = name
+            } catch {
+                logger.error("Failed to start hosting for share target: \(error.localizedDescription)")
+            }
+        }
+    }
 
     private func startHosting(target: HostCaptureTarget) async throws {
         let permissions = LocalCastPermissions()
@@ -178,6 +219,7 @@ class LocalCastService: ObservableObject {
         guard isHosting else { return }
         self.isHosting = false
         self.isAuthEnabled = false
+        self.shareTargetName = "Entire Desktop"
         stopAdvertisement()
 
         let session = self.hostSession

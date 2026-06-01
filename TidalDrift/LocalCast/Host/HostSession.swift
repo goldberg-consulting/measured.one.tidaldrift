@@ -647,90 +647,81 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     // app picker to switch the LocalCast stream from the full desktop to a
     // single app or window (and back).
 
+    /// Enumerate apps that have at least one visible, titled, reasonably-sized
+    /// on-screen window. Shared by the client-driven app list and the host-side
+    /// share picker in the menu bar. Requires Screen Recording permission.
+    static func enumerateShareableApps() async throws -> [RemoteAppInfo] {
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+
+        // System/background bundle ID prefixes to exclude
+        let excludedBundlePrefixes = [
+            "com.apple.dock",
+            "com.apple.WindowManager",
+            "com.apple.controlcenter",
+            "com.apple.notificationcenterui",
+            "com.apple.Spotlight",
+            "com.apple.SystemUIServer",
+            "com.apple.loginwindow",
+            "com.apple.finder.SharedFileList",
+            "com.apple.universalcontrol",
+            "com.apple.AirPlayUIAgent",
+            "com.apple.accessibility",
+            "com.apple.TextInputMenuAgent",
+            "com.apple.TextInputSwitcher",
+            "com.apple.CoreLocationAgent",
+            "com.apple.ViewBridgeAuxiliary",
+            "com.apple.BKAgentService",
+            "com.apple.cloudd",
+            "com.apple.inputmethod",
+            "com.apple.ScreenTimeWidgetExtension"
+        ]
+
+        var appDict: [pid_t: (app: SCRunningApplication, windows: [SCWindow])] = [:]
+        for window in content.windows {
+            guard let app = window.owningApplication else { continue }
+            if app.bundleIdentifier == Bundle.main.bundleIdentifier { continue }
+            if excludedBundlePrefixes.contains(where: { app.bundleIdentifier.hasPrefix($0) }) { continue }
+            guard window.isOnScreen else { continue }
+            guard window.frame.width >= 100 && window.frame.height >= 50 else { continue }
+            guard let title = window.title, !title.isEmpty else { continue }
+
+            if appDict[app.processID] == nil {
+                appDict[app.processID] = (app: app, windows: [])
+            }
+            appDict[app.processID]?.windows.append(window)
+        }
+
+        var apps: [RemoteAppInfo] = []
+        for (pid, data) in appDict {
+            let windows = data.windows.map { window in
+                RemoteWindowInfo(
+                    windowID: window.windowID,
+                    title: window.title ?? "Untitled",
+                    width: Int(window.frame.width),
+                    height: Int(window.frame.height),
+                    isOnScreen: window.isOnScreen
+                )
+            }
+            guard !windows.isEmpty else { continue }
+            guard !data.app.applicationName.isEmpty else { continue }
+            apps.append(RemoteAppInfo(
+                processID: pid,
+                name: data.app.applicationName,
+                bundleIdentifier: data.app.bundleIdentifier,
+                windows: windows
+            ))
+        }
+
+        apps.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        return apps
+    }
+
     /// Gather available apps and send to client
     private func handleAppListRequest(replyTo endpoint: NWEndpoint) async {
         lcDebug("📋 HostSession: Gathering available apps...")
 
         do {
-            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-
-            // System/background bundle ID prefixes and exact matches to exclude
-            let excludedBundlePrefixes = [
-                "com.apple.dock",
-                "com.apple.WindowManager",
-                "com.apple.controlcenter",
-                "com.apple.notificationcenterui",
-                "com.apple.Spotlight",
-                "com.apple.SystemUIServer",
-                "com.apple.loginwindow",
-                "com.apple.finder.SharedFileList",
-                "com.apple.universalcontrol",
-                "com.apple.AirPlayUIAgent",
-                "com.apple.accessibility",
-                "com.apple.TextInputMenuAgent",
-                "com.apple.TextInputSwitcher",
-                "com.apple.CoreLocationAgent",
-                "com.apple.ViewBridgeAuxiliary",
-                "com.apple.BKAgentService",
-                "com.apple.cloudd",
-                "com.apple.inputmethod",
-                "com.apple.ScreenTimeWidgetExtension"
-            ]
-
-            // Group windows by application -- only include on-screen windows
-            var appDict: [pid_t: (app: SCRunningApplication, windows: [SCWindow])] = [:]
-
-            for window in content.windows {
-                guard let app = window.owningApplication else { continue }
-
-                // Skip TidalDrift itself
-                if app.bundleIdentifier == Bundle.main.bundleIdentifier { continue }
-
-                // Skip system/background apps
-                if excludedBundlePrefixes.contains(where: { app.bundleIdentifier.hasPrefix($0) }) { continue }
-
-                // Only include windows that are on-screen and reasonably sized
-                guard window.isOnScreen else { continue }
-                guard window.frame.width >= 100 && window.frame.height >= 50 else { continue }
-
-                // Require a title (windows without titles are usually invisible/system)
-                guard let title = window.title, !title.isEmpty else { continue }
-
-                if appDict[app.processID] == nil {
-                    appDict[app.processID] = (app: app, windows: [])
-                }
-                appDict[app.processID]?.windows.append(window)
-            }
-
-            // Convert to RemoteAppInfo -- only include apps that have at least one visible window
-            var apps: [RemoteAppInfo] = []
-            for (pid, data) in appDict {
-                let windows = data.windows.map { window in
-                    RemoteWindowInfo(
-                        windowID: window.windowID,
-                        title: window.title ?? "Untitled",
-                        width: Int(window.frame.width),
-                        height: Int(window.frame.height),
-                        isOnScreen: window.isOnScreen
-                    )
-                }
-
-                // Skip apps with no visible windows
-                guard !windows.isEmpty else { continue }
-
-                // Skip apps with empty names (background agents)
-                guard !data.app.applicationName.isEmpty else { continue }
-
-                apps.append(RemoteAppInfo(
-                    processID: pid,
-                    name: data.app.applicationName,
-                    bundleIdentifier: data.app.bundleIdentifier,
-                    windows: windows
-                ))
-            }
-
-            // Sort by name
-            apps.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            let apps = try await Self.enumerateShareableApps()
             allowedAppPIDs = Set(apps.map(\.processID))
             allowedWindowIDs = Set(apps.flatMap { $0.windows.map { CGWindowID($0.windowID) } })
 
@@ -908,6 +899,38 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             }
 
             sendStreamError(error.localizedDescription, to: endpoint)
+        }
+    }
+
+    // MARK: - Host-initiated retarget (menu-bar share picker)
+
+    /// Switch the live capture to a new target chosen on the host side, without
+    /// tearing down the UDP transport. If no client is connected yet, the target
+    /// is stored and applied when the next client connects (capture is deferred).
+    func retarget(to target: HostCaptureTarget) async {
+        guard isRunning else {
+            captureTarget = target
+            return
+        }
+
+        let hadCapture = withCaptureState { () -> Bool in
+            let had = captureActive
+            captureActive = false
+            return had
+        }
+        if hadCapture {
+            await captureManager.stopCapture()
+            encoder.invalidate()
+        }
+
+        captureTarget = target
+        logger.info("🎯 Host retargeted capture to: \(String(describing: target))")
+
+        // Start the new capture now only if a client is actually connected and
+        // authenticated; otherwise beginCaptureForClient runs on next connect.
+        if clientConnection != nil || clientEndpoint != nil, authState == .authenticated {
+            beginCaptureForClient()
+            forceInitialKeyframes()
         }
     }
 
