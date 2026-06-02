@@ -1181,6 +1181,7 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             self.publishLock.unlock()
 
             self.deviceCacheLock.lock()
+            self.coalesceDuplicateComputers()
             let devices = Array(self.deviceCache.values).sorted { a, b in
                 if a.isTidalDriftPeer != b.isTidalDriftPeer { return a.isTidalDriftPeer }
                 return a.displayName.localizedCaseInsensitiveCompare(b.displayName) == .orderedAscending
@@ -1196,6 +1197,96 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         publishLock.unlock()
 
         queue.asyncAfter(deadline: .now() + 0.2, execute: work)
+    }
+
+    // MARK: - Multi-homed device coalescing
+
+    /// Collapse cache entries that belong to the same physical computer. A Mac
+    /// connected over both Wi-Fi and Ethernet (or rediscovered on a new DHCP
+    /// lease) otherwise shows up as two rows under two IPs. Two entries are the
+    /// same computer when they share a TidalDrift peer ID or an exact normalized
+    /// hostname; both are strong, per-machine signals, so this never merges
+    /// distinct Macs. Caller must hold `deviceCacheLock`.
+    private func coalesceDuplicateComputers() {
+        let devices = Array(deviceCache.values)
+        guard devices.count > 1 else { return }
+
+        var groups: [[DiscoveredDevice]] = []
+        for device in devices {
+            let pid = DiscoveredDevice.normalizedIdentityComponent(device.peerId)
+            let host = DiscoveredDevice.normalizedHostname(device.hostname)
+            let idx = groups.firstIndex { group in
+                group.contains { other in
+                    if let pid, let op = DiscoveredDevice.normalizedIdentityComponent(other.peerId), pid == op {
+                        return true
+                    }
+                    if let host, let oh = DiscoveredDevice.normalizedHostname(other.hostname), host == oh {
+                        return true
+                    }
+                    return false
+                }
+            }
+            if let idx {
+                groups[idx].append(device)
+            } else {
+                groups.append([device])
+            }
+        }
+
+        guard groups.contains(where: { $0.count > 1 }) else { return }
+
+        var rebuilt: [String: DiscoveredDevice] = [:]
+        for group in groups {
+            let merged = group.count == 1 ? group[0] : mergeComputerGroup(group)
+            rebuilt[cacheKey(for: merged)] = merged
+        }
+        deviceCache = rebuilt
+        logger.info("🧩 Coalesced \(devices.count) entries into \(rebuilt.count) computers")
+    }
+
+    /// Merge several discovery entries for one computer into a single device,
+    /// preferring the TidalDrift-peer entry and the most recent data, unioning
+    /// services, and choosing the most usable IP as the primary address.
+    private func mergeComputerGroup(_ group: [DiscoveredDevice]) -> DiscoveredDevice {
+        let sorted = group.sorted { a, b in
+            if a.isTidalDriftPeer != b.isTidalDriftPeer { return a.isTidalDriftPeer }
+            return a.lastSeen > b.lastSeen
+        }
+
+        var base = sorted[0]
+        for other in sorted.dropFirst() {
+            base.services.formUnion(other.services)
+            base.isTidalDriftPeer = base.isTidalDriftPeer || other.isTidalDriftPeer
+            base.isTrusted = base.isTrusted || other.isTrusted
+            base.lastSeen = max(base.lastSeen, other.lastSeen)
+            if base.peerId == nil { base.peerId = other.peerId }
+            if base.localCastAuthRequired == nil { base.localCastAuthRequired = other.localCastAuthRequired }
+            if base.savedCredentialRef == nil { base.savedCredentialRef = other.savedCredentialRef }
+            if base.peerModelName == nil { base.peerModelName = other.peerModelName }
+            if base.peerModelIdentifier == nil { base.peerModelIdentifier = other.peerModelIdentifier }
+            if base.peerProcessorInfo == nil { base.peerProcessorInfo = other.peerProcessorInfo }
+            if base.peerMemoryGB == nil { base.peerMemoryGB = other.peerMemoryGB }
+            if base.peerMacOSVersion == nil { base.peerMacOSVersion = other.peerMacOSVersion }
+            if base.peerUserName == nil { base.peerUserName = other.peerUserName }
+            if base.peerUptimeHours == nil { base.peerUptimeHours = other.peerUptimeHours }
+            if base.peerTidalDriftName == nil { base.peerTidalDriftName = other.peerTidalDriftName }
+        }
+
+        base.ipAddress = preferredIP(in: sorted) ?? base.ipAddress
+        return base
+    }
+
+    /// Pick the most usable IP from a set of duplicate entries: a concrete,
+    /// non-local, non-placeholder address from the most recently seen entry.
+    private func preferredIP(in devices: [DiscoveredDevice]) -> String? {
+        let localIPs = Set(NetworkUtils.getAllIPAddresses().values)
+        func usable(_ ip: String) -> Bool {
+            !ip.isEmpty && ip != "Unknown" && ip != "Resolving..."
+        }
+        if let best = devices.first(where: { usable($0.ipAddress) && !localIPs.contains($0.ipAddress) }) {
+            return best.ipAddress
+        }
+        return devices.first(where: { usable($0.ipAddress) })?.ipAddress
     }
 
     func addManualDevice(name: String, ipAddress: String, port: Int = 5900, services: Set<DiscoveredDevice.ServiceType> = [.screenSharing]) {
