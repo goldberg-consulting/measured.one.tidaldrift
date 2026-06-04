@@ -552,8 +552,18 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             case .authComplete:
                 handleAuthComplete(payload: packet.payload, from: endpoint)
                 return
+            case .heartbeat:
+                // Answer heartbeats even before authentication so the client
+                // knows the host is reachable. Without this, an auth-required
+                // host looks identical to an unreachable/firewalled one and the
+                // client shows a misleading "no response from host" when it
+                // really just needs to authenticate. No video is sent until
+                // auth completes (the encoder delegate still gates on authState).
+                let pong = LocalCastPacket(type: .heartbeat, sequenceNumber: 0, timestamp: CFAbsoluteTimeGetCurrent() + kCFAbsoluteTimeIntervalSince1970, payload: Data())
+                transport.send(packet: pong, to: endpoint)
+                return
             default:
-                // Drop all non-auth packets until authenticated
+                // Drop all other non-auth packets until authenticated
                 return
             }
         }

@@ -10,6 +10,9 @@ struct MenuBarView: View {
     @State private var editingNameText = ""
     @State private var hostApps: [RemoteAppInfo] = []
     @State private var isLoadingHostApps = false
+    @AppStorage("localCastRequireAuth") private var requireLocalCastAuth = true
+    @State private var localCastPassword = ""
+    @State private var didLoadLocalCastPassword = false
     
     private var otherDevices: [DiscoveredDevice] {
         appState.discoveredDevices.filter { !$0.isCurrentDevice }
@@ -168,6 +171,7 @@ struct MenuBarView: View {
             }
             if localCast.isHosting {
                 shareTargetPicker
+                localCastAuthControl
 
                 if !localCast.activeConnections.isEmpty {
                     ForEach(localCast.activeConnections) { conn in
@@ -186,6 +190,59 @@ struct MenuBarView: View {
                         .padding(.leading, 20)
                 }
             }
+        }
+    }
+
+    /// Host-side authentication control. Surfaced in the dropdown (not buried in
+    /// the Settings sub-tab) so it is easy to find and to disable. Toggling it
+    /// restarts hosting so the change takes effect.
+    private var localCastAuthControl: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Image(systemName: requireLocalCastAuth ? "lock.fill" : "lock.open")
+                    .font(.system(size: 10))
+                    .foregroundColor(requireLocalCastAuth ? .secondary : .orange)
+                Text("Require password")
+                    .font(.system(size: 11))
+                Spacer()
+                Toggle("", isOn: $requireLocalCastAuth)
+                    .toggleStyle(.switch)
+                    .scaleEffect(0.55)
+                    .labelsHidden()
+            }
+            if requireLocalCastAuth {
+                SecureField("Host password", text: $localCastPassword)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 11))
+            } else {
+                Text("Anyone on this network can view this Mac.")
+                    .font(.system(size: 9))
+                    .foregroundColor(.orange)
+            }
+        }
+        .padding(.leading, 20)
+        .padding(.trailing, 4)
+        .onAppear { loadLocalCastPasswordIfNeeded() }
+        .onChange(of: requireLocalCastAuth) { _ in restartHostingForAuthChange() }
+        .onChange(of: localCastPassword) { newValue in
+            LocalCastPasswordStore.save(newValue)
+        }
+    }
+
+    private func loadLocalCastPasswordIfNeeded() {
+        guard !didLoadLocalCastPassword else { return }
+        didLoadLocalCastPassword = true
+        localCastPassword = LocalCastPasswordStore.load() ?? ""
+    }
+
+    /// Restart the host so a changed auth setting takes effect (the host reads
+    /// requireAuthentication only when hosting starts).
+    private func restartHostingForAuthChange() {
+        guard localCast.isHosting else { return }
+        Task {
+            localCast.stopHosting()
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            try? await localCast.startHosting()
         }
     }
 
