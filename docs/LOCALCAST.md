@@ -143,12 +143,39 @@ settings:
 preserved. `0` = Native, which streams the full panel resolution including
 ultrawide (5120x1440). Options: Native / 720p / 1080p / 1440p / 4K / Ultrawide.
 
-### Plan (remaining)
+### Fix 3: adaptive jitter buffer + render pacing (1.6.19)
 
-- Reduce `queueDepth` (done: 5 → 3) to trim worst-case buffering.
-- Consider FEC or selective retransmit for keyframes on lossy links.
-- Separate the input/heartbeat channel from video to avoid head-of-line
-  blocking under a video burst.
+Even with loss handled, motion looked less smooth than macOS Screen Sharing
+because the client presented each decoded frame the instant it arrived. With
+±30-40 ms link jitter, frames land in clumps, so playback cadence was uneven.
+
+`MetalRenderer` now queues decoded frames and releases them on a steady,
+time-based cadence (the measured source interval, `arrivalIntervalEWMA`),
+decoupled from both bursty arrival and the display refresh rate. The buffer is
+display-linked (`isPaused = false`) rather than draw-on-demand so it has a tick
+to pace against. Depth is adaptive: `targetDepth = round(jitter / interval) + 1`,
+clamped to `[1, 6]`, so a jittery link gets cushion while a clean link stays near
+one frame of latency. Overflow drops to newest; underrun re-buffers and holds the
+last frame. Each queued frame retains its `CVImageBuffer`/`CVMetalTexture` (and is
+held through the GPU draw), preserving the tearing fix.
+
+### Plan (remaining, toward Screen-Sharing parity)
+
+The user's target is full parity: adaptive buffering (done), plus **region-aware
+updates** and **reliable transport (TCP)**. Sequencing and tradeoffs:
+
+- **Reliable transport.** Options, lowest-risk first: (a) FEC/parity on keyframes
+  over the existing UDP (recover lost fragments without a round trip, keeps low
+  latency); (b) selective NACK retransmit; (c) a full TCP transport mode (simplest
+  reliability, but head-of-line blocking adds latency under loss, and it partly
+  undoes the UDP/pacing work). Recommend (a) before (c).
+- **Region-aware updates.** Send only changed regions instead of full-frame video.
+  This is a large rework that converges on what the existing VNC tier already
+  does; for a buttery *full desktop*, the VNC path is the better tool, with
+  LocalCast focused on high-fidelity single app/window streaming.
+- Reduce `queueDepth` (done: 5 → 3) to trim capture-side buffering.
+- Separate the input/heartbeat channel from video to avoid head-of-line blocking
+  under a video burst.
 
 ### Calibration
 
