@@ -89,6 +89,33 @@ Expect `dns-sd advertising ... ip=...` on start and, on changes,
 `Local IP changed ... re-advertising` / `Woke from sleep — re-advertising`.
 Repeated `registration unconfirmed` lines would indicate a deeper mDNS issue.
 
+## Follow-on fixes
+
+### Peers aged out after ~1-2 min (v1.6.8)
+
+`dns-sd -B` emits an Add for a service only once, and mDNS does not re-announce
+existing services often. The earlier CPU pass had replaced the periodic
+`refreshScan()` (which used to restart browsers and re-emit Adds) with
+prune-only maintenance, so discovered peers were never re-confirmed: their
+`lastSeen` aged past the 2-minute peer prune and the device dropped its
+TidalDrift-peer status (red outline). Fix: `TidalDriftPeerService` re-resolves
+known peers every 45s (`reconfirmTimer`); present peers stay fresh, departed
+peers fail to resolve and age out. Peer prune threshold raised to 3 minutes as
+a backstop alongside the Bonjour Remove event.
+
+### 100% CPU spin on dns-sd helper EOF (v1.6.9)
+
+A `sample` of a 99%-CPU TidalDrift pinned it to the
+`com.apple.NSFileHandle.fd_monitoring` queue inside the LocalCast browse
+readability handler. When a `dns-sd` helper process exits, its pipe hits EOF and
+`FileHandle.availableData` returns empty, but the `readabilityHandler` stays
+installed and is re-invoked immediately, forever, spinning a core. The LocalCast
+browse (`startNetServiceBrowserForLocalCast`) had no watchdog, so it spun
+indefinitely. Fix: every dns-sd readability handler now treats empty data as
+EOF, removes itself, and the LocalCast browse relaunches after a short backoff.
+This is a structural argument for Option C: the entire bug class only exists
+because discovery is driven through subprocess pipes and readability handlers.
+
 ## Not yet done / follow-up (Option C)
 
 - The **LocalCast cast advertiser** (`LocalCastService.advertiseLocalCast`) has
