@@ -13,6 +13,11 @@ class InputInjector {
     /// The capture bounds for input mapping (defaults to full screen)
     /// When capturing a window/app, this should be set to the window's frame
     var captureBounds: CGRect?
+
+    /// Mouse button currently held down (0 = left, 1 = right, 2 = other), so a
+    /// subsequent move can be injected as a drag rather than a plain move.
+    /// `inject(_:)` is called sequentially per client, so a plain var is safe.
+    private var heldMouseButton: Int?
     
     enum RemoteInput {
         case mouseMove(x: Double, y: Double)
@@ -216,7 +221,21 @@ class InputInjector {
         switch input {
         case .mouseMove(let x, let y):
             let point = normalizedToScreenCoordinates(x: x, y: y)
-            guard let event = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left) else {
+            // While a button is held, a move is a *drag*. AppKit's window/title-bar
+            // and selection tracking loops consume `.leftMouseDragged` (not
+            // `.mouseMoved`), so sending plain moves made drags jump to the drop
+            // point instead of tracking. Emit the matching dragged event for the
+            // held button so drags follow the cursor live.
+            let moveType: CGEventType
+            let moveButton: CGMouseButton
+            if let held = heldMouseButton {
+                moveType = held == 0 ? .leftMouseDragged : (held == 1 ? .rightMouseDragged : .otherMouseDragged)
+                moveButton = CGMouseButton(rawValue: UInt32(held)) ?? .left
+            } else {
+                moveType = .mouseMoved
+                moveButton = .left
+            }
+            guard let event = CGEvent(mouseEventSource: nil, mouseType: moveType, mouseCursorPosition: point, mouseButton: moveButton) else {
                 if inputCount <= 5 { logger.error("❌ Failed to create mouseMove event") }
                 return
             }
@@ -229,6 +248,7 @@ class InputInjector {
                 lcDebug("[INPUT-DIAG] ❌ INJECT FAILED: could not create mouseDown CGEvent at norm(\(x), \(y))")
                 return
             }
+            heldMouseButton = button
             lcDebug("[INPUT-DIAG] 💉 INJECTING mouseDown button=\(button) at screen(\(Int(point.x)), \(Int(point.y))) from norm(\(String(format: "%.3f", x)), \(String(format: "%.3f", y))) bounds=\(String(describing: captureBounds))")
             event.post(tap: .cghidEventTap)
             
@@ -239,6 +259,7 @@ class InputInjector {
                 lcDebug("[INPUT-DIAG] ❌ INJECT FAILED: could not create mouseUp CGEvent at norm(\(x), \(y))")
                 return
             }
+            if heldMouseButton == button { heldMouseButton = nil }
             lcDebug("[INPUT-DIAG] 💉 INJECTING mouseUp button=\(button) at screen(\(Int(point.x)), \(Int(point.y)))")
             event.post(tap: .cghidEventTap)
             

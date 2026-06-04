@@ -42,6 +42,18 @@ The whole chain is hardware-accelerated, which is why TidalDrift sits near
 - **Capture-start race + viewer takeover (earlier 1.6.x).** Capture starts once
   per connected client (no duplicate `SCStream`s), and the newest viewer takes
   over as the single active client.
+- **Live drag tracking (1.6.18).** While a button is held, a move is a *drag*:
+  AppKit's window/selection tracking loops consume `.leftMouseDragged`, not
+  `.mouseMoved`. The injector now tracks the held button and emits the matching
+  dragged event, so dragging a window follows the cursor live instead of
+  jumping to the drop point. (The client already sends moves during
+  `.leftMouseDragged`; the gap was host-side injection.)
+- **Render tearing / typing shear (1.6.18).** The Metal renderer kept the
+  `MTLTexture` but not the `CVImageBuffer`/`CVMetalTexture` backing it, so
+  VideoToolbox could recycle that IOSurface for a later frame and the GPU would
+  sample a buffer mid-overwrite (shear, worst during rapid small updates like
+  typing). The renderer now retains the current buffer and wrapper, and extends
+  their lifetime through the GPU draw via the command-buffer completion handler.
 
 Coordinate model: the client sends normalized `(x, y)` with a top-left origin
 relative to the video. The host maps them with `InputInjector`:
