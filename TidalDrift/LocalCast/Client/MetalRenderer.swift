@@ -46,6 +46,18 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     private var targetDepth = 2
     private let minDepth = 1
     private let maxDepth = 6
+
+    // MARK: - Region-aware canvas
+    //
+    // When the host streams region-aware (tile) updates, the client keeps a
+    // persistent canvas texture: full frames replace it, tiles patch sub-rects,
+    // and the canvas is presented every display tick. Activated on the first
+    // tileUpdate, so the default full-frame jitter-buffer path is unchanged.
+    // All canvas mutations and presentation happen on the main thread (the MTKView
+    // draw callback and the dispatched apply/update blocks), so blits and the
+    // present are committed to one queue in order (no GPU read/write race).
+    private var canvasMode = false
+    private var canvasTexture: MTLTexture?
     private var vertices: MTLBuffer?
     private var texCoords: MTLBuffer?
     
@@ -269,6 +281,19 @@ class MetalRenderer: NSObject, MTKViewDelegate {
             height: height
         )
 
+        // Region-aware: a full frame replaces the canvas (it's the periodic /
+        // on-request refresh that heals lost tiles). Blit it in on the main
+        // thread so it orders correctly with tile blits and the present.
+        if canvasMode {
+            frameCount += 1
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.ensureCanvas(width: width, height: height, seedFrom: nil)
+                self.blitIntoCanvas(frame.texture, atX: 0, y: 0, retain: frame)
+            }
+            return
+        }
+
         // Adapt the buffer depth to measured arrival jitter: depth grows with
         // (jitter / frame interval) so a jittery link gets enough cushion, while
         // a clean link stays near one frame of latency.
@@ -314,7 +339,14 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     }
     
     func draw(in view: MTKView) {
-        guard let pipelineState = pipelineState else { return }
+        guard pipelineState != nil else { return }
+
+        // Region-aware: present the persistent canvas every tick.
+        if canvasMode {
+            guard let canvas = canvasTexture else { return }
+            presentTexture(canvas, srcWidth: canvas.width, srcHeight: canvas.height, in: view, retain: nil)
+            return
+        }
 
         // Pacing: release one buffered frame per measured source interval, after
         // priming to the adaptive target depth. Between releases (or on underrun)
@@ -339,53 +371,116 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         let frame = lastPresentedFrame
         frameQueueLock.unlock()
 
-        guard let frame = frame,
+        guard let frame = frame else { return }
+        presentTexture(frame.texture, srcWidth: frame.width, srcHeight: frame.height, in: view, retain: frame)
+    }
+
+    /// Draw a texture to the view's drawable with aspect-ratio letterboxing.
+    /// `retain` is held until the GPU finishes so a recycled IOSurface can't be
+    /// overwritten mid-read.
+    private func presentTexture(_ texture: MTLTexture, srcWidth: Int, srcHeight: Int, in view: MTKView, retain: Any?) {
+        guard let pipelineState = pipelineState,
               let drawable = view.currentDrawable,
               let renderPassDescriptor = view.currentRenderPassDescriptor else {
             return
         }
 
-        // Update aspect ratio if the source resolution changed.
-        if frame.width != sourceWidth || frame.height != sourceHeight {
-            sourceWidth = frame.width
-            sourceHeight = frame.height
+        if srcWidth != sourceWidth || srcHeight != sourceHeight {
+            sourceWidth = srcWidth
+            sourceHeight = srcHeight
             lastDrawableSize = .zero
             updateVertexBufferForAspectRatio(viewSize: view.drawableSize)
-            logger.info("🖥️ MetalRenderer: Source resolution changed to \(frame.width)x\(frame.height)")
+            logger.info("🖥️ MetalRenderer: Source resolution changed to \(srcWidth)x\(srcHeight)")
         }
-        // Catch any missed resize events (full-screen transitions, etc.)
         let currentSize = view.drawableSize
         if currentSize != lastDrawableSize {
             updateVertexBufferForAspectRatio(viewSize: currentSize)
         }
-        
-        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
-            return
-        }
-        
-        // Clear to black for letterbox/pillarbox areas
+
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else { return }
         renderPassDescriptor.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
         renderPassDescriptor.colorAttachments[0].loadAction = .clear
-        
-        // Use proper render encoder for scaling
-        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else {
-            return
-        }
-        
+        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else { return }
+
         renderEncoder.setRenderPipelineState(pipelineState)
         renderEncoder.setVertexBuffer(vertices, offset: 0, index: 0)
         renderEncoder.setVertexBuffer(texCoords, offset: 0, index: 1)
-        renderEncoder.setFragmentTexture(frame.texture, index: 0)
-        
+        renderEncoder.setFragmentTexture(texture, index: 0)
         renderEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
-        
         renderEncoder.endEncoding()
 
-        // Keep the sampled frame alive until the GPU finishes this draw, so its
-        // IOSurface can't be recycled and overwritten mid-read.
-        commandBuffer.addCompletedHandler { _ in _ = frame }
-
+        if let retain { commandBuffer.addCompletedHandler { _ in _ = retain } }
         commandBuffer.present(drawable)
         commandBuffer.commit()
+    }
+
+    // MARK: - Region-aware tiles (main thread)
+
+    /// Apply a changed screen region into the persistent canvas. Called off the
+    /// transport thread; hops to main so it serializes with the present.
+    func applyTile(x: Int, y: Int, width: Int, height: Int, bgra: Data) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if self.canvasTexture == nil {
+                // Need a base canvas sized to the stream; seed from the last
+                // full frame so we don't start from black.
+                guard self.sourceWidth > 0, self.sourceHeight > 0 else { return }
+                self.ensureCanvas(width: self.sourceWidth, height: self.sourceHeight, seedFrom: self.lastPresentedFrame)
+            }
+            guard let canvas = self.canvasTexture,
+                  x >= 0, y >= 0, x + width <= canvas.width, y + height <= canvas.height,
+                  let tileTex = self.makeSharedTexture(width: width, height: height) else {
+                return
+            }
+            bgra.withUnsafeBytes { ptr in
+                guard let base = ptr.baseAddress else { return }
+                tileTex.replace(region: MTLRegionMake2D(0, 0, width, height),
+                                mipmapLevel: 0, withBytes: base, bytesPerRow: width * 4)
+            }
+            self.canvasMode = true
+            self.blitIntoCanvas(tileTex, atX: x, y: y, retain: tileTex)
+        }
+    }
+
+    /// Create or resize the canvas, optionally seeding it from a prior frame.
+    /// Main thread only.
+    private func ensureCanvas(width: Int, height: Int, seedFrom: DecodedFrame?) {
+        canvasMode = true
+        if let c = canvasTexture, c.width == width, c.height == height { return }
+        guard let tex = makeSharedTexture(width: width, height: height) else { return }
+        canvasTexture = tex
+        sourceWidth = width
+        sourceHeight = height
+        if let seed = seedFrom, seed.width == width, seed.height == height {
+            blitIntoCanvas(seed.texture, atX: 0, y: 0, retain: seed)
+        }
+    }
+
+    private func makeSharedTexture(width: Int, height: Int) -> MTLTexture? {
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false)
+        desc.usage = [.shaderRead]
+        desc.storageMode = .shared
+        return device.makeTexture(descriptor: desc)
+    }
+
+    /// Copy a source texture into the canvas at (x, y). Main thread only.
+    private func blitIntoCanvas(_ src: MTLTexture, atX x: Int, y: Int, retain: Any?) {
+        guard let canvas = canvasTexture else { return }
+        let w = min(src.width, canvas.width - x)
+        let h = min(src.height, canvas.height - y)
+        guard w > 0, h > 0,
+              let cb = commandQueue.makeCommandBuffer(),
+              let blit = cb.makeBlitCommandEncoder() else {
+            return
+        }
+        blit.copy(from: src, sourceSlice: 0, sourceLevel: 0,
+                  sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                  sourceSize: MTLSize(width: w, height: h, depth: 1),
+                  to: canvas, destinationSlice: 0, destinationLevel: 0,
+                  destinationOrigin: MTLOrigin(x: x, y: y, z: 0))
+        blit.endEncoding()
+        if let retain { cb.addCompletedHandler { _ in _ = retain } }
+        cb.commit()
     }
 }

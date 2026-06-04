@@ -667,6 +667,20 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
                 }
             }
 
+        case .tileUpdate:
+            // Region-aware: a changed screen region. Decode and patch the canvas.
+            if let tile = TileCodec.decode(packet.payload) {
+                renderer?.applyTile(x: tile.x, y: tile.y, width: tile.width, height: tile.height, bgra: tile.bgra)
+                if !isConnected {
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self, !self.isConnected else { return }
+                        self.isConnected = true
+                        self.connectionPhase = .streaming
+                        self.connectionStatus = "Streaming"
+                    }
+                }
+            }
+
         case .heartbeat:
             // Pong received - calculate latency
             lastHeartbeatResponse = Date()

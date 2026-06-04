@@ -102,6 +102,22 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     private static let adaptiveDecreaseCooldown: TimeInterval = 0.5
     private static let adaptiveRecoveryQuiet: TimeInterval = 2.5
 
+    // MARK: - Region-aware streaming (experimental)
+    //
+    // When enabled, frames with a small changed area are sent as lossless tiles
+    // (only the dirty bounding box) instead of full-frame video; large-change
+    // frames fall back to the video encoder. A periodic/on-request full frame
+    // heals any lost tile. Hysteresis avoids flapping between modes.
+    private enum FrameMode { case tile, video }
+    private var frameMode: FrameMode = .video
+    private var lowCoverageStreak = 0
+    private var lastFullRefresh = Date.distantPast
+    private var pendingFullRefresh = false
+    private static let regionTileMaxCoverage = 0.30   // stay/enter TILE at or below
+    private static let regionVideoCoverage = 0.45     // switch to VIDEO above (hysteresis)
+    private static let regionLowStreakNeeded = 3
+    private static let regionFullRefreshInterval: TimeInterval = 4.0
+
     /// Run `body` while holding the capture-state lock. Synchronous generic so
     /// it is callable from async contexts (stop, stream-request handling)
     /// without the "NSLock used from async context" warning; the lock is never
@@ -429,7 +445,130 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             return
         }
 
+        // Region-aware: try to send only the changed region as tiles. Returns
+        // true when handled (tiles sent or idle no-op); false means fall through
+        // to full-frame video.
+        if configuration.regionAware,
+           let change = manager.lastFrameChange,
+           handleRegionAware(sampleBuffer, change: change) {
+            return
+        }
+
         encoder.encode(sampleBuffer)
+    }
+
+    // MARK: - Region-aware streaming
+
+    /// Decide TILE vs VIDEO for this frame. Returns true if the frame was handled
+    /// here (tiles sent, or an idle no-op); false to fall through to video encode.
+    private func handleRegionAware(_ sampleBuffer: CMSampleBuffer, change: ScreenCaptureManager.FrameChangeInfo) -> Bool {
+        let now = Date()
+
+        // Periodic / requested full refresh forces a VIDEO keyframe to heal any
+        // lost tiles and to seed the client canvas at session start.
+        if pendingFullRefresh || now.timeIntervalSince(lastFullRefresh) >= Self.regionFullRefreshInterval {
+            pendingFullRefresh = false
+            lastFullRefresh = now
+            frameMode = .video
+            lowCoverageStreak = 0
+            encoder.forceKeyFrame()
+            return false
+        }
+
+        // Nothing changed: send nothing.
+        if change.isIdle || change.coverage <= 0 || change.dirtyRects.isEmpty {
+            return true
+        }
+
+        // Large change -> VIDEO (entering from TILE forces a keyframe).
+        if change.coverage >= Self.regionVideoCoverage {
+            if frameMode == .tile {
+                encoder.forceKeyFrame()
+                lastFullRefresh = now
+            }
+            frameMode = .video
+            lowCoverageStreak = 0
+            return false
+        }
+
+        // Small change. Require a streak of low-coverage frames before committing
+        // to TILE so brief lulls during motion don't cause mode flapping.
+        lowCoverageStreak = change.coverage <= Self.regionTileMaxCoverage ? lowCoverageStreak + 1 : 0
+        if frameMode == .video {
+            guard lowCoverageStreak >= Self.regionLowStreakNeeded else { return false }
+            frameMode = .tile
+        }
+
+        return sendDirtyTiles(sampleBuffer, rects: change.dirtyRects)
+    }
+
+    /// Crop the dirty bounding box and send it as a lossless tile. Returns true
+    /// if handled; false to fall back to video (e.g. the union got too large).
+    private func sendDirtyTiles(_ sampleBuffer: CMSampleBuffer, rects: [CGRect]) -> Bool {
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return false }
+        let pw = CVPixelBufferGetWidth(pixelBuffer)
+        let ph = CVPixelBufferGetHeight(pixelBuffer)
+        guard pw > 0, ph > 0 else { return false }
+
+        let union = rects.reduce(CGRect.null) { $0.union($1) }
+            .integral
+            .intersection(CGRect(x: 0, y: 0, width: pw, height: ph))
+        guard !union.isNull, union.width >= 1, union.height >= 1 else { return true }
+
+        // If the bounding box covers most of the frame, video is more efficient.
+        if Double(union.width * union.height) / Double(pw * ph) >= Self.regionVideoCoverage {
+            frameMode = .video
+            encoder.forceKeyFrame()
+            lastFullRefresh = Date()
+            return false
+        }
+
+        let x = Int(union.minX), y = Int(union.minY)
+        let w = Int(union.width), h = Int(union.height)
+        guard let bgra = cropBGRA(pixelBuffer, x: x, y: y, w: w, h: h),
+              let payload = TileCodec.encode(x: x, y: y, width: w, height: h, bgra: bgra) else {
+            return false
+        }
+
+        sequenceNumber += 1
+        let packet = LocalCastPacket(
+            type: .tileUpdate,
+            sequenceNumber: sequenceNumber,
+            timestamp: CFAbsoluteTimeGetCurrent() + kCFAbsoluteTimeIntervalSince1970,
+            payload: payload
+        )
+        sendPacketToClient(packet)
+        return true
+    }
+
+    /// Copy a tightly packed BGRA sub-rectangle out of a 32BGRA pixel buffer.
+    private func cropBGRA(_ pixelBuffer: CVPixelBuffer, x: Int, y: Int, w: Int, h: Int) -> Data? {
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else { return nil }
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let pw = CVPixelBufferGetWidth(pixelBuffer)
+        let ph = CVPixelBufferGetHeight(pixelBuffer)
+        guard x >= 0, y >= 0, w > 0, h > 0, x + w <= pw, y + h <= ph else { return nil }
+
+        var out = Data(count: w * h * 4)
+        out.withUnsafeMutableBytes { dst in
+            guard let dstBase = dst.baseAddress else { return }
+            for row in 0..<h {
+                let src = base.advanced(by: (y + row) * bytesPerRow + x * 4)
+                let dstRow = dstBase.advanced(by: row * w * 4)
+                memcpy(dstRow, src, w * 4)
+            }
+        }
+        return out
+    }
+
+    private func sendPacketToClient(_ packet: LocalCastPacket) {
+        if let connection = clientConnection {
+            transport.send(packet: packet, on: connection)
+        } else if let endpoint = clientEndpoint {
+            transport.send(packet: packet, to: endpoint)
+        }
     }
 
     func screenCaptureManager(_ manager: ScreenCaptureManager, didFailWithError error: Error) {
@@ -495,6 +634,12 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             // requests (which aren't loss) for a short grace window.
             resetAdaptiveBitrate()
             adaptiveGraceUntil = Date().addingTimeInterval(4)
+            // Region-aware: start in VIDEO and force a full refresh so the new
+            // viewer's canvas is seeded before any tiles arrive.
+            frameMode = .video
+            lowCoverageStreak = 0
+            lastFullRefresh = .distantPast
+            pendingFullRefresh = true
             logger.info("👤 Active viewer → \(String(describing: endpoint)) (loopback: \(self.isLoopbackConnection))")
         }
     }
@@ -719,6 +864,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             logger.info("🔑 LocalCast: Received keyframe request from client")
             lcDebug("🔑 HostSession: Received keyframe request")
             encoder.forceKeyFrame()
+            pendingFullRefresh = true  // region-aware: send a full frame to heal
             noteClientLossSignal()
 
         case .appListRequest:

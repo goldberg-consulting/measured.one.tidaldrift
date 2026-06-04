@@ -159,10 +159,39 @@ one frame of latency. Overflow drops to newest; underrun re-buffers and holds th
 last frame. Each queued frame retains its `CVImageBuffer`/`CVMetalTexture` (and is
 held through the GPU draw), preserving the tearing fix.
 
+### Fix 4: region-aware streaming (experimental, 1.6.20)
+
+Full parity step toward Screen Sharing: send only what changed. Toggle in
+Metal Streaming settings ("Region-aware streaming"), host-side, default off.
+
+- Host reads `SCStreamFrameInfo` dirty rects ([ScreenCaptureManager](../TidalDrift/LocalCast/Host/ScreenCaptureManager.swift)).
+  Small changed area -> crop the dirty bounding box and send it as a lossless
+  LZFSE BGRA tile (`tileUpdate` packet, [TileCodec](../TidalDrift/LocalCast/Core/TileCodec.swift));
+  large change -> fall back to full-frame video. Hysteresis
+  (`regionTileMaxCoverage` / `regionVideoCoverage` / streak) avoids flapping.
+- Client keeps a persistent canvas texture ([MetalRenderer](../TidalDrift/LocalCast/Client/MetalRenderer.swift)):
+  tiles blit into sub-rects, full frames replace it, the canvas is presented
+  each display tick. Activated on the first tile, so the default jitter-buffer
+  path is unchanged.
+- Recovery (chosen: periodic + on-request full refresh): the host sends a full
+  frame every ~4 s, on client `keyframeRequest`, and at viewer connect to seed
+  the canvas. A lost tile heals at the next refresh.
+- Transport: the top frameId bit marks droppable (video) frames; drop-to-newest
+  reassembly only discards those, so tiles are never dropped as "stale"
+  ([UDPTransport](../TidalDrift/LocalCast/Transport/UDPTransport.swift)).
+- Codec: HEVC selectable for the full-frame fallback. The decoder routes NALs by
+  codec once HEVC is detected (HEVC IDR type 19 otherwise collided with H.264
+  SEI type 6 and was dropped). Default remains H.264 pending two-Mac validation.
+
+Why not pure "small change = small data": H.264/HEVC P-frames already delta-code,
+so typing is already a small frame. Region-aware's wins are avoiding full-frame
+keyframes, not re-encoding the whole panel every tick (ultrawide), and
+lowest-latency localized updates.
+
 ### Plan (remaining, toward Screen-Sharing parity)
 
-The user's target is full parity: adaptive buffering (done), plus **region-aware
-updates** and **reliable transport (TCP)**. Sequencing and tradeoffs:
+The user's target is full parity: adaptive buffering (done), region-aware updates
+(done, experimental, above), plus **reliable transport**. Sequencing and tradeoffs:
 
 - **Reliable transport.** Options, lowest-risk first: (a) FEC/parity on keyframes
   over the existing UDP (recover lost fragments without a round trip, keeps low

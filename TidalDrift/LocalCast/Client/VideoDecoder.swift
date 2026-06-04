@@ -141,6 +141,16 @@ class VideoDecoder {
         guard !nalUnit.isEmpty else { return }
         
         let firstByte = nalUnit[0]
+
+        // Once the stream is known to be HEVC, route via HEVC NAL types. H.264
+        // and HEVC type encodings overlap (e.g. HEVC IDR type 19 shares the low
+        // 5 bits with H.264 SEI type 6), so guessing per-NAL silently drops HEVC
+        // keyframes. Param sets (VPS/SPS/PPS) flip isHEVC below.
+        if isHEVC {
+            handleHEVCNAL(nalUnit, firstByte: firstByte)
+            return
+        }
+
         let h264NalType = firstByte & 0x1F  // H.264 NAL type (lower 5 bits)
         
         // Debug first few NAL units
@@ -200,53 +210,57 @@ class VideoDecoder {
             break
         }
         
-        // If not recognized as H.264, check HEVC
-        if nalUnit.count >= 2 {
-            let hevcNalType = (firstByte >> 1) & 0x3F
-            
-            switch hevcNalType {
-            case 32:  // VPS
-                lcDebug("🎬 VideoDecoder: ✅ Received HEVC VPS (\(nalUnit.count) bytes)")
-                vps = nalUnit
-                isHEVC = true
-                return
-                
-            case 33:  // SPS
-                lcDebug("🎬 VideoDecoder: ✅ Received HEVC SPS (\(nalUnit.count) bytes)")
-                sps = nalUnit
-                isHEVC = true
-                tryCreateSession()
-                return
-                
-            case 34:  // PPS
-                lcDebug("🎬 VideoDecoder: ✅ Received HEVC PPS (\(nalUnit.count) bytes)")
-                pps = nalUnit
-                isHEVC = true
-                tryCreateSession()
-                return
-                
-            case 0...9, 16...21:  // HEVC VCL NAL units
-                if isHEVC {
-                    frameCount += 1
-                    if !hasLoggedFirstFrame {
-                        lcDebug("🎬 VideoDecoder: ✅ Decoding first HEVC frame!")
-                        hasLoggedFirstFrame = true
-                    }
-                    decodeVideoFrame(nalUnit)
+        // Not recognized as H.264: may be an HEVC param set that flips the stream
+        // to HEVC, after which all NALs route through handleHEVCNAL.
+        handleHEVCNAL(nalUnit, firstByte: firstByte)
+    }
+
+    /// Handle a NAL as HEVC. Param sets (VPS/SPS/PPS) set `isHEVC` and create the
+    /// session; VCL units are decoded.
+    private func handleHEVCNAL(_ nalUnit: Data, firstByte: UInt8) {
+        guard nalUnit.count >= 2 else { return }
+        let hevcNalType = (firstByte >> 1) & 0x3F
+
+        switch hevcNalType {
+        case 32:  // VPS
+            lcDebug("🎬 VideoDecoder: ✅ Received HEVC VPS (\(nalUnit.count) bytes)")
+            vps = nalUnit
+            isHEVC = true
+            return
+
+        case 33:  // SPS
+            lcDebug("🎬 VideoDecoder: ✅ Received HEVC SPS (\(nalUnit.count) bytes)")
+            sps = nalUnit
+            isHEVC = true
+            tryCreateSession()
+            return
+
+        case 34:  // PPS
+            lcDebug("🎬 VideoDecoder: ✅ Received HEVC PPS (\(nalUnit.count) bytes)")
+            pps = nalUnit
+            isHEVC = true
+            tryCreateSession()
+            return
+
+        case 0...9, 16...21:  // HEVC VCL NAL units (incl. IDR 19/20, CRA 21)
+            if isHEVC {
+                frameCount += 1
+                if !hasLoggedFirstFrame {
+                    lcDebug("🎬 VideoDecoder: ✅ Decoding first HEVC frame!")
+                    hasLoggedFirstFrame = true
                 }
-                return
-                
-            default:
-                break
+                decodeVideoFrame(nalUnit)
             }
-        }
-        
-        // If we have a session, try to decode anyway
-        if decompressionSession != nil && h264NalType != 0 {
-            frameCount += 1
-            decodeVideoFrame(nalUnit)
-        } else if frameCount < 10 {
-            lcDebug("🎬 VideoDecoder: Unknown NAL type \(h264NalType), size=\(nalUnit.count)")
+            return
+
+        default:
+            // Unknown: decode if a session already exists, else ignore.
+            if decompressionSession != nil {
+                frameCount += 1
+                decodeVideoFrame(nalUnit)
+            } else if frameCount < 10 {
+                lcDebug("🎬 VideoDecoder: Unknown NAL (hevcType=\(hevcNalType)), size=\(nalUnit.count)")
+            }
         }
     }
     

@@ -11,6 +11,7 @@ struct LocalCastSettingsView: View {
     @AppStorage("localCastMaxDimension") var maxDimension = 0
     @AppStorage("localCastDropToNewest") var dropToNewest = true
     @AppStorage("localCastLossRecovery") var lossRecovery = true
+    @AppStorage("localCastRegionAware") var regionAware = false
     
     @State private var hostPassword = ""
     
@@ -130,6 +131,15 @@ struct LocalCastSettingsView: View {
                     Text("On lossy Wi-Fi these keep motion smooth and recover quickly. On a clean wired link they have little effect. Turn them off to force fixed-bitrate, play-everything behavior.")
                         .font(.caption)
                         .foregroundColor(.secondary)
+
+                    Toggle("Region-aware streaming (experimental)", isOn: $regionAware)
+                        .help("Send only changed screen regions as crisp lossless tiles, falling back to full-frame video on large motion. Reduces bandwidth and sharpens static content (text, UI), especially on large/ultrawide displays. Host-side; applies to the next session.")
+
+                    if regionAware {
+                        Text("Experimental. Best for desktop/text work; large continuous motion still uses full-frame video. Both Macs must run a build with region-aware support.")
+                            .font(.caption)
+                            .foregroundColor(.orange)
+                    }
                 }
                 .padding(.leading, 8)
 

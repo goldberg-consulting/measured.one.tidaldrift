@@ -186,6 +186,11 @@ class LocalCastService: ObservableObject {
         configuration.inputRateLimit = defaults.object(forKey: "localCastInputRateLimit") as? Int ?? 120
         configuration.adaptiveQuality = defaults.object(forKey: "localCastAdaptive") as? Bool ?? true
         configuration.maxDimensionOverride = defaults.object(forKey: "localCastMaxDimension") as? Int ?? 0
+        configuration.regionAware = defaults.object(forKey: "localCastRegionAware") as? Bool ?? false
+        if let codecRaw = defaults.string(forKey: "localCastCodec"),
+           let codec = LocalCastConfiguration.Codec(rawValue: codecRaw) {
+            configuration.codec = codec
+        }
 
         // Read the host password for auth (Keychain first, legacy UserDefaults fallback)
         let hostPassword: String?
