@@ -40,6 +40,11 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     
     private var stream: SCStream?
     private let captureQueue = DispatchQueue(label: "com.tidaldrift.localcast.capture", qos: .userInteractive)
+
+    /// The configuration the active stream was created with. `updateConfiguration`
+    /// replaces the *entire* configuration, so live updates must start from this
+    /// (preserving width/height/pixelFormat/etc.) and change only what's needed.
+    private var activeConfig: SCStreamConfiguration?
     
     deinit {
         if let stream = stream {
@@ -220,6 +225,7 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
         config.pixelFormat = kCVPixelFormatType_32BGRA
         config.colorSpaceName = CGColorSpace.sRGB
         config.showsCursor = true
+        activeConfig = config
         
         logger.info("Creating SCStream for \(description)...")
         stream = SCStream(filter: filter, configuration: config, delegate: self)
@@ -248,11 +254,20 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
             logger.warning("updateFrameRate: no active stream")
             return
         }
-        
+        guard let config = activeConfig else {
+            logger.warning("updateFrameRate: no active configuration")
+            return
+        }
+
+        // Mutate only the frame interval on the existing configuration.
+        // updateConfiguration replaces the whole config, so a bare config here
+        // would reset width/height/pixelFormat and break the stream (frozen
+        // viewer). Reusing activeConfig preserves everything else.
+        let newInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
+        if CMTimeCompare(config.minimumFrameInterval, newInterval) == 0 { return }
+        config.minimumFrameInterval = newInterval
+
         if #available(macOS 14.0, *) {
-            let config = SCStreamConfiguration()
-            config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
-            
             do {
                 try await stream.updateConfiguration(config)
                 logger.info("Live capture update: fps → \(fps)")
@@ -268,6 +283,7 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
         do {
             try await stream?.stopCapture()
             stream = nil
+            activeConfig = nil
             captureMode = nil
             captureBounds = nil
             logger.info("Stopped screen capture")

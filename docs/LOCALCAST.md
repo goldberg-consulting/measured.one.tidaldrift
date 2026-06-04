@@ -48,6 +48,13 @@ The whole chain is hardware-accelerated, which is why TidalDrift sits near
   dragged event, so dragging a window follows the cursor live instead of
   jumping to the drop point. (The client already sends moves during
   `.leftMouseDragged`; the gap was host-side injection.)
+- **Live quality change froze the viewer (1.6.18).** `SCStream.updateConfiguration`
+  replaces the *entire* configuration, but the frame-rate update passed a bare
+  `SCStreamConfiguration` (width/height/pixelFormat all default), resetting the
+  stream to 0x0 and freezing the viewer until a re-share rebuilt it. The capture
+  manager now retains the active config and mutates only the frame interval (and
+  skips the call when fps is unchanged); the host also forces a keyframe after a
+  live quality change so the viewer resyncs immediately.
 - **Render tearing / typing shear (1.6.18).** The Metal renderer kept the
   `MTLTexture` but not the `CVImageBuffer`/`CVMetalTexture` backing it, so
   VideoToolbox could recycle that IOSurface for a later frame and the GPU would

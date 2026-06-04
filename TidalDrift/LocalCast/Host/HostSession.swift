@@ -370,6 +370,10 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             keyframeIntervalSeconds: kfi
         )
 
+        // Emit a fresh keyframe so the viewer resyncs immediately after the
+        // parameter change instead of waiting for the next scheduled keyframe.
+        encoder.forceKeyFrame()
+
         guard withCaptureState({ captureActive }) else { return }
 
         Task {
