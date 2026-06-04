@@ -95,8 +95,8 @@ class UDPTransport {
     // Fragment reassembly
     private var fragmentBuffers: [UInt32: [UInt16: Data]] = [:] // frameId -> [fragmentIndex -> data]
     private var fragmentCounts: [UInt32: UInt16] = [:] // frameId -> totalFragments
+    private var frameDroppable: [UInt32: Bool] = [:]   // frameId -> droppable (video) vs reliable (tile)
     private let fragmentLock = NSLock()
-    private var oldestBufferedFrameId: UInt32 = 0
 
     // Drop-to-newest reassembly. The sender's frameId increments per frame, so a
     // frame still missing fragments once newer frames are arriving will never
@@ -246,9 +246,11 @@ class UDPTransport {
             }
         }
         
-        // Check if we need to fragment
+        // Check if we need to fragment. Only video frames are "droppable" by the
+        // receiver's drop-to-newest reassembly; tiles and control packets must
+        // be delivered whole (a lost tile is healed by periodic refresh instead).
         if data.count > maxPayloadSize {
-            sendFragmented(data: data, on: connection)
+            sendFragmented(data: data, on: connection, droppable: packet.type == .videoFrame)
         } else {
             // Small packet, send directly with a "no fragment" header
             var noFragmentData = Data()
@@ -268,10 +270,15 @@ class UDPTransport {
         }
     }
     
-    private func sendFragmented(data: Data, on connection: NWConnection) {
+    /// Top bit of the wire frameId marks a frame as droppable (video). The
+    /// receiver's drop-to-newest reassembly only discards droppable frames; the
+    /// remaining 31 bits are the frame counter (wraps after ~414 days at 60fps).
+    static let droppableFrameFlag: UInt32 = 0x8000_0000
+
+    private func sendFragmented(data: Data, on connection: NWConnection, droppable: Bool) {
         fragmentLock.lock()
         frameCounter += 1
-        let frameId = frameCounter
+        let frameId = (frameCounter & ~Self.droppableFrameFlag) | (droppable ? Self.droppableFrameFlag : 0)
         fragmentLock.unlock()
         
         let payloadSize = maxPayloadSize - FragmentHeader.size
@@ -486,73 +493,80 @@ class UDPTransport {
             return
         }
         
-        // Drop-to-newest: once a frame falls behind the newest by more than the
-        // in-flight window, a late fragment for it is useless (its siblings were
-        // pruned), so ignore it instead of resurrecting a dead buffer.
-        if dropToNewestEnabled,
+        // The top frameId bit marks a droppable (video) frame; the low 31 bits
+        // are the real id. Drop-to-newest only applies to droppable frames so
+        // tiles (and other reliable packets) are never discarded as "stale".
+        let droppable = (header.frameId & Self.droppableFrameFlag) != 0
+        let realFrameId = header.frameId & ~Self.droppableFrameFlag
+
+        // Drop-to-newest: a droppable frame that fell behind the newest by more
+        // than the in-flight window will never complete (its siblings were
+        // pruned), so ignore a late fragment instead of resurrecting it.
+        if dropToNewestEnabled, droppable,
            highestFrameId > inFlightFrameWindow,
-           header.frameId < highestFrameId - inFlightFrameWindow {
+           realFrameId < highestFrameId - inFlightFrameWindow {
             fragmentLock.unlock()
             return
         }
 
         // Initialize buffer for this frame if needed
-        if fragmentBuffers[header.frameId] == nil {
-            fragmentBuffers[header.frameId] = [:]
-            fragmentCounts[header.frameId] = header.totalFragments
+        if fragmentBuffers[realFrameId] == nil {
+            fragmentBuffers[realFrameId] = [:]
+            fragmentCounts[realFrameId] = header.totalFragments
+            frameDroppable[realFrameId] = droppable
         }
 
-        if header.frameId > highestFrameId {
-            highestFrameId = header.frameId
+        if droppable, realFrameId > highestFrameId {
+            highestFrameId = realFrameId
         }
 
         // Store this fragment
-        fragmentBuffers[header.frameId]?[header.fragmentIndex] = Data(payload)
+        fragmentBuffers[realFrameId]?[header.fragmentIndex] = Data(payload)
 
-        // Prune frames that fell behind the newest. Any pruned frame that never
-        // completed is a lost frame worth signalling for recovery.
+        // Prune droppable frames that fell behind the newest. A pruned-but-
+        // incomplete frame is a lost frame worth signalling for recovery. Tiles
+        // (non-droppable) are kept; a lost tile is healed by periodic refresh.
         var lostIncomplete = false
         if dropToNewestEnabled, highestFrameId > inFlightFrameWindow {
             let cutoff = highestFrameId - inFlightFrameWindow
-            for (fid, frags) in fragmentBuffers where fid < cutoff {
+            for (fid, frags) in fragmentBuffers where fid < cutoff && (frameDroppable[fid] ?? true) {
                 if frags.count < Int(fragmentCounts[fid] ?? 0) { lostIncomplete = true }
                 fragmentBuffers.removeValue(forKey: fid)
                 fragmentCounts.removeValue(forKey: fid)
+                frameDroppable.removeValue(forKey: fid)
             }
-        } else {
-            // Drop-to-newest off: fall back to the original bounded-buffer eviction.
-            if oldestBufferedFrameId == 0 { oldestBufferedFrameId = header.frameId }
-            while fragmentBuffers.count > maxBufferedFrames {
-                fragmentBuffers.removeValue(forKey: oldestBufferedFrameId)
-                fragmentCounts.removeValue(forKey: oldestBufferedFrameId)
-                oldestBufferedFrameId += 1
-                while !fragmentBuffers.isEmpty && fragmentBuffers[oldestBufferedFrameId] == nil {
-                    oldestBufferedFrameId += 1
-                }
-            }
+        }
+
+        // Memory backstop (covers never-completing tiles and the drop-to-newest
+        // off case): evict the oldest buffered frame if we exceed the cap.
+        while fragmentBuffers.count > maxBufferedFrames, let oldest = fragmentBuffers.keys.min() {
+            fragmentBuffers.removeValue(forKey: oldest)
+            fragmentCounts.removeValue(forKey: oldest)
+            frameDroppable.removeValue(forKey: oldest)
         }
         
         // Check if we have all fragments
-        let received = fragmentBuffers[header.frameId]?.count ?? 0
-        let total = Int(fragmentCounts[header.frameId] ?? 0)
+        let received = fragmentBuffers[realFrameId]?.count ?? 0
+        let total = Int(fragmentCounts[realFrameId] ?? 0)
         
-        if received == total {
+        if total > 0, received == total {
             // Reassemble
             var fullData = Data()
             for i in 0..<UInt16(total) {
-                if let fragmentData = fragmentBuffers[header.frameId]?[i] {
+                if let fragmentData = fragmentBuffers[realFrameId]?[i] {
                     fullData.append(fragmentData)
                 }
             }
             
             // Clean up
-            fragmentBuffers.removeValue(forKey: header.frameId)
-            fragmentCounts.removeValue(forKey: header.frameId)
+            fragmentBuffers.removeValue(forKey: realFrameId)
+            fragmentCounts.removeValue(forKey: realFrameId)
+            frameDroppable.removeValue(forKey: realFrameId)
             fragmentLock.unlock()
             
             // Parse and deliver (decrypt if needed)
             if let packet = decryptAndParse(fullData) {
-                logger.debug("Reassembled frame \(header.frameId): \(fullData.count) bytes from \(total) fragments")
+                logger.debug("Reassembled frame \(realFrameId): \(fullData.count) bytes from \(total) fragments")
                 delegate?.udpTransport(self, didReceivePacket: packet, from: endpoint)
             }
         } else {

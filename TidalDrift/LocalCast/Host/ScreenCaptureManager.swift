@@ -41,6 +41,27 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     private var stream: SCStream?
     private let captureQueue = DispatchQueue(label: "com.tidaldrift.localcast.capture", qos: .userInteractive)
 
+    /// Per-frame change description parsed from ScreenCaptureKit's frame info.
+    /// `dirtyRects` are in the capture pixel-buffer coordinate space (top-left
+    /// origin). `coverage` is the changed fraction of the frame. `isIdle` means
+    /// the frame carried no new content (status != complete).
+    struct FrameChangeInfo {
+        let dirtyRects: [CGRect]
+        let coverage: Double
+        let isIdle: Bool
+    }
+
+    /// Change info for the most recent delivered sample buffer. Set immediately
+    /// before the `didOutput` delegate call (single capture queue), so the
+    /// delegate can read it synchronously for the same frame.
+    private(set) var lastFrameChange: FrameChangeInfo?
+
+    // Rolling coverage stats for Phase 0 instrumentation.
+    private var statFrames = 0
+    private var statCoverageSum = 0.0
+    private var statIdle = 0
+    private var statSmall = 0
+
     /// The configuration the active stream was created with. `updateConfiguration`
     /// replaces the *entire* configuration, so live updates must start from this
     /// (preserving width/height/pixelFormat/etc.) and change only what's needed.
@@ -296,7 +317,61 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .screen, sampleBuffer.isValid else { return }
+        lastFrameChange = parseFrameChange(sampleBuffer)
         delegate?.screenCaptureManager(self, didOutput: sampleBuffer)
+    }
+
+    /// Parse ScreenCaptureKit frame info into changed rects + coverage, and log
+    /// rolling stats so we can confirm the region-aware payoff and tune the
+    /// TILE/VIDEO threshold against real usage.
+    private func parseFrameChange(_ sampleBuffer: CMSampleBuffer) -> FrameChangeInfo? {
+        guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
+              let info = attachments.first else {
+            return nil
+        }
+
+        // Non-complete frames (idle/blank/suspended) carry no new content.
+        if let statusRaw = info[.status] as? Int,
+           let status = SCFrameStatus(rawValue: statusRaw),
+           status != .complete {
+            recordStat(coverage: 0, idle: true)
+            return FrameChangeInfo(dirtyRects: [], coverage: 0, isIdle: true)
+        }
+
+        var pixelWidth = 0
+        var pixelHeight = 0
+        if let pb = CMSampleBufferGetImageBuffer(sampleBuffer) {
+            pixelWidth = CVPixelBufferGetWidth(pb)
+            pixelHeight = CVPixelBufferGetHeight(pb)
+        }
+
+        guard let rectDicts = info[.dirtyRects] as? [[String: Any]] else {
+            // Unknown changed area: treat as full-frame change.
+            recordStat(coverage: 1, idle: false)
+            return FrameChangeInfo(dirtyRects: [], coverage: 1, isIdle: false)
+        }
+
+        let rects = rectDicts.compactMap { CGRect(dictionaryRepresentation: $0 as CFDictionary) }
+        let totalArea = Double(pixelWidth * pixelHeight)
+        let changedArea = rects.reduce(0.0) { $0 + Double($1.width) * Double($1.height) }
+        let coverage = totalArea > 0 ? min(1.0, changedArea / totalArea) : 1.0
+        recordStat(coverage: coverage, idle: false)
+        return FrameChangeInfo(dirtyRects: rects, coverage: coverage, isIdle: false)
+    }
+
+    private func recordStat(coverage: Double, idle: Bool) {
+        statFrames += 1
+        statCoverageSum += coverage
+        if idle { statIdle += 1 }
+        if !idle && coverage > 0 && coverage < 0.25 { statSmall += 1 }
+        if statFrames >= 120 {
+            let avg = statCoverageSum / Double(statFrames)
+            logger.info("📐 Dirty-rect stats over \(self.statFrames) frames: avg coverage \(String(format: "%.1f", avg * 100))%, idle \(self.statIdle), small(<25%) \(self.statSmall)")
+            statFrames = 0
+            statCoverageSum = 0
+            statIdle = 0
+            statSmall = 0
+        }
     }
     
     // MARK: - SCStreamDelegate

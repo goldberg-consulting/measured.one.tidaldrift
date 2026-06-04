@@ -27,6 +27,10 @@ struct LocalCastConfiguration: Codable {
     /// captures at native resolution, which is what large/ultrawide panels
     /// (e.g. 5120x1440) need. Aspect ratio is always preserved.
     var maxDimensionOverride: Int = 0
+
+    /// Region-aware streaming (experimental): send only changed screen regions as
+    /// lossless tiles, falling back to full-frame video on large changes.
+    var regionAware: Bool = false
     
     // Security
     var requireAuthentication: Bool = true
