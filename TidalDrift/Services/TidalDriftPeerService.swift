@@ -244,7 +244,13 @@ class TidalDriftPeerService: NSObject, ObservableObject {
         process.standardError = FileHandle.nullDevice
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
-            guard !data.isEmpty, let output = String(data: data, encoding: .utf8) else { return }
+            // EOF: the helper exited. Remove the handler so it does not spin on
+            // empty reads; the watchdog relaunches with a fresh pipe.
+            if data.isEmpty {
+                handle.readabilityHandler = nil
+                return
+            }
+            guard let output = String(data: data, encoding: .utf8) else { return }
             // dns-sd -R prints "Name now registered and active" once mDNSResponder
             // accepts the registration. Until then the ad is not actually live.
             if output.contains("registered and active") {
@@ -479,7 +485,13 @@ class TidalDriftPeerService: NSObject, ObservableObject {
         
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
-            guard !data.isEmpty, let output = String(data: data, encoding: .utf8) else { return }
+            // EOF: the browse helper exited. Remove the handler to avoid a tight
+            // empty-read spin; the browse watchdog relaunches with a fresh pipe.
+            if data.isEmpty {
+                handle.readabilityHandler = nil
+                return
+            }
+            guard let output = String(data: data, encoding: .utf8) else { return }
             self?.parseBrowseOutput(output)
         }
         
@@ -646,11 +658,8 @@ class TidalDriftPeerService: NSObject, ObservableObject {
         
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
-            
-            guard !data.isEmpty, let output = String(data: data, encoding: .utf8) else {
-                return
-            }
-            
+            if data.isEmpty { handle.readabilityHandler = nil; return }
+            guard let output = String(data: data, encoding: .utf8) else { return }
             self?.parseResolveOutput(output, name: name)
         }
         
@@ -784,10 +793,8 @@ class TidalDriftPeerService: NSObject, ObservableObject {
             self.lookupLock.unlock()
             
             let data = handle.availableData
-            
-            guard !data.isEmpty, let output = String(data: data, encoding: .utf8) else {
-                return
-            }
+            if data.isEmpty { handle.readabilityHandler = nil; return }
+            guard let output = String(data: data, encoding: .utf8) else { return }
             
             // Parse IP from output
             let lines = output.components(separatedBy: "\n")
