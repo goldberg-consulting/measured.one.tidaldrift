@@ -11,6 +11,14 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     private var pipelineState: MTLRenderPipelineState?
     
     private var currentTexture: MTLTexture?
+    // The MTLTexture is backed by the CVImageBuffer's IOSurface via the texture
+    // cache. We must keep strong references to both the CVMetalTexture wrapper
+    // and the source CVImageBuffer for as long as the texture is in use, or
+    // VideoToolbox recycles that IOSurface for a later frame and the GPU samples
+    // a buffer being overwritten — visible as tearing/shear, worst during rapid
+    // small updates like typing.
+    private var currentCVTexture: CVMetalTexture?
+    private var currentPixelBuffer: CVImageBuffer?
     private var textureCache: CVMetalTextureCache?
     private var vertices: MTLBuffer?
     private var texCoords: MTLBuffer?
@@ -230,6 +238,10 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         )
         
         if status == kCVReturnSuccess, let texture = cvTexture {
+            // Retain the wrapper and backing buffer so their IOSurface isn't
+            // recycled while this texture is the displayed frame.
+            currentCVTexture = texture
+            currentPixelBuffer = imageBuffer
             currentTexture = CVMetalTextureGetTexture(texture)
             
             frameCount += 1
@@ -301,7 +313,17 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         renderEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         
         renderEncoder.endEncoding()
-        
+
+        // Keep the sampled buffer/texture alive until the GPU finishes this draw,
+        // even if a newer frame replaces `current*` mid-flight, so the surface
+        // can't be recycled and overwritten while it is being read.
+        let drawnCVTexture = currentCVTexture
+        let drawnPixelBuffer = currentPixelBuffer
+        commandBuffer.addCompletedHandler { _ in
+            _ = drawnCVTexture
+            _ = drawnPixelBuffer
+        }
+
         commandBuffer.present(drawable)
         commandBuffer.commit()
     }
