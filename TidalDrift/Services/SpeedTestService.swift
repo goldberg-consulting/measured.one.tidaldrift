@@ -93,7 +93,7 @@ final class SpeedTestService {
     private var listener: NWListener?
     private let respLock = NSLock()
     private var uploadExpected: [String: Int] = [:]
-    private var uploadReceived: [String: (packets: Int, bytes: Int, firstAt: Date?)] = [:]
+    private var uploadReceived: [String: (packets: Int, bytes: Int, firstAt: Date?, lastAt: Date?)] = [:]
     private var uploadResultSent: Set<String> = []
 
     /// Start the always-on responder so peers can test against this Mac.
@@ -151,7 +151,7 @@ final class SpeedTestService {
             let count = Int(Self.readU32(data, 1))
             respLock.lock()
             uploadExpected[key] = count
-            uploadReceived[key] = (0, 0, nil)
+            uploadReceived[key] = (0, 0, nil, nil)
             uploadResultSent.remove(key)
             respLock.unlock()
             // Safety net: report even if the tail of the burst is lost.
@@ -162,7 +162,9 @@ final class SpeedTestService {
         case .uploadData:
             respLock.lock()
             if var r = uploadReceived[key] {
-                if r.firstAt == nil { r.firstAt = Date() }
+                let now = Date()
+                if r.firstAt == nil { r.firstAt = now }
+                r.lastAt = now
                 r.packets += 1
                 r.bytes += data.count
                 uploadReceived[key] = r
@@ -196,13 +198,16 @@ final class SpeedTestService {
             respLock.unlock()
             return
         }
-        let r = uploadReceived[key] ?? (0, 0, nil)
+        let r = uploadReceived[key] ?? (0, 0, nil, nil)
         uploadResultSent.insert(key)
         respLock.unlock()
 
+        // Measure over the actual receive window (first to last packet), not to
+        // the safety-net deadline. Tail loss must not inflate the duration and
+        // crush the reported throughput.
         let ms: UInt32
-        if let first = r.firstAt {
-            ms = UInt32(max(Date().timeIntervalSince(first) * 1000, 1))
+        if let first = r.firstAt, let last = r.lastAt {
+            ms = UInt32(max(last.timeIntervalSince(first) * 1000, 1))
         } else {
             ms = 1
         }

@@ -463,12 +463,15 @@ struct DeviceDetailSheet: View {
             return "No throughput measured — the peer may not be running a version with the speed-test responder, or the link dropped everything."
         }
         if r.downloadLossPct > 5 {
-            return String(format: "High packet loss (%.0f%%). The Wi-Fi link is the bottleneck — lower the streaming quality or use Ethernet.", r.downloadLossPct)
+            return String(format: "High download packet loss (%.0f%%). The Wi-Fi link is the bottleneck — lower the streaming quality or use Ethernet.", r.downloadLossPct)
         }
         if r.downloadMbps < 25 {
             return String(format: "Link is ~%.0f Mbps — below comfortable streaming headroom, so lag is bandwidth-bound. Lower quality or go wired.", r.downloadMbps)
         }
-        return String(format: "Link is ~%.0f Mbps with low loss — bandwidth is fine. If streaming is still laggy, the bottleneck is buffering/pipeline, not the network.", r.downloadMbps)
+        if r.uploadLossPct > 8 {
+            return String(format: "Download is clean (~%.0f Mbps), but the uplink drops %.0f%% under a burst. That matters when this Mac is the host: bursty keyframes will shed packets. Pacing/lower bitrate on the host side helps more than raw bandwidth.", r.downloadMbps, r.uploadLossPct)
+        }
+        return String(format: "Link is ~%.0f Mbps with low loss both ways — bandwidth is fine. If streaming is still laggy, the bottleneck is buffering/pipeline, not the network.", r.downloadMbps)
     }
 
     private func runSpeedTest() {
