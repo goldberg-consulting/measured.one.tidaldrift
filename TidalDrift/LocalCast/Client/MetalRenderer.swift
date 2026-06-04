@@ -10,16 +10,42 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     private let commandQueue: MTLCommandQueue
     private var pipelineState: MTLRenderPipelineState?
     
-    private var currentTexture: MTLTexture?
-    // The MTLTexture is backed by the CVImageBuffer's IOSurface via the texture
-    // cache. We must keep strong references to both the CVMetalTexture wrapper
-    // and the source CVImageBuffer for as long as the texture is in use, or
-    // VideoToolbox recycles that IOSurface for a later frame and the GPU samples
-    // a buffer being overwritten — visible as tearing/shear, worst during rapid
-    // small updates like typing.
-    private var currentCVTexture: CVMetalTexture?
-    private var currentPixelBuffer: CVImageBuffer?
     private var textureCache: CVMetalTextureCache?
+
+    /// A decoded frame plus the references that keep its IOSurface alive. The
+    /// MTLTexture is backed by the CVImageBuffer via the texture cache, so we
+    /// must retain both the CVMetalTexture wrapper and the source buffer for as
+    /// long as the texture is in use, or VideoToolbox recycles that IOSurface
+    /// for a later frame and the GPU samples a buffer being overwritten (tearing).
+    private struct DecodedFrame {
+        let texture: MTLTexture
+        let cvTexture: CVMetalTexture
+        let pixelBuffer: CVImageBuffer
+        let width: Int
+        let height: Int
+    }
+
+    // MARK: - Adaptive jitter buffer
+    //
+    // Frames arrive in clumps (the link's ±30-40 ms jitter), so presenting each
+    // one the instant it decodes makes motion play back unevenly even when no
+    // frame is lost. We queue decoded frames and release them on a steady,
+    // time-based cadence (the measured source interval), decoupled from both
+    // bursty arrival and the display refresh rate. The buffer depth adapts to
+    // measured jitter: deeper when the link is jittery, ~1 frame when it's
+    // clean, so we add only as much latency as smoothness requires.
+    private let frameQueueLock = NSLock()
+    private var frameQueue: [DecodedFrame] = []
+    private var lastPresentedFrame: DecodedFrame?
+    private var primed = false
+    private var lastPresentTime: CFTimeInterval = 0
+
+    private var lastArrival: CFTimeInterval = 0
+    private var arrivalIntervalEWMA: Double = 1.0 / 60.0  // est. source frame interval
+    private var jitterEWMA: Double = 0
+    private var targetDepth = 2
+    private let minDepth = 1
+    private let maxDepth = 6
     private var vertices: MTLBuffer?
     private var texCoords: MTLBuffer?
     
@@ -128,10 +154,11 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         
         mtkView.device = device
         mtkView.delegate = self
-        // Draw-on-demand: only redraw when we call setNeedsDisplay after
-        // receiving a new decoded frame. Saves GPU when idle / between streams.
-        mtkView.isPaused = true
-        mtkView.enableSetNeedsDisplay = true
+        // Display-linked: draw at the display cadence and release one buffered
+        // frame per measured source interval. The jitter buffer needs a steady
+        // tick to pace against, so we cannot use draw-on-demand here.
+        mtkView.isPaused = false
+        mtkView.enableSetNeedsDisplay = false
         mtkView.preferredFramesPerSecond = 60
         mtkView.framebufferOnly = false  // Allow texture sampling
         
@@ -198,15 +225,6 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         let width = CVPixelBufferGetWidth(imageBuffer)
         let height = CVPixelBufferGetHeight(imageBuffer)
         
-        // Track source resolution and update aspect ratio if changed
-        if width != sourceWidth || height != sourceHeight {
-            sourceWidth = width
-            sourceHeight = height
-            lastDrawableSize = .zero  // Force vertex recalculation
-            updateVertexBufferForAspectRatio()
-            logger.info("🖥️ MetalRenderer: Source resolution changed to \(width)x\(height)")
-        }
-        
         // Get pixel format
         let pixelFormat = CVPixelBufferGetPixelFormatType(imageBuffer)
         let mtlPixelFormat: MTLPixelFormat
@@ -237,34 +255,51 @@ class MetalRenderer: NSObject, MTKViewDelegate {
             &cvTexture
         )
         
-        if status == kCVReturnSuccess, let texture = cvTexture {
-            // Retain the wrapper and backing buffer so their IOSurface isn't
-            // recycled while this texture is the displayed frame.
-            currentCVTexture = texture
-            currentPixelBuffer = imageBuffer
-            currentTexture = CVMetalTextureGetTexture(texture)
-            
-            frameCount += 1
-            if !hasLoggedSuccess {
-                logger.info("🖥️ MetalRenderer: First frame received! \(width)x\(height)")
-                hasLoggedSuccess = true
-            }
-            if frameCount % 60 == 0 {
-                logger.info("🖥️ MetalRenderer: Rendered \(self.frameCount) frames")
-            }
-            
-            // Flush stale textures every 120 frames (~2 seconds at 60fps)
-            // to prevent GPU memory from growing on long sessions.
-            if frameCount % 120 == 0, let cache = textureCache {
-                CVMetalTextureCacheFlush(cache, 0)
-            }
-            
-            // Tell the MTKView it needs to redraw (draw-on-demand mode).
-            DispatchQueue.main.async {
-                self.mtkView.needsDisplay = true
-            }
-        } else {
+        guard status == kCVReturnSuccess, let cvTex = cvTexture,
+              let mtlTexture = CVMetalTextureGetTexture(cvTex) else {
             logger.error("🖥️ MetalRenderer: Failed to create Metal texture: \(status)")
+            return
+        }
+
+        let frame = DecodedFrame(
+            texture: mtlTexture,
+            cvTexture: cvTex,
+            pixelBuffer: imageBuffer,
+            width: width,
+            height: height
+        )
+
+        // Adapt the buffer depth to measured arrival jitter: depth grows with
+        // (jitter / frame interval) so a jittery link gets enough cushion, while
+        // a clean link stays near one frame of latency.
+        let now = CACurrentMediaTime()
+        if lastArrival > 0 {
+            let interval = now - lastArrival
+            let a = 0.1
+            let dev = abs(interval - arrivalIntervalEWMA)
+            arrivalIntervalEWMA = (1 - a) * arrivalIntervalEWMA + a * interval
+            jitterEWMA = (1 - a) * jitterEWMA + a * dev
+            let fi = max(arrivalIntervalEWMA, 1.0 / 120.0)
+            targetDepth = min(maxDepth, max(minDepth, Int((jitterEWMA / fi).rounded()) + 1))
+        }
+        lastArrival = now
+
+        frameQueueLock.lock()
+        frameQueue.append(frame)
+        // Drop-to-newest if the queue outgrows the cap (we're behind).
+        if frameQueue.count > maxDepth {
+            frameQueue.removeFirst(frameQueue.count - maxDepth)
+        }
+        frameQueueLock.unlock()
+
+        frameCount += 1
+        if !hasLoggedSuccess {
+            logger.info("🖥️ MetalRenderer: First frame received! \(width)x\(height)")
+            hasLoggedSuccess = true
+        }
+        if frameCount % 120 == 0, let cache = textureCache {
+            // Flush stale cache entries periodically to bound GPU memory.
+            CVMetalTextureCacheFlush(cache, 0)
         }
     }
     
@@ -279,13 +314,45 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     }
     
     func draw(in view: MTKView) {
-        guard let pipelineState = pipelineState,
-              let texture = currentTexture,
+        guard let pipelineState = pipelineState else { return }
+
+        // Pacing: release one buffered frame per measured source interval, after
+        // priming to the adaptive target depth. Between releases (or on underrun)
+        // re-present the last frame so the display tick always has content.
+        let now = CACurrentMediaTime()
+        frameQueueLock.lock()
+        if !primed, frameQueue.count >= targetDepth {
+            primed = true
+        }
+        if primed {
+            let interval = max(arrivalIntervalEWMA, 1.0 / 120.0)
+            let due = (now - lastPresentTime) >= interval * 0.85
+            if due {
+                if frameQueue.isEmpty {
+                    primed = false  // underrun: re-buffer before resuming
+                } else {
+                    lastPresentedFrame = frameQueue.removeFirst()
+                    lastPresentTime = now
+                }
+            }
+        }
+        let frame = lastPresentedFrame
+        frameQueueLock.unlock()
+
+        guard let frame = frame,
               let drawable = view.currentDrawable,
               let renderPassDescriptor = view.currentRenderPassDescriptor else {
             return
         }
-        
+
+        // Update aspect ratio if the source resolution changed.
+        if frame.width != sourceWidth || frame.height != sourceHeight {
+            sourceWidth = frame.width
+            sourceHeight = frame.height
+            lastDrawableSize = .zero
+            updateVertexBufferForAspectRatio(viewSize: view.drawableSize)
+            logger.info("🖥️ MetalRenderer: Source resolution changed to \(frame.width)x\(frame.height)")
+        }
         // Catch any missed resize events (full-screen transitions, etc.)
         let currentSize = view.drawableSize
         if currentSize != lastDrawableSize {
@@ -308,21 +375,15 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         renderEncoder.setRenderPipelineState(pipelineState)
         renderEncoder.setVertexBuffer(vertices, offset: 0, index: 0)
         renderEncoder.setVertexBuffer(texCoords, offset: 0, index: 1)
-        renderEncoder.setFragmentTexture(texture, index: 0)
+        renderEncoder.setFragmentTexture(frame.texture, index: 0)
         
         renderEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         
         renderEncoder.endEncoding()
 
-        // Keep the sampled buffer/texture alive until the GPU finishes this draw,
-        // even if a newer frame replaces `current*` mid-flight, so the surface
-        // can't be recycled and overwritten while it is being read.
-        let drawnCVTexture = currentCVTexture
-        let drawnPixelBuffer = currentPixelBuffer
-        commandBuffer.addCompletedHandler { _ in
-            _ = drawnCVTexture
-            _ = drawnPixelBuffer
-        }
+        // Keep the sampled frame alive until the GPU finishes this draw, so its
+        // IOSurface can't be recycled and overwritten mid-read.
+        commandBuffer.addCompletedHandler { _ in _ = frame }
 
         commandBuffer.present(drawable)
         commandBuffer.commit()
