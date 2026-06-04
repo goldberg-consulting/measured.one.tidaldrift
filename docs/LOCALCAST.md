@@ -89,13 +89,47 @@ immediately, so pacing adds no latency where it isn't needed. This targets the
 ~13% burst loss directly. Constants live at the top of `UDPTransport` for tuning
 against speed-test numbers.
 
-### Plan
+### Fix 2: loss resilience bundle (1.6.17)
+
+A symptom report crystallised the remaining problem: when dragging, interim
+frames vanish (low effective fps) while still frames are crisp. Cause: a motion
+frame is a large delta of 100+ fragments, and with no FEC/retransmit one lost
+fragment kills the whole frame. Static frames are a few fragments and almost
+always arrive; motion frames frequently lose one and are dropped. (macOS Screen
+Sharing makes the opposite trade: it softens during motion to hold frame rate.)
+
+Four complementary changes, each individually toggleable in Metal Streaming
+settings:
+
+- **Adaptive bitrate (`localCastAdaptive`, host).** The client requests a
+  keyframe on every abandoned-incomplete frame; the host treats clustered
+  requests as congestion and runs AIMD on the encoder bitrate
+  (`adaptiveScale`, ×0.8 down rate-limited, +0.1 up after a quiet period, floor
+  25%). Motion frames shrink enough to survive, then quality restores. A
+  post-connect grace window ignores the connect-time keyframe requests.
+- **Drop-to-newest (`localCastDropToNewest`, client).** Reassembly abandons
+  frames that fall behind the newest by more than `inFlightFrameWindow` instead
+  of buffering a long backlog, and ignores stragglers for abandoned frames.
+- **Loss-triggered recovery (`localCastLossRecovery`, client).** An abandoned
+  incomplete frame fires `udpTransportDidLoseFrames`; the client requests a
+  keyframe (rate-limited to 1/300 ms) so the picture heals in ~1 RTT instead of
+  waiting for the scheduled IDR.
+- **Shorter keyframe interval (4 s → 1.5 s, host).** Bounds worst-case recovery;
+  pacing keeps the more frequent keyframes from re-introducing burst loss.
+
+### Resolution control (1.6.17)
+
+`LocalCastConfiguration.maxDimensionOverride` (UI: "Streaming resolution",
+`localCastMaxDimension`) caps the captured frame's longest edge, aspect ratio
+preserved. `0` = Native, which streams the full panel resolution including
+ultrawide (5120x1440). Options: Native / 720p / 1080p / 1440p / 4K / Ultrawide.
+
+### Plan (remaining)
 
 - Reduce `queueDepth` (done: 5 → 3) to trim worst-case buffering.
-- **Next: client-side drop-to-newest** so a backlog self-corrects.
-- Lower the default bitrate / wire up real adaptive bitrate that backs off under
-  loss (the `adaptiveQuality` flag is not yet acted on).
 - Consider FEC or selective retransmit for keyframes on lossy links.
+- Separate the input/heartbeat channel from video to avoid head-of-line
+  blocking under a video burst.
 
 ### Calibration
 

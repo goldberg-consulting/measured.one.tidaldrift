@@ -8,6 +8,9 @@ struct LocalCastSettingsView: View {
     @AppStorage("localCastAutoHost") var autoHost = false
     @AppStorage("localCastRequireAuth") var requireAuth = true
     @AppStorage("localCastInputRateLimit") var inputRateLimit = 120
+    @AppStorage("localCastMaxDimension") var maxDimension = 0
+    @AppStorage("localCastDropToNewest") var dropToNewest = true
+    @AppStorage("localCastLossRecovery") var lossRecovery = true
     
     @State private var hostPassword = ""
     
@@ -100,7 +103,36 @@ struct LocalCastSettingsView: View {
                         .help("Automatically start hosting when TidalDrift launches")
                 }
                 .padding(.leading, 8)
-                
+
+                Divider()
+
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Resolution & Resilience")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+
+                    Picker("Streaming resolution", selection: $maxDimension) {
+                        ForEach(LocalCastConfiguration.captureDimensionOptions, id: \.value) { option in
+                            Text(option.label).tag(option.value)
+                        }
+                    }
+                    .help("Caps the captured frame's longest edge (aspect ratio preserved). Native streams the full panel resolution, including ultrawide (5120x1440). Applies to the next session.")
+
+                    Toggle("Adaptive bitrate", isOn: $adaptiveQuality)
+                        .help("Automatically lowers bitrate when the link drops packets so motion (e.g. dragging) stays smooth, then restores quality when it clears. Host-side; applies to the next session.")
+
+                    Toggle("Drop to newest frame", isOn: $dropToNewest)
+                        .help("Skip stale/incomplete frames instead of playing through a backlog. Client-side; applies to the next connection.")
+
+                    Toggle("Loss-triggered recovery", isOn: $lossRecovery)
+                        .help("Request a fresh keyframe immediately when a frame is lost, so the picture heals in ~1 round trip instead of waiting for the next scheduled keyframe. Client-side; applies to the next connection.")
+
+                    Text("On lossy Wi-Fi these keep motion smooth and recover quickly. On a clean wired link they have little effect. Turn them off to force fixed-bitrate, play-everything behavior.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                .padding(.leading, 8)
+
                 Divider()
                 
                 VStack(alignment: .leading, spacing: 12) {

@@ -79,8 +79,13 @@ class VideoEncoder {
         // High profile gives better quality per bit than Main at the same bitrate
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel, value: codec == .hevc ? kVTProfileLevel_HEVC_Main_AutoLevel : kVTProfileLevel_H264_High_AutoLevel)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: 4.0 as CFNumber)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: (fps * 4) as CFNumber)
+        // Shorter keyframe interval: on a lossy link a dropped frame corrupts the
+        // stream until the next IDR, so a 4 s interval meant up to 4 s of freeze.
+        // 1.5 s bounds worst-case recovery; paced sends keep the more frequent
+        // keyframes from re-introducing burst loss.
+        let keyframeIntervalSeconds = 1.5
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: keyframeIntervalSeconds as CFNumber)
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: Int(Double(fps) * keyframeIntervalSeconds) as CFNumber)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_Quality, value: quality as CFNumber)
         
         // Low-latency tuning: emit each frame immediately instead of buffering

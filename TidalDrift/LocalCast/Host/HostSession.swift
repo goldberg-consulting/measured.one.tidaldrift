@@ -83,6 +83,25 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     private var captureActive = false
     private let captureStateLock = NSLock()
 
+    // MARK: - Adaptive bitrate (AIMD on client loss signals)
+    //
+    // The client requests a keyframe whenever reassembly abandons an incomplete
+    // frame (a lost fragment). Clustered keyframe requests are a congestion
+    // signal: we multiplicatively shrink the encoder bitrate so motion frames
+    // become small enough to survive the link (the cause of "no interim frames
+    // while dragging"), then additively restore toward the configured target
+    // after a quiet period. Gated by `configuration.adaptiveQuality`.
+    private var adaptiveScale: Double = 1.0
+    private var lastAdaptiveDecrease = Date.distantPast
+    private var adaptiveGraceUntil = Date.distantPast
+    private var adaptiveRecoveryTimer: DispatchSourceTimer?
+    private let adaptiveQueue = DispatchQueue(label: "com.tidaldrift.localcast.adaptive")
+    private static let adaptiveMinScale = 0.25
+    private static let adaptiveDecreaseFactor = 0.8
+    private static let adaptiveIncreaseStep = 0.1
+    private static let adaptiveDecreaseCooldown: TimeInterval = 0.5
+    private static let adaptiveRecoveryQuiet: TimeInterval = 2.5
+
     /// Run `body` while holding the capture-state lock. Synchronous generic so
     /// it is callable from async contexts (stop, stream-request handling)
     /// without the "NSLock used from async context" warning; the lock is never
@@ -362,6 +381,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         guard isRunning else { return }
 
         withCaptureState { captureActive = false }
+        resetAdaptiveBitrate()
 
         await captureManager.stopCapture()
         encoder.invalidate()
@@ -467,7 +487,73 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         lastClientPacketAt = Date()
         if isNewClient {
             hasSentFirstVideoPacket = false
+            // Fresh viewer: reset adaptation and ignore the connect-time keyframe
+            // requests (which aren't loss) for a short grace window.
+            resetAdaptiveBitrate()
+            adaptiveGraceUntil = Date().addingTimeInterval(4)
             logger.info("👤 Active viewer → \(String(describing: endpoint)) (loopback: \(self.isLoopbackConnection))")
+        }
+    }
+
+    // MARK: - Adaptive bitrate control
+
+    /// Treat a client keyframe request as a congestion signal and step the
+    /// encoder bitrate down (rate-limited), scheduling recovery once the link
+    /// goes quiet. No-op during the post-connect grace window or when adaptation
+    /// is disabled.
+    private func noteClientLossSignal() {
+        guard configuration.adaptiveQuality else { return }
+        let now = Date()
+        guard now >= adaptiveGraceUntil else { return }
+
+        // Confine all adaptive-state mutation to adaptiveQueue (also where the
+        // recovery timer fires) so there is no cross-queue race on the scale.
+        adaptiveQueue.async { [weak self] in
+            guard let self else { return }
+            if now.timeIntervalSince(self.lastAdaptiveDecrease) >= Self.adaptiveDecreaseCooldown,
+               self.adaptiveScale > Self.adaptiveMinScale {
+                self.adaptiveScale = max(Self.adaptiveMinScale, self.adaptiveScale * Self.adaptiveDecreaseFactor)
+                self.lastAdaptiveDecrease = now
+                self.applyAdaptiveBitrate()
+                self.logger.info("📉 Adaptive bitrate down: scale=\(String(format: "%.2f", self.adaptiveScale))")
+            }
+            self.scheduleAdaptiveRecovery()
+        }
+    }
+
+    /// Must be called on `adaptiveQueue`.
+    private func applyAdaptiveBitrate() {
+        let target = configuration.bitrateMbps
+        let scaled = max(Int(Double(target) * adaptiveScale), Int(Double(target) * Self.adaptiveMinScale))
+        encoder.updateLiveParameters(bitrateMbps: scaled)
+    }
+
+    /// After a quiet period (no loss signals), step the bitrate back up one
+    /// additive increment toward the target, rescheduling until fully restored.
+    /// Must be called on `adaptiveQueue`.
+    private func scheduleAdaptiveRecovery() {
+        adaptiveRecoveryTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: adaptiveQueue)
+        timer.schedule(deadline: .now() + Self.adaptiveRecoveryQuiet)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            guard self.adaptiveScale < 1.0 else { return }
+            self.adaptiveScale = min(1.0, self.adaptiveScale + Self.adaptiveIncreaseStep)
+            self.applyAdaptiveBitrate()
+            self.logger.info("📈 Adaptive bitrate up: scale=\(String(format: "%.2f", self.adaptiveScale))")
+            if self.adaptiveScale < 1.0 { self.scheduleAdaptiveRecovery() }
+        }
+        timer.resume()
+        adaptiveRecoveryTimer = timer
+    }
+
+    private func resetAdaptiveBitrate() {
+        adaptiveQueue.async { [weak self] in
+            guard let self else { return }
+            self.adaptiveRecoveryTimer?.cancel()
+            self.adaptiveRecoveryTimer = nil
+            self.adaptiveScale = 1.0
+            self.lastAdaptiveDecrease = .distantPast
         }
     }
 
@@ -629,6 +715,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             logger.info("🔑 LocalCast: Received keyframe request from client")
             lcDebug("🔑 HostSession: Received keyframe request")
             encoder.forceKeyFrame()
+            noteClientLossSignal()
 
         case .appListRequest:
             // Client wants to know what apps are available to stream
