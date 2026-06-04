@@ -216,7 +216,7 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
         config.width = width
         config.height = height
         config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(frameRate))
-        config.queueDepth = 5  // Enough frames queued for consistent 60 FPS delivery
+        config.queueDepth = 3  // Lower buffering for latency; still enough to absorb jitter
         config.pixelFormat = kCVPixelFormatType_32BGRA
         config.colorSpaceName = CGColorSpace.sRGB
         config.showsCursor = true
