@@ -98,6 +98,18 @@ class UDPTransport {
     // At 1390 bytes/fragment, a 5 MB frame needs ~3,600 fragments.
     private let maxTotalFragments: UInt16 = 5000  // ~7 MB max per frame
     private let maxBufferedFrames = 120           // Allow more in-flight frames for high-throughput
+
+    // Paced fragment sending.
+    // A keyframe is hundreds of fragments. Handing them all to the network
+    // stack in one tight loop overruns the Wi-Fi uplink, which sheds ~13% of
+    // the burst (measured) — and losing a single fragment makes the whole
+    // frame undecodable, since there is no FEC or retransmit. Draining large
+    // frames in small bursts with a short gap keeps the in-flight queue under
+    // the uplink's instantaneous capacity and largely removes that loss.
+    private let pacingFragmentThreshold = 12   // frames at/below this go out unpaced
+    private let pacingBatchSize = 16           // fragments per paced burst
+    private let pacingGapMicros = 700          // gap between bursts (~256 Mbps ceiling)
+    private let paceQueue = DispatchQueue(label: "com.tidaldrift.localcast.sendpace", qos: .userInteractive)
     
     var localPort: UInt16? {
         listener?.port?.rawValue
@@ -251,6 +263,8 @@ class UDPTransport {
         let payloadSize = maxPayloadSize - FragmentHeader.size
         let totalFragments = UInt16((data.count + payloadSize - 1) / payloadSize)
         
+        var fragments: [Data] = []
+        fragments.reserveCapacity(Int(totalFragments))
         for i in 0..<Int(totalFragments) {
             let start = i * payloadSize
             let end = min(start + payloadSize, data.count)
@@ -266,17 +280,52 @@ class UDPTransport {
             var fragmentData = Data()
             fragmentData.append(header.serialize())
             fragmentData.append(fragmentPayload)
-            
-            connection.send(content: fragmentData, completion: .contentProcessed { [weak self] error in
-                if let error = error {
-                    self?.logger.error("UDP fragment send error: \(error.localizedDescription)")
-                }
-            })
+            fragments.append(fragmentData)
         }
         
-        if totalFragments > 1 {
-            logger.debug("Sent \(totalFragments) fragments for frame \(frameId) (\(data.count) bytes)")
+        // Small frames go out immediately; pacing them would only add latency
+        // and they are too small to overrun the uplink.
+        if totalFragments <= pacingFragmentThreshold {
+            for fragment in fragments {
+                connection.send(content: fragment, completion: .contentProcessed { [weak self] error in
+                    if let error = error {
+                        self?.logger.error("UDP fragment send error: \(error.localizedDescription)")
+                    }
+                })
+            }
+            return
         }
+        
+        // Large frames: drain in small bursts so the uplink isn't overrun.
+        paceFragments(fragments, on: connection, frameId: frameId)
+    }
+    
+    /// Drain a frame's fragments in small bursts separated by a short gap,
+    /// keeping the instantaneous send rate under the uplink's capacity so the
+    /// burst isn't partially dropped. Runs on `paceQueue` off the encoder's
+    /// callback queue.
+    private func paceFragments(_ fragments: [Data], on connection: NWConnection, frameId: UInt32) {
+        let total = fragments.count
+        let batchSize = pacingBatchSize
+        let gap = DispatchTimeInterval.microseconds(pacingGapMicros)
+        
+        func drain(from start: Int) {
+            let end = min(start + batchSize, total)
+            for i in start..<end {
+                connection.send(content: fragments[i], completion: .contentProcessed { [weak self] error in
+                    if let error = error {
+                        self?.logger.error("UDP fragment send error: \(error.localizedDescription)")
+                    }
+                })
+            }
+            if end < total {
+                paceQueue.asyncAfter(deadline: .now() + gap) { drain(from: end) }
+            } else {
+                logger.debug("Paced \(total) fragments for frame \(frameId)")
+            }
+        }
+        
+        paceQueue.async { drain(from: 0) }
     }
     
     func send(packet: LocalCastPacket, to endpoint: NWEndpoint) {

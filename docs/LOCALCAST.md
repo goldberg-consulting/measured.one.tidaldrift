@@ -49,28 +49,52 @@ relative to the video. The host maps them with `InputInjector`:
 or `CGDisplayBounds(CGMainDisplayID())` for full desktop. Both are top-left
 origin, matching `CGEvent`.
 
+## Diagnosing the link: peer speed test (1.6.14)
+
+Device Details has a **Network Speed Test** (UDP/IPv4, same family as the
+stream) that reports RTT/jitter, down/up throughput, and **packet loss** in each
+direction. Loss is the metric that matters: UDP has no retransmit, so a lossy
+direction breaks frames regardless of raw Mbps.
+
+Measured Air ↔ Pro on Wi-Fi (1.6.15): download 746 Mbps / 0% loss, but a
+saturating **upload burst shed ~13%** of its packets at 349 Mbps. Bandwidth is
+not the constraint; **burst loss on the host's uplink** is. That directly
+implicates keyframe sends, which are exactly such bursts.
+
 ## Latency: where it comes from
 
 Latency is dominated by the **link and the transport**, not the GPU:
 
-1. **Wi-Fi bandwidth vs bitrate.** Even the "Balanced" preset is ~30 Mbps over
-   **UDP with no congestion control**. On Wi-Fi this oversubscribes the link,
-   adding queuing delay and packet loss.
-2. **Fragmentation is loss-fragile.** Each frame is split into many UDP packets
-   with **no FEC and no retransmit**, so losing any one fragment drops the whole
-   frame and the client waits for the next keyframe. On lossy Wi-Fi this reads
-   as stutter, not just delay.
+1. **Burst loss on big frames.** A keyframe is hundreds of UDP fragments. Handed
+   to the stack in one tight loop, they overrun the Wi-Fi uplink and ~13% are
+   dropped (measured). With no FEC/retransmit, losing one fragment makes the
+   whole frame undecodable and the client stalls to the next keyframe. **Fixed
+   in 1.6.16** (see below).
+2. **Wi-Fi bandwidth vs bitrate.** Bitrate above the link's comfortable rate
+   over **UDP with no congestion control** adds queuing delay and loss. (On the
+   tested LAN there is ample bandwidth; this is secondary.)
 3. **Capture buffering.** `SCStreamConfiguration.queueDepth` adds buffered
    frames ahead of the encoder.
 4. **No client catch-up.** The client does not skip to the newest frame when it
    falls behind.
 
+### Fix 1: paced fragment sending (1.6.16)
+
+`UDPTransport.sendFragmented` no longer dumps every fragment of a large frame
+into the stack at once. Frames above a small threshold are drained on a
+dedicated queue in bursts of `pacingBatchSize` separated by `pacingGapMicros`,
+keeping the instantaneous send rate (~256 Mbps ceiling) under the uplink's
+capacity. Small frames (≤ `pacingFragmentThreshold` fragments) still send
+immediately, so pacing adds no latency where it isn't needed. This targets the
+~13% burst loss directly. Constants live at the top of `UDPTransport` for tuning
+against speed-test numbers.
+
 ### Plan
 
 - Reduce `queueDepth` (done: 5 → 3) to trim worst-case buffering.
+- **Next: client-side drop-to-newest** so a backlog self-corrects.
 - Lower the default bitrate / wire up real adaptive bitrate that backs off under
   loss (the `adaptiveQuality` flag is not yet acted on).
-- Add client-side drop-to-newest so a backlog self-corrects.
 - Consider FEC or selective retransmit for keyframes on lossy links.
 
 ### Calibration
