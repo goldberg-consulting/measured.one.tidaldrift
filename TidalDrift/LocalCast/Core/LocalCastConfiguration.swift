@@ -21,6 +21,12 @@ struct LocalCastConfiguration: Codable {
     var showLatencyOverlay: Bool = false
     var captureCursor: Bool = true
     var captureAudio: Bool = false  // Future
+
+    /// User override for the capture's longest-edge dimension in pixels. 0 means
+    /// "use the preset default". A value at/above the display's longest edge
+    /// captures at native resolution, which is what large/ultrawide panels
+    /// (e.g. 5120x1440) need. Aspect ratio is always preserved.
+    var maxDimensionOverride: Int = 0
     
     // Security
     var requireAuthentication: Bool = true
@@ -40,9 +46,11 @@ struct LocalCastConfiguration: Codable {
         qualityPreset == .low ? 0.75 : 1.0
     }
     
-    /// Maximum capture dimension (longest edge). Higher quality presets allow
-    /// larger captures to preserve detail on high-DPI / large displays.
+    /// Maximum capture dimension (longest edge). A user override (if set) wins;
+    /// otherwise higher quality presets allow larger captures to preserve detail
+    /// on high-DPI / large displays.
     var maxCaptureDimension: Int {
+        if maxDimensionOverride > 0 { return maxDimensionOverride }
         switch qualityPreset {
         case .ultra: return 3840    // Up to 4K
         case .high: return 2560     // Up to 1440p
@@ -50,6 +58,18 @@ struct LocalCastConfiguration: Codable {
         case .low: return 1280      // 720p
         }
     }
+
+    /// Resolution-cap choices for the streaming-resolution picker. `0` = Native
+    /// (no cap, full panel resolution incl. ultrawide). Aspect ratio is always
+    /// preserved; the value caps the longest edge.
+    static let captureDimensionOptions: [(label: String, value: Int)] = [
+        ("Native", 0),
+        ("720p (1280)", 1280),
+        ("1080p (1920)", 1920),
+        ("1440p (2560)", 2560),
+        ("4K (3840)", 3840),
+        ("Ultrawide (5120)", 5120),
+    ]
     
     /// Encoder quality hint passed to VTCompressionSession (0.0 = min, 1.0 = lossless).
     var encoderQuality: Float {

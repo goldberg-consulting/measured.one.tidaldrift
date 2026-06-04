@@ -418,6 +418,22 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         logger.info("Requested keyframe from host")
     }
 
+    /// Loss-triggered recovery. When reassembly abandons an incomplete frame,
+    /// ask the host for a keyframe so the picture heals in ~1 RTT instead of
+    /// waiting for the scheduled IDR. Rate-limited so a burst of losses can't
+    /// storm the host (which would worsen the congestion that caused them).
+    private let lossRecoveryEnabled = UserDefaults.standard.object(forKey: "localCastLossRecovery") as? Bool ?? true
+    private var lastLossKeyframeRequest = Date.distantPast
+    private static let lossKeyframeMinInterval: TimeInterval = 0.3
+
+    func udpTransportDidLoseFrames(_ transport: UDPTransport) {
+        guard lossRecoveryEnabled, isConnected else { return }
+        let now = Date()
+        guard now.timeIntervalSince(lastLossKeyframeRequest) >= Self.lossKeyframeMinInterval else { return }
+        lastLossKeyframeRequest = now
+        requestKeyFrame()
+    }
+
     // MARK: - Remote App Streaming
 
     private static let appListTimeoutSeconds: TimeInterval = 8

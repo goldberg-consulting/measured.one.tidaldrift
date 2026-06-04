@@ -184,6 +184,8 @@ class LocalCastService: ObservableObject {
         let defaults = UserDefaults.standard
         configuration.requireAuthentication = defaults.object(forKey: "localCastRequireAuth") as? Bool ?? true
         configuration.inputRateLimit = defaults.object(forKey: "localCastInputRateLimit") as? Int ?? 120
+        configuration.adaptiveQuality = defaults.object(forKey: "localCastAdaptive") as? Bool ?? true
+        configuration.maxDimensionOverride = defaults.object(forKey: "localCastMaxDimension") as? Int ?? 0
 
         // Read the host password for auth (Keychain first, legacy UserDefaults fallback)
         let hostPassword: String?

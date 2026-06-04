@@ -21,10 +21,15 @@ func lcDebug(_ message: @autoclosure () -> String) {
 protocol UDPTransportDelegate: AnyObject {
     func udpTransport(_ transport: UDPTransport, didReceivePacket packet: LocalCastPacket, from endpoint: NWEndpoint)
     func udpTransport(_ transport: UDPTransport, clientDidConnect endpoint: NWEndpoint, connection: NWConnection)
+    /// Called when reassembly abandons one or more incomplete frames because a
+    /// newer frame superseded them (i.e. at least one fragment was lost). The
+    /// receiver can use this to request recovery (e.g. a keyframe).
+    func udpTransportDidLoseFrames(_ transport: UDPTransport)
 }
 
 extension UDPTransportDelegate {
     func udpTransport(_ transport: UDPTransport, clientDidConnect endpoint: NWEndpoint, connection: NWConnection) {}
+    func udpTransportDidLoseFrames(_ transport: UDPTransport) {}
 }
 
 // Fragment header for large packets
@@ -92,6 +97,15 @@ class UDPTransport {
     private var fragmentCounts: [UInt32: UInt16] = [:] // frameId -> totalFragments
     private let fragmentLock = NSLock()
     private var oldestBufferedFrameId: UInt32 = 0
+
+    // Drop-to-newest reassembly. The sender's frameId increments per frame, so a
+    // frame still missing fragments once newer frames are arriving will never
+    // complete. Rather than buffer a long backlog (latency) or wait out the
+    // straggler, abandon frames that fall behind the newest by more than this
+    // window and treat any abandoned-incomplete frame as a loss.
+    var dropToNewestEnabled = UserDefaults.standard.object(forKey: "localCastDropToNewest") as? Bool ?? true
+    private var highestFrameId: UInt32 = 0
+    private let inFlightFrameWindow: UInt32 = 4
     
     // Safety limits for fragment reassembly
     // Quality-focused encoding at 4K can produce keyframes of 2-5 MB.
@@ -472,13 +486,42 @@ class UDPTransport {
             return
         }
         
+        // Drop-to-newest: once a frame falls behind the newest by more than the
+        // in-flight window, a late fragment for it is useless (its siblings were
+        // pruned), so ignore it instead of resurrecting a dead buffer.
+        if dropToNewestEnabled,
+           highestFrameId > inFlightFrameWindow,
+           header.frameId < highestFrameId - inFlightFrameWindow {
+            fragmentLock.unlock()
+            return
+        }
+
         // Initialize buffer for this frame if needed
         if fragmentBuffers[header.frameId] == nil {
             fragmentBuffers[header.frameId] = [:]
             fragmentCounts[header.frameId] = header.totalFragments
-            
+        }
+
+        if header.frameId > highestFrameId {
+            highestFrameId = header.frameId
+        }
+
+        // Store this fragment
+        fragmentBuffers[header.frameId]?[header.fragmentIndex] = Data(payload)
+
+        // Prune frames that fell behind the newest. Any pruned frame that never
+        // completed is a lost frame worth signalling for recovery.
+        var lostIncomplete = false
+        if dropToNewestEnabled, highestFrameId > inFlightFrameWindow {
+            let cutoff = highestFrameId - inFlightFrameWindow
+            for (fid, frags) in fragmentBuffers where fid < cutoff {
+                if frags.count < Int(fragmentCounts[fid] ?? 0) { lostIncomplete = true }
+                fragmentBuffers.removeValue(forKey: fid)
+                fragmentCounts.removeValue(forKey: fid)
+            }
+        } else {
+            // Drop-to-newest off: fall back to the original bounded-buffer eviction.
             if oldestBufferedFrameId == 0 { oldestBufferedFrameId = header.frameId }
-            
             while fragmentBuffers.count > maxBufferedFrames {
                 fragmentBuffers.removeValue(forKey: oldestBufferedFrameId)
                 fragmentCounts.removeValue(forKey: oldestBufferedFrameId)
@@ -488,9 +531,6 @@ class UDPTransport {
                 }
             }
         }
-        
-        // Store this fragment
-        fragmentBuffers[header.frameId]?[header.fragmentIndex] = Data(payload)
         
         // Check if we have all fragments
         let received = fragmentBuffers[header.frameId]?.count ?? 0
@@ -517,6 +557,10 @@ class UDPTransport {
             }
         } else {
             fragmentLock.unlock()
+        }
+
+        if lostIncomplete {
+            delegate?.udpTransportDidLoseFrames(self)
         }
     }
     
