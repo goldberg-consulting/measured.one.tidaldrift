@@ -681,6 +681,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             )
             TidalDriftPeerService.shared.startAdvertising()
             TidalDriftPeerService.shared.startDiscovery()
+            SpeedTestService.shared.startResponder()
             _ = TidalDropService.shared
 
             if UserDefaults.standard.bool(forKey: "localCastAutoHost") {

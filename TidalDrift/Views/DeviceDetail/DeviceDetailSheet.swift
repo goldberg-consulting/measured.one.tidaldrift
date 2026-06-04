@@ -11,6 +11,10 @@ struct DeviceDetailSheet: View {
     @State private var wakeResult: WakeResult?
     @State private var isDiscoveringMAC = false
 
+    // Speed test state
+    @State private var isRunningSpeedTest = false
+    @State private var speedTestResult: SpeedTestService.Result?
+
     enum WakeResult {
         case success
         case failed
@@ -33,6 +37,8 @@ struct DeviceDetailSheet: View {
                     connectionSection
 
                     wakeOnLANSection
+
+                    speedTestSection
 
                     servicesSection
 
@@ -383,6 +389,96 @@ struct DeviceDetailSheet: View {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
                     wakeResult = nil
                 }
+            }
+        }
+    }
+
+    private var speedTestSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Image(systemName: "speedometer")
+                    .foregroundColor(.purple)
+                Text("Network Speed Test")
+                    .font(.headline)
+                Spacer()
+                Button {
+                    runSpeedTest()
+                } label: {
+                    HStack(spacing: 6) {
+                        if isRunningSpeedTest {
+                            ProgressView().scaleEffect(0.6)
+                        } else {
+                            Image(systemName: "play.fill")
+                        }
+                        Text(isRunningSpeedTest ? "Testing…" : "Run Test")
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(isRunningSpeedTest)
+            }
+
+            if let r = speedTestResult {
+                VStack(alignment: .leading, spacing: 6) {
+                    speedRow("Latency", String(format: "%.1f ms (±%.1f jitter)", r.rttMs, r.jitterMs))
+                    speedRow("Download", String(format: "%.1f Mbps  (%.1f%% loss)", r.downloadMbps, r.downloadLossPct))
+                    speedRow("Upload", String(format: "%.1f Mbps  (%.1f%% loss)", r.uploadMbps, r.uploadLossPct))
+                    Text(speedVerdict(r))
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            } else if !isRunningSpeedTest {
+                Text("Measures latency and UDP throughput to this peer using the same transport as LocalCast. Both Macs must be updated to a version with the speed-test responder.")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+        }
+        .padding(16)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color.purple.opacity(0.05))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12)
+                        .stroke(Color.purple.opacity(0.2), lineWidth: 1)
+                )
+        )
+    }
+
+    private func speedRow(_ label: String, _ value: String) -> some View {
+        HStack {
+            Text(label)
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+                .frame(width: 80, alignment: .leading)
+            Text(value)
+                .font(.system(.subheadline, design: .monospaced))
+            Spacer()
+        }
+    }
+
+    /// Translate raw numbers into a buffering-vs-bandwidth verdict.
+    private func speedVerdict(_ r: SpeedTestService.Result) -> String {
+        if r.downloadMbps <= 0 {
+            return "No throughput measured — the peer may not be running a version with the speed-test responder, or the link dropped everything."
+        }
+        if r.downloadLossPct > 5 {
+            return String(format: "High packet loss (%.0f%%). The Wi-Fi link is the bottleneck — lower the streaming quality or use Ethernet.", r.downloadLossPct)
+        }
+        if r.downloadMbps < 25 {
+            return String(format: "Link is ~%.0f Mbps — below comfortable streaming headroom, so lag is bandwidth-bound. Lower quality or go wired.", r.downloadMbps)
+        }
+        return String(format: "Link is ~%.0f Mbps with low loss — bandwidth is fine. If streaming is still laggy, the bottleneck is buffering/pipeline, not the network.", r.downloadMbps)
+    }
+
+    private func runSpeedTest() {
+        isRunningSpeedTest = true
+        speedTestResult = nil
+        Task {
+            let result = await SpeedTestService.shared.runTest(toHost: device.ipAddress)
+            await MainActor.run {
+                speedTestResult = result
+                isRunningSpeedTest = false
             }
         }
     }
