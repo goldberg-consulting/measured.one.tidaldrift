@@ -3,6 +3,7 @@ import Network
 import IOKit
 import os.log
 import Combine
+import AppKit
 
 /// Service to advertise this TidalDrift instance and discover peers
 /// Uses Network.framework for modern, reliable Bonjour discovery
@@ -149,29 +150,64 @@ class TidalDriftPeerService: NSObject, ObservableObject {
             .store(in: &cancellables)
     }
     
-    // MARK: - Advertising (Network.framework)
-    
+    // MARK: - Advertising (dns-sd helper, hardened)
+    //
+    // The peer beacon is advertised by running `dns-sd -R`. The registration
+    // lives only as long as the helper process and mDNSResponder's acceptance
+    // of it, so this path is hardened against the failure modes that made
+    // discovery intermittently slow or absent:
+    //   1. Registration is confirmed by parsing the helper's stdout, not just
+    //      "is the process alive" (a live-but-unregistered helper used to look
+    //      healthy forever).
+    //   2. A watchdog restarts on process death, unconfirmed registration, or a
+    //      change in the local IP (so the advertised `ip=` TXT, which the
+    //      discovery fast path keys on, never goes stale).
+    //   3. The advertisement is re-registered on wake from sleep.
+    //   4. App Nap is suppressed (idle system sleep still allowed) so the
+    //      watchdog and helper stay responsive while the app is in the
+    //      background, which is always for a menu-bar accessory.
+
     private var dnssdProcess: Process?
-    
+    private var advertisePipe: Pipe?
     private var advertiseMonitorTimer: Timer?
-    
+
+    /// IP currently baked into the advertised TXT record (`ip=`).
+    private var advertisedIP: String?
+    /// True once dns-sd confirms "Name now registered and active" on stdout.
+    private var advertiseRegistered = false
+    /// When the current `dns-sd -R` process launched (registration grace window).
+    private var advertiseLaunchedAt: Date?
+    /// Keeps the app out of App Nap while advertising (idle sleep still allowed).
+    private var advertiseActivity: NSObjectProtocol?
+    private var sleepWakeObserved = false
+
+    private static let advertiseWatchdogInterval: TimeInterval = 4
+    private static let advertiseRegistrationGrace: TimeInterval = 3
+
     func startAdvertising() {
         guard dnssdProcess == nil else {
             Self.log("Already advertising, skipping")
             return
         }
-        
+
         Self.log("📢 Starting Bonjour advertisement via dns-sd")
+        if advertiseActivity == nil {
+            advertiseActivity = ProcessInfo.processInfo.beginActivity(
+                options: [.userInitiatedAllowingIdleSystemSleep, .suddenTerminationDisabled],
+                reason: "TidalDrift Bonjour advertising"
+            )
+        }
+        observeSleepWake()
         launchAdvertiseProcess()
         startAdvertiseMonitor()
     }
-    
+
     private func launchAdvertiseProcess() {
         let currentIP = NetworkUtils.getLocalIPAddress() ?? localInfo.ipAddress
-        
+
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/dns-sd")
-        
+
         let customName = AppState.shared.settings.tidalDriftDisplayName
         var txtParts = [
             "peerId=\(Self.localPeerId)",
@@ -190,63 +226,136 @@ class TidalDriftPeerService: NSObject, ObservableObject {
         if !customName.isEmpty {
             txtParts.append("tdname=\(customName)")
         }
-        
+
         let advName = advertisedName
         var args = ["-R", advName, serviceType, "local.", "5959"]
         args.append(contentsOf: txtParts)
         process.arguments = args
-        
-        process.standardOutput = FileHandle.nullDevice
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
-        
-        do {
-            try process.run()
-            dnssdProcess = process
-            Self.log("✅ dns-sd advertising: \(advName) on \(serviceType) with \(txtParts.count) TXT fields")
-            DispatchQueue.main.async {
-                self.isAdvertising = true
-            }
-        } catch {
-            Self.log("❌ Failed to start dns-sd: \(error)")
-        }
-    }
-    
-    private func startAdvertiseMonitor() {
-        advertiseMonitorTimer?.invalidate()
-        DispatchQueue.main.async { [weak self] in
-            self?.advertiseMonitorTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
-                guard let self else { return }
-                if let proc = self.dnssdProcess, !proc.isRunning {
-                    Self.log("⚠️ Advertise process died (exit \(proc.terminationStatus)), restarting")
-                    self.dnssdProcess = nil
-                    self.launchAdvertiseProcess()
+        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let output = String(data: data, encoding: .utf8) else { return }
+            // dns-sd -R prints "Name now registered and active" once mDNSResponder
+            // accepts the registration. Until then the ad is not actually live.
+            if output.contains("registered and active") {
+                DispatchQueue.main.async { [weak self] in
+                    self?.advertiseRegistered = true
+                    self?.isAdvertising = true
                 }
             }
         }
+
+        advertiseRegistered = false
+        advertiseLaunchedAt = Date()
+        advertisedIP = currentIP
+
+        do {
+            try process.run()
+            dnssdProcess = process
+            advertisePipe = pipe
+            Self.log("✅ dns-sd advertising: \(advName) on \(serviceType), ip=\(currentIP), \(txtParts.count) TXT fields")
+            DispatchQueue.main.async { self.isAdvertising = true }
+        } catch {
+            pipe.fileHandleForReading.readabilityHandler = nil
+            Self.log("❌ Failed to start dns-sd: \(error)")
+        }
     }
-    
+
+    private func startAdvertiseMonitor() {
+        advertiseMonitorTimer?.invalidate()
+        DispatchQueue.main.async { [weak self] in
+            self?.advertiseMonitorTimer = Timer.scheduledTimer(
+                withTimeInterval: Self.advertiseWatchdogInterval, repeats: true
+            ) { [weak self] _ in
+                self?.checkAdvertiseHealth()
+            }
+        }
+    }
+
+    /// Watchdog: restart the advertisement if the helper died, never confirmed
+    /// registration, or the local IP changed out from under the `ip=` TXT.
+    private func checkAdvertiseHealth() {
+        guard let proc = dnssdProcess else { return }
+
+        if !proc.isRunning {
+            Self.log("⚠️ Advertise process died (exit \(proc.terminationStatus)), restarting")
+            relaunchAdvertise()
+            return
+        }
+
+        if !advertiseRegistered,
+           let launched = advertiseLaunchedAt,
+           Date().timeIntervalSince(launched) > Self.advertiseRegistrationGrace {
+            Self.log("⚠️ Advertise registration unconfirmed after \(Int(Self.advertiseRegistrationGrace))s, restarting")
+            relaunchAdvertise()
+            return
+        }
+
+        if let current = NetworkUtils.getLocalIPAddress(), current != advertisedIP {
+            Self.log("🌐 Local IP changed (\(self.advertisedIP ?? "nil") → \(current)), re-advertising")
+            relaunchAdvertise()
+        }
+    }
+
+    private func relaunchAdvertise() {
+        advertisePipe?.fileHandleForReading.readabilityHandler = nil
+        advertisePipe = nil
+        if let proc = dnssdProcess, proc.isRunning {
+            proc.terminate()
+        }
+        dnssdProcess = nil
+        launchAdvertiseProcess()
+    }
+
+    /// Re-register the advertisement on wake; sleep can drop the helper's
+    /// registration and the IP often changes across a sleep/wake cycle.
+    private func observeSleepWake() {
+        guard !sleepWakeObserved else { return }
+        sleepWakeObserved = true
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self, self.dnssdProcess != nil else { return }
+            Self.log("⏰ Woke from sleep — re-advertising")
+            self.relaunchAdvertise()
+        }
+    }
+
     func stopAdvertising() {
         advertiseMonitorTimer?.invalidate()
         advertiseMonitorTimer = nil
-        
+
         telemetryTimer?.invalidate()
         telemetryTimer = nil
-        
+
         listener?.cancel()
         listener = nil
-        
+
         if let service = netService {
             service.remove(from: .main, forMode: .common)
             service.stop()
         }
         netService = nil
-        
+
+        advertisePipe?.fileHandleForReading.readabilityHandler = nil
+        advertisePipe = nil
         if let process = dnssdProcess, process.isRunning {
             process.terminate()
             Self.log("Terminated dns-sd process")
         }
         dnssdProcess = nil
-        
+        advertiseRegistered = false
+        advertisedIP = nil
+        advertiseLaunchedAt = nil
+
+        if let activity = advertiseActivity {
+            ProcessInfo.processInfo.endActivity(activity)
+            advertiseActivity = nil
+        }
+
         DispatchQueue.main.async {
             self.isAdvertising = false
         }
