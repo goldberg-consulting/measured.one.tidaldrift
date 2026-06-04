@@ -109,6 +109,14 @@ class UDPTransport {
         params.allowLocalEndpointReuse = true
         // Use .userInteractive service class to signal the OS this is latency-sensitive traffic.
         params.serviceClass = .interactiveVideo
+        // Pin to IPv4. LocalCast clients resolve hosts to IPv4 addresses
+        // (ConnectionResolver uses AF_INET), but NWListener can otherwise bind
+        // IPv6-only, leaving the host unreachable on IPv4 — the client's
+        // heartbeats get no reply ("no response from host"). Forcing v4 keeps
+        // the listener and the client on the same family.
+        if let ip = params.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
+            ip.version = .v4
+        }
         return params
     }
     
