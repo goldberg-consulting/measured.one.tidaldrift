@@ -168,19 +168,33 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
     
     private func handleMouseEvent(_ event: NSEvent, at point: NSPoint) {
         guard let window = self.window, let contentView = window.contentView else { return }
-        
-        let contentRect = contentView.frame
-        guard point.x >= 0 && point.x <= contentRect.width &&
-              point.y >= 0 && point.y <= contentRect.height else { return }
-        
-        let relativeX = point.x / contentRect.width
-        let relativeY: Double
-        if contentView.isFlipped {
-            relativeY = point.y / contentRect.height
-        } else {
-            relativeY = 1.0 - (point.y / contentRect.height)
+        let viewSize = contentView.frame.size
+        guard viewSize.width > 0, viewSize.height > 0 else { return }
+
+        // Scroll carries deltas, not a position; forward it regardless of where
+        // the cursor is (even over the letterbox bars).
+        if event.type == .scrollWheel {
+            clientSession.sendInput(.scroll(deltaX: event.scrollingDeltaX, deltaY: event.scrollingDeltaY))
+            return
         }
-        
+
+        // The renderer preserves the source aspect ratio by letterboxing /
+        // pillarboxing the stream inside the view, so the video does NOT fill the
+        // whole content view. Normalize against the actual video rect; otherwise
+        // clicks land offset from the cursor (most visible when the viewer window
+        // aspect differs from the streamed content, e.g. a single window).
+        let videoRect = aspectFitVideoRect(in: viewSize)
+
+        let rawX = (point.x - videoRect.minX) / videoRect.width
+        let yFromBottom = (point.y - videoRect.minY) / videoRect.height
+        // The remote expects top-left origin (y down). Content view is bottom-left
+        // origin (y up) unless flipped.
+        let rawY = contentView.isFlipped ? yFromBottom : (1.0 - yFromBottom)
+        // Clamp into [0,1] rather than dropping clicks in the letterbox bars, so
+        // a mouse-up that lands on a bar can't leave a stuck button on the host.
+        let relativeX = min(max(rawX, 0), 1)
+        let relativeY = min(max(rawY, 0), 1)
+
         switch event.type {
         case .mouseMoved, .leftMouseDragged, .rightMouseDragged:
             clientSession.sendInput(.mouseMove(x: relativeX, y: relativeY))
@@ -192,16 +206,39 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
             clientSession.sendInput(.mouseDown(button: 1, x: relativeX, y: relativeY))
         case .rightMouseUp:
             clientSession.sendInput(.mouseUp(button: 1, x: relativeX, y: relativeY))
-        case .scrollWheel:
-            clientSession.sendInput(.scroll(deltaX: event.scrollingDeltaX, deltaY: event.scrollingDeltaY))
         default:
             break
+        }
+    }
+
+    /// The rect within the content view actually occupied by the video, honoring
+    /// the source aspect ratio. Mirrors `MetalRenderer`'s letterbox/pillarbox so
+    /// input coordinates line up with what is on screen.
+    private func aspectFitVideoRect(in viewSize: CGSize) -> CGRect {
+        let src = remoteResolution
+        guard src.width > 0, src.height > 0 else {
+            return CGRect(origin: .zero, size: viewSize)
+        }
+        let srcAspect = src.width / src.height
+        let viewAspect = viewSize.width / viewSize.height
+        if srcAspect > viewAspect {
+            // Source wider than view → letterbox (bars top & bottom).
+            let h = viewSize.width / srcAspect
+            return CGRect(x: 0, y: (viewSize.height - h) / 2, width: viewSize.width, height: h)
+        } else {
+            // Source taller than view → pillarbox (bars left & right).
+            let w = viewSize.height * srcAspect
+            return CGRect(x: (viewSize.width - w) / 2, y: 0, width: w, height: viewSize.height)
         }
     }
     
     private func handleKeyEvent(_ event: NSEvent) {
         let keyCode = event.keyCode
-        let modifiers = event.modifierFlags.rawValue
+        // Keep only the standard, device-independent modifier bits (shift,
+        // control, option, command, caps lock). Their raw values line up with
+        // CGEventFlags on the host; passing the full rawValue can include
+        // device-dependent low bits that set spurious flags.
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask).rawValue
         
         switch event.type {
         case .keyDown:
