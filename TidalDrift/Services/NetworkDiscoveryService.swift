@@ -15,7 +15,7 @@ private func runDnsSdLookup(name: String, type: String, domain: String, timeout:
     let finished = DispatchSemaphore(value: 0)
     pipe.fileHandleForReading.readabilityHandler = { handle in
         let data = handle.availableData
-        guard !data.isEmpty else { return }
+        if data.isEmpty { handle.readabilityHandler = nil; return }
         outputLock.lock()
         outputData.append(data)
         outputLock.unlock()
@@ -343,11 +343,18 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
 
         dnsSdBrowseProcess = process
 
-        // Read output asynchronously
+        // Read output asynchronously. On EOF (the dns-sd browse exited), the
+        // readability handler would otherwise be re-invoked forever with empty
+        // data and spin a core at ~100% CPU, so detect EOF, remove the handler,
+        // and relaunch the browse to recover LocalCast discovery.
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
-            guard !data.isEmpty, let output = String(data: data, encoding: .utf8) else { return }
-
+            if data.isEmpty {
+                handle.readabilityHandler = nil
+                self?.handleLocalCastBrowseEOF()
+                return
+            }
+            guard let output = String(data: data, encoding: .utf8) else { return }
             self?.parseDnsSdBrowseOutput(output)
         }
 
@@ -356,6 +363,20 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             logger.info("🌊 dns-sd browse started (PID: \(process.processIdentifier))")
         } catch {
             logger.error("🌊 Failed to start dns-sd browse: \(error.localizedDescription)")
+        }
+    }
+
+    /// Recover the LocalCast browse after its dns-sd helper exits (EOF). Runs on
+    /// the serial discovery queue and relaunches after a short backoff so a
+    /// repeatedly-dying helper cannot tight-loop.
+    private func handleLocalCastBrowseEOF() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.logger.warning("🌊 LocalCast browse exited (EOF); relaunching in 2s")
+            self.dnsSdBrowseProcess = nil
+            self.queue.asyncAfter(deadline: .now() + 2) { [weak self] in
+                self?.startNetServiceBrowserForLocalCast()
+            }
         }
     }
 
