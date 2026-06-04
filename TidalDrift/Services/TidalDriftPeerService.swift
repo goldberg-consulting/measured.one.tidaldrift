@@ -59,6 +59,13 @@ class TidalDriftPeerService: NSObject, ObservableObject {
     
     private var telemetryTimer: Timer?
     private var peerPruneTimer: Timer?
+
+    /// Periodically re-resolves already-discovered peers so they stay fresh.
+    /// `dns-sd -B` emits an Add only once, and mDNS does not re-announce existing
+    /// services often, so without this a present peer's lastSeen ages out and it
+    /// gets pruned (losing its TidalDrift-peer status / red outline).
+    private var reconfirmTimer: Timer?
+    private static let peerReconfirmInterval: TimeInterval = 45
     
     private let serviceType = "_tidaldrift._tcp"
     private let dropServiceType = "_tidaldrop._tcp"
@@ -436,6 +443,27 @@ class TidalDriftPeerService: NSObject, ObservableObject {
                 }
             }
         }
+
+        if reconfirmTimer == nil {
+            DispatchQueue.main.async { [weak self] in
+                self?.reconfirmTimer = Timer.scheduledTimer(
+                    withTimeInterval: Self.peerReconfirmInterval, repeats: true
+                ) { [weak self] _ in
+                    self?.reconfirmKnownPeers()
+                }
+            }
+        }
+    }
+
+    /// Re-resolve already-discovered peers so their lastSeen stays current.
+    /// A present peer refreshes (keeping it online and out of the prune window);
+    /// a departed peer simply fails to resolve and ages out as intended.
+    private func reconfirmKnownPeers() {
+        let names = Set(discoveredPeers.values.map { $0.hostname }).subtracting([advertisedName])
+        guard !names.isEmpty else { return }
+        for name in names {
+            resolveServiceViaDnsSd(name: name)
+        }
     }
     
     private func launchBrowseProcess() {
@@ -502,7 +530,10 @@ class TidalDriftPeerService: NSObject, ObservableObject {
         
         peerPruneTimer?.invalidate()
         peerPruneTimer = nil
-        
+
+        reconfirmTimer?.invalidate()
+        reconfirmTimer = nil
+
         Self.log("Stopped discovery")
     }
 

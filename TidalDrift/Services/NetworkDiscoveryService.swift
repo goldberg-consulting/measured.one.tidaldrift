@@ -188,7 +188,11 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
     /// Clear all stale devices (not seen recently) - includes peers
     /// Uses 2 minutes for TidalDrift peers, 5 minutes for other devices
     func clearStaleDevices() {
-        let peerStaleThreshold: TimeInterval = 2 * 60 // 2 minutes for peers
+        // Peers are re-confirmed every ~45s (TidalDriftPeerService.reconfirmTimer),
+        // so a present peer's lastSeen stays well under this. The threshold only
+        // catches genuinely-departed peers that also missed several reconfirms,
+        // as a backstop to the Bonjour Remove event.
+        let peerStaleThreshold: TimeInterval = 3 * 60 // 3 minutes for peers
         let deviceStaleThreshold: TimeInterval = 5 * 60 // 5 minutes for other devices
 
         deviceCacheLock.lock()
