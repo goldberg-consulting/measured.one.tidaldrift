@@ -454,13 +454,26 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
 
     // MARK: - UDPTransportDelegate
 
-    func udpTransport(_ transport: UDPTransport, clientDidConnect endpoint: NWEndpoint, connection: NWConnection) {
-        // Store the connection from the client for reliable bidirectional communication
-        clientConnection = connection
+    /// Make `endpoint` the single active viewer (newest-wins takeover). An older
+    /// viewer stops receiving video once a new one connects or authenticates, so
+    /// a fresh connection always works even if a previous session is still
+    /// holding the slot. Resets per-client send state so the new viewer is
+    /// treated as fresh (and gets a keyframe burst from the caller).
+    private func setActiveClient(endpoint: NWEndpoint, connection: NWConnection?) {
+        let isNewClient = clientEndpoint.map { String(describing: $0) != String(describing: endpoint) } ?? true
         clientEndpoint = endpoint
-
-        // Detect loopback: check if client IP is localhost or our own IP
+        clientConnection = connection
         isLoopbackConnection = Self.isLocalEndpoint(endpoint)
+        lastClientPacketAt = Date()
+        if isNewClient {
+            hasSentFirstVideoPacket = false
+            logger.info("👤 Active viewer → \(String(describing: endpoint)) (loopback: \(self.isLoopbackConnection))")
+        }
+    }
+
+    func udpTransport(_ transport: UDPTransport, clientDidConnect endpoint: NWEndpoint, connection: NWConnection) {
+        // Newest viewer takes over as the single active client.
+        setActiveClient(endpoint: endpoint, connection: connection)
 
         let localIP = NetworkUtils.getLocalIPAddress() ?? "unknown"
         logger.info("LocalCast: Client connected from \(String(describing: endpoint)) (loopback: \(self.isLoopbackConnection))")
@@ -1008,6 +1021,10 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         )
         transport.send(packet: successPacket, to: endpoint)
 
+        // The just-authenticated client becomes the active viewer (takeover).
+        // Route by endpoint (connection: nil) so video can't go to a stale
+        // previous client's connection.
+        setActiveClient(endpoint: endpoint, connection: nil)
         beginCaptureForClient()
         forceInitialKeyframes()
     }
