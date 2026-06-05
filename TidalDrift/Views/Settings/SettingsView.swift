@@ -309,6 +309,19 @@ struct NetworkSettingsView: View {
                     .font(.caption)
             }
             
+            Section {
+                DirectRoutingToggle()
+            } header: {
+                HStack {
+                    Text("Local Direct Routing")
+                    Image(systemName: "arrow.triangle.branch")
+                        .foregroundColor(.green)
+                }
+            } footer: {
+                Text("Keeps your home LAN (TidalDrift peers, NAS, etc.) routed directly over Wi-Fi/Ethernet instead of through a full-tunnel VPN, only while you're on your home network. Confirm this is allowed by your employer's VPN policy before enabling.")
+                    .font(.caption)
+            }
+
             Section("Network Status") {
                 HStack {
                     Text("Local IP")
@@ -580,6 +593,105 @@ struct RemoteLoginToggle: View {
                 } else if enable && !newState {
                     errorMessage = "Remote Login was enabled but the SSH service doesn't appear to be running yet. Try checking again in a moment."
                     showError = true
+                }
+            }
+        }
+    }
+}
+
+struct DirectRoutingToggle: View {
+    @State private var status = LocalDirectRouteService.shared.currentStatus()
+    @State private var isToggling = false
+    @State private var message: String?
+    @State private var isError = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Route home LAN direct (bypass VPN)")
+                    Text("Requires admin password to change")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+
+                Spacer()
+
+                if isToggling {
+                    ProgressView().scaleEffect(0.7)
+                } else {
+                    Toggle("", isOn: Binding(
+                        get: { status.installed },
+                        set: { setEnabled($0) }
+                    ))
+                    .labelsHidden()
+                }
+            }
+
+            if status.installed {
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(status.isActive ? Color.green : Color.orange)
+                        .frame(width: 8, height: 8)
+                    if let subnet = status.subnet {
+                        Text(status.isActive
+                             ? "Active: \(subnet) direct via \(status.routingInterface ?? "LAN")"
+                             : "Installed: \(subnet) (not on home network)")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    } else {
+                        Text("Installed")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+            }
+
+            if let message {
+                Text(message)
+                    .font(.caption)
+                    .foregroundColor(isError ? .orange : .secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .onAppear { status = LocalDirectRouteService.shared.currentStatus() }
+    }
+
+    private func setEnabled(_ enable: Bool) {
+        message = nil
+        isError = false
+
+        if enable {
+            guard let home = LocalDirectRouteService.shared.detectHomeNetwork() else {
+                message = "Couldn't detect a home network. Connect to your home Wi-Fi/Ethernet (a private LAN) first, then try again."
+                isError = true
+                return
+            }
+            isToggling = true
+            Task {
+                let ok = await LocalDirectRouteService.shared.enable(home)
+                await MainActor.run {
+                    isToggling = false
+                    status = LocalDirectRouteService.shared.currentStatus()
+                    if ok {
+                        message = "Pinned \(home.subnetCIDR) direct via \(home.interface)."
+                    } else {
+                        message = "Could not enable (authentication cancelled or failed)."
+                        isError = true
+                    }
+                }
+            }
+        } else {
+            isToggling = true
+            Task {
+                let ok = await LocalDirectRouteService.shared.disable()
+                await MainActor.run {
+                    isToggling = false
+                    status = LocalDirectRouteService.shared.currentStatus()
+                    if !ok {
+                        message = "Could not disable (authentication cancelled or failed)."
+                        isError = true
+                    }
                 }
             }
         }
