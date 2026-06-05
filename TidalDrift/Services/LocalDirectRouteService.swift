@@ -59,28 +59,29 @@ final class LocalDirectRouteService {
 
     // MARK: - Detection (user level)
 
-    /// Inspect the current default route to learn the physical interface, its
-    /// IPv4, the /24 subnet, and the gateway + its MAC. Returns nil if the
-    /// default route isn't a private LAN (so we never pin a VPN/public subnet).
+    /// Find the physical LAN interface, its IPv4, the /24 subnet, and the gateway
+    /// + its MAC. Deliberately does NOT use the default route: behind a
+    /// full-tunnel VPN the default route is the tunnel (utun), while the physical
+    /// interface still holds its home IP. We scan physical interfaces directly so
+    /// detection works even while the VPN is up (the whole point of this tool).
     func detectHomeNetwork() -> HomeNetwork? {
-        guard let def = run("/sbin/route", ["-n", "get", "default"])?.out else { return nil }
-        guard let iface = value(of: "interface", in: def),
-              let gateway = value(of: "gateway", in: def),
-              !iface.hasPrefix("utun"), !iface.hasPrefix("ipsec"), iface != "lo0" else {
-            return nil
-        }
-        guard let ip = run("/usr/sbin/ipconfig", ["getifaddr", iface])?.out
-            .trimmingCharacters(in: .whitespacesAndNewlines), !ip.isEmpty,
-              NetworkUtils.isLocalNetworkAddress(ip) else {
-            return nil
-        }
+        guard let (iface, ip) = physicalPrivateInterface() else { return nil }
         let octets = ip.split(separator: ".")
         guard octets.count == 4 else { return nil }
         let prefix = "\(octets[0]).\(octets[1]).\(octets[2])."
         let cidr = "\(prefix)0/24"
 
-        // Gateway MAC (best effort): captured in the same format `arp` prints,
-        // so the daemon's comparison against live `arp` output matches.
+        // Home gateway from this interface's DHCP lease (still correct with the
+        // VPN up), falling back to the conventional .1 of the subnet.
+        var gateway = "\(prefix)1"
+        if let router = run("/usr/sbin/ipconfig", ["getoption", iface, "router"])?.out
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           NetworkUtils.isValidIPAddress(router) {
+            gateway = router
+        }
+
+        // Gateway MAC (best effort), captured in the same format `arp` prints so
+        // the daemon's comparison against live `arp` output matches.
         var mac = ""
         if let arp = run("/usr/sbin/arp", ["-n", gateway])?.out,
            let at = arp.range(of: " at ") {
@@ -90,6 +91,34 @@ final class LocalDirectRouteService {
 
         return HomeNetwork(interface: iface, ipv4: ip, subnetCIDR: cidr,
                            subnetPrefix: prefix, gatewayIP: gateway, gatewayMAC: mac)
+    }
+
+    /// A physical (en*) interface currently holding a private, non-link-local
+    /// IPv4. Prefers en0. Ignores VPN (utun/ipsec) and virtual interfaces.
+    private func physicalPrivateInterface() -> (iface: String, ip: String)? {
+        var result: (String, String)?
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return nil }
+        defer { freeifaddrs(ifaddr) }
+
+        var ptr: UnsafeMutablePointer<ifaddrs>? = first
+        while let cur = ptr {
+            let ifa = cur.pointee
+            ptr = ifa.ifa_next
+            guard ifa.ifa_addr.pointee.sa_family == UInt8(AF_INET) else { continue }
+            let name = String(cString: ifa.ifa_name)
+            guard name.hasPrefix("en") else { continue }  // Wi-Fi / Ethernet only
+
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            getnameinfo(ifa.ifa_addr, socklen_t(ifa.ifa_addr.pointee.sa_len),
+                        &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST)
+            let ip = String(cString: host)
+            guard NetworkUtils.isLocalNetworkAddress(ip), !ip.hasPrefix("169.254.") else { continue }
+
+            if name == "en0" { return (name, ip) }
+            if result == nil { result = (name, ip) }
+        }
+        return result
     }
 
     // MARK: - Enable / disable (privileged)
