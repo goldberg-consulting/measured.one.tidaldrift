@@ -80,6 +80,14 @@ saturating **upload burst shed ~13%** of its packets at 349 Mbps. Bandwidth is
 not the constraint; **burst loss on the host's uplink** is. That directly
 implicates keyframe sends, which are exactly such bursts.
 
+**Apply optimized settings (1.6.22):** after a test, Device Details shows a
+recommendation derived from the measured link (`SpeedTestService.recommend`) and
+an "Apply optimized settings" button that writes the `localCast*` defaults
+(resolution, region-aware, adaptive, drop-to-newest, loss recovery, codec).
+Resolution and codec scale with the constrained-direction bandwidth; region-aware
+turns on for lossy/low-bandwidth links; resilience options stay on (no-ops on a
+clean link). Applies on the next session.
+
 ## Latency: where it comes from
 
 Latency is dominated by the **link and the transport**, not the GPU:
