@@ -35,7 +35,14 @@ class AppControlPanelController: NSWindowController {
         panel.level = .floating
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         
-        let contentView = AppControlPanelView(session: session, deviceName: device.name)
+        let targetDevice = device
+        let contentView = AppControlPanelView(
+            session: session,
+            deviceName: device.name,
+            onOpenScreenShare: {
+                Task { try? await ScreenShareConnectionService.shared.connect(to: targetDevice) }
+            }
+        )
         panel.contentView = NSHostingView(rootView: contentView)
         
         // Position in the top-right corner of the main screen
@@ -82,6 +89,7 @@ extension AppControlPanelController: NSWindowDelegate {
 struct AppControlPanelView: View {
     @ObservedObject var session: ClientSession
     let deviceName: String
+    var onOpenScreenShare: () -> Void = {}
     @State private var expandedAppID: Int32?
     @State private var isolatedAppPID: Int32?
     
@@ -135,7 +143,15 @@ struct AppControlPanelView: View {
                 }
                 
                 Spacer()
-                
+
+                Button {
+                    onOpenScreenShare()
+                } label: {
+                    Image(systemName: "display")
+                }
+                .buttonStyle(.borderless)
+                .help("Open macOS Screen Sharing to this Mac")
+
                 Button {
                     session.requestAppList()
                 } label: {
