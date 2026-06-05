@@ -45,7 +45,9 @@ struct SettingsView: View {
                     Label("About", systemImage: "info.circle")
                 }
         }
-        .frame(width: 600, height: 520)
+        // Wide enough that all tabs (General … About) fit on the tab bar instead
+        // of collapsing into a ">>" overflow that hid Network/Security.
+        .frame(width: 820, height: 560)
     }
 }
 
