@@ -153,11 +153,15 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
         let width = Int(pixelWidth * scale) & ~1
         let height = Int(pixelHeight * scale) & ~1
         
-        // Store the window's screen bounds for input mapping
-        captureBounds = window.frame
+        // Store the window's on-screen bounds for input mapping. Prefer the
+        // Quartz (top-left origin) bounds from CGWindowList, which match the
+        // coordinate space CGEvent injection uses; SCWindow.frame can differ in
+        // Y origin and throw remote clicks off when streaming a single window.
+        let bounds = Self.quartzWindowBounds(windowID) ?? window.frame
+        captureBounds = bounds
         captureMode = .singleWindow(windowID)
         
-        logger.info("🪟 Window capture bounds: \(NSStringFromRect(window.frame))")
+        logger.info("🪟 Window capture bounds (Quartz): \(NSStringFromRect(bounds)) [SCWindow.frame: \(NSStringFromRect(window.frame))]")
         try await startStream(with: filter, width: width, height: height, frameRate: frameRate, description: "window '\(window.title ?? "Untitled")'")
     }
     
@@ -224,13 +228,30 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
         let width = Int(pixelWidth * scale) & ~1
         let height = Int(pixelHeight * scale) & ~1
         
-        captureBounds = mainWindow.frame
+        // Prefer Quartz (top-left) bounds for input mapping; see startWindowCapture.
+        let bounds = Self.quartzWindowBounds(mainWindow.windowID) ?? mainWindow.frame
+        captureBounds = bounds
         captureMode = .singleApp(processID)
         
-        logger.info("📱 App capture bounds: \(NSStringFromRect(mainWindow.frame)) -> \(width)x\(height) pixels (retina: \(retinaScale)x)")
+        logger.info("📱 App capture bounds (Quartz): \(NSStringFromRect(bounds)) -> \(width)x\(height) pixels (retina: \(retinaScale)x)")
         try await startStream(with: filter, width: width, height: height, frameRate: frameRate, description: "app '\(mainWindow.title ?? "PID \(processID)")'")
     }
     
+    /// The window's on-screen bounds in Quartz coordinates (top-left origin,
+    /// Y-down) from CGWindowList. This is the exact space `CGEvent` injection
+    /// uses, so mapping remote clicks through it avoids the Y-origin mismatch
+    /// that `SCWindow.frame` can introduce for single-window/app streaming.
+    private static func quartzWindowBounds(_ windowID: CGWindowID) -> CGRect? {
+        guard let infoList = CGWindowListCopyWindowInfo(.optionIncludingWindow, windowID) as? [[String: Any]],
+              let info = infoList.first,
+              let boundsDict = info[kCGWindowBounds as String] as? NSDictionary else {
+            return nil
+        }
+        var rect = CGRect.zero
+        guard CGRectMakeWithDictionaryRepresentation(boundsDict, &rect) else { return nil }
+        return rect
+    }
+
     // MARK: - Shared Stream Setup
     
     private func startStream(with filter: SCContentFilter, width: Int, height: Int, frameRate: Int, description: String) async throws {
