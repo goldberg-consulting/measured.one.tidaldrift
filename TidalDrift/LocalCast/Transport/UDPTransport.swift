@@ -124,6 +124,22 @@ class UDPTransport {
     private let pacingBatchSize = 16           // fragments per paced burst
     private let pacingGapMicros = 700          // gap between bursts (~256 Mbps ceiling)
     private let paceQueue = DispatchQueue(label: "com.tidaldrift.localcast.sendpace", qos: .userInteractive)
+
+    // Forward error correction (XOR parity). When enabled (host/sender side),
+    // each block of `fecBlockSize` video data fragments gets one parity fragment
+    // = XOR of the block's payloads (zero-padded to the fragment payload size).
+    // The receiver can reconstruct exactly one lost data fragment per block
+    // without a retransmit. Parity reuses the 10-byte fragment header with the
+    // high bit of `fragmentIndex` set, so the wire format is unchanged for peers
+    // that don't understand FEC (they simply ignore parity, since it's kept in a
+    // separate buffer and never counted toward frame completion). Recovery on
+    // the receiver is always attempted; only the sender's parity emission is
+    // gated by the toggle.
+    var fecEnabled = UserDefaults.standard.object(forKey: "localCastFEC") as? Bool ?? false
+    private let fecBlockSize = 16
+    private static let fecParityFlag: UInt16 = 0x8000
+    private var parityBuffers: [UInt32: [UInt16: Data]] = [:] // frameId -> blockIndex -> parity payload
+    private var _fecRecovered = 0  // guarded by fragmentLock
     
     var localPort: UInt16? {
         listener?.port?.rawValue
@@ -303,11 +319,40 @@ class UDPTransport {
             fragmentData.append(fragmentPayload)
             fragments.append(fragmentData)
         }
-        
+
+        // Optionally interleave one XOR parity fragment after each block of data
+        // fragments, so the receiver can recover a single lost fragment per block.
+        var sendList = fragments
+        if fecEnabled && droppable && totalFragments > 1 {
+            sendList = []
+            sendList.reserveCapacity(fragments.count + fragments.count / fecBlockSize + 1)
+            var index = 0
+            var blockIndex: UInt16 = 0
+            while index < fragments.count {
+                let blockEnd = min(index + fecBlockSize, fragments.count)
+                for j in index..<blockEnd { sendList.append(fragments[j]) }
+
+                let parityPayload = xorParity(of: data, fragmentRange: index..<blockEnd, payloadSize: payloadSize)
+                let parityHeader = FragmentHeader(
+                    frameId: frameId,
+                    fragmentIndex: Self.fecParityFlag | blockIndex,
+                    totalFragments: totalFragments,
+                    payloadLength: UInt16(parityPayload.count)
+                )
+                var parityData = Data()
+                parityData.append(parityHeader.serialize())
+                parityData.append(parityPayload)
+                sendList.append(parityData)
+
+                index = blockEnd
+                blockIndex += 1
+            }
+        }
+
         // Small frames go out immediately; pacing them would only add latency
         // and they are too small to overrun the uplink.
         if totalFragments <= pacingFragmentThreshold {
-            for fragment in fragments {
+            for fragment in sendList {
                 connection.send(content: fragment, completion: .contentProcessed { [weak self] error in
                     if let error = error {
                         self?.logger.error("UDP fragment send error: \(error.localizedDescription)")
@@ -318,7 +363,39 @@ class UDPTransport {
         }
         
         // Large frames: drain in small bursts so the uplink isn't overrun.
-        paceFragments(fragments, on: connection, frameId: frameId)
+        paceFragments(sendList, on: connection, frameId: frameId)
+    }
+
+    /// Number of fragments recovered via FEC since the last call; resets the
+    /// counter. Read once per second by the client for the stats HUD.
+    func takeFECRecovered() -> Int {
+        fragmentLock.lock(); defer { fragmentLock.unlock() }
+        let v = _fecRecovered
+        _fecRecovered = 0
+        return v
+    }
+
+    /// XOR of the given data fragments (each zero-padded to `payloadSize`),
+    /// forming the parity payload for one FEC block.
+    private func xorParity(of data: Data, fragmentRange: Range<Int>, payloadSize: Int) -> Data {
+        var parity = [UInt8](repeating: 0, count: payloadSize)
+        data.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
+            guard let base = buf.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+            let count = buf.count
+            for i in fragmentRange {
+                let start = i * payloadSize
+                guard start < count else { continue }
+                let end = min(start + payloadSize, count)
+                var k = 0
+                var p = start
+                while p < end {
+                    parity[k] ^= base[p]
+                    k += 1
+                    p += 1
+                }
+            }
+        }
+        return Data(parity)
     }
     
     /// Drain a frame's fragments in small bursts separated by a short gap,
@@ -509,7 +586,8 @@ class UDPTransport {
             return
         }
 
-        // Initialize buffer for this frame if needed
+        // Initialize buffers for this frame if needed (header.totalFragments is
+        // the data fragment count, carried on both data and parity fragments).
         if fragmentBuffers[realFrameId] == nil {
             fragmentBuffers[realFrameId] = [:]
             fragmentCounts[realFrameId] = header.totalFragments
@@ -520,8 +598,19 @@ class UDPTransport {
             highestFrameId = realFrameId
         }
 
-        // Store this fragment
-        fragmentBuffers[realFrameId]?[header.fragmentIndex] = Data(payload)
+        // A parity fragment (high bit of fragmentIndex set) goes into a separate
+        // buffer so it never counts toward frame completion; a data fragment is
+        // stored normally. Either way, attempt FEC recovery on the affected
+        // block, which can fill in a single missing data fragment.
+        if (header.fragmentIndex & Self.fecParityFlag) != 0 {
+            let blockIndex = header.fragmentIndex & ~Self.fecParityFlag
+            if parityBuffers[realFrameId] == nil { parityBuffers[realFrameId] = [:] }
+            parityBuffers[realFrameId]?[blockIndex] = Data(payload)
+            recoverBlock(realFrameId, blockIndex: blockIndex, totalFragments: Int(header.totalFragments))
+        } else {
+            fragmentBuffers[realFrameId]?[header.fragmentIndex] = Data(payload)
+            recoverBlock(realFrameId, blockIndex: header.fragmentIndex / UInt16(fecBlockSize), totalFragments: Int(header.totalFragments))
+        }
 
         // Prune droppable frames that fell behind the newest. A pruned-but-
         // incomplete frame is a lost frame worth signalling for recovery. Tiles
@@ -534,6 +623,7 @@ class UDPTransport {
                 fragmentBuffers.removeValue(forKey: fid)
                 fragmentCounts.removeValue(forKey: fid)
                 frameDroppable.removeValue(forKey: fid)
+                parityBuffers.removeValue(forKey: fid)
             }
         }
 
@@ -543,6 +633,7 @@ class UDPTransport {
             fragmentBuffers.removeValue(forKey: oldest)
             fragmentCounts.removeValue(forKey: oldest)
             frameDroppable.removeValue(forKey: oldest)
+            parityBuffers.removeValue(forKey: oldest)
         }
         
         // Check if we have all fragments
@@ -562,6 +653,7 @@ class UDPTransport {
             fragmentBuffers.removeValue(forKey: realFrameId)
             fragmentCounts.removeValue(forKey: realFrameId)
             frameDroppable.removeValue(forKey: realFrameId)
+            parityBuffers.removeValue(forKey: realFrameId)
             fragmentLock.unlock()
             
             // Parse and deliver (decrypt if needed)
@@ -578,6 +670,46 @@ class UDPTransport {
         }
     }
     
+    /// Reconstruct a single missing data fragment in `blockIndex` from its XOR
+    /// parity. Must be called with `fragmentLock` held. Recovers only when the
+    /// block has exactly one missing data fragment and parity is present, and
+    /// never the frame's last (short) fragment whose length can't be inferred.
+    private func recoverBlock(_ frameId: UInt32, blockIndex: UInt16, totalFragments: Int) {
+        guard totalFragments > 0,
+              let parity = parityBuffers[frameId]?[blockIndex],
+              var frags = fragmentBuffers[frameId] else { return }
+
+        let payloadSize = maxPayloadSize - FragmentHeader.size
+        let blockStart = Int(blockIndex) * fecBlockSize
+        guard blockStart < totalFragments else { return }
+        let blockEnd = min(blockStart + fecBlockSize, totalFragments)
+        let lastFrameIndex = totalFragments - 1
+
+        var missing = -1
+        for i in blockStart..<blockEnd where frags[UInt16(i)] == nil {
+            if missing >= 0 { return }            // more than one missing: XOR can't recover
+            missing = i
+        }
+        guard missing >= 0 else { return }        // nothing missing
+        guard missing != lastFrameIndex else { return }  // unknown length; skip
+
+        // recovered = parity XOR (present data fragments, each padded to payloadSize)
+        var recovered = [UInt8](repeating: 0, count: payloadSize)
+        parity.withUnsafeBytes { (b: UnsafeRawBufferPointer) in
+            for k in 0..<min(b.count, payloadSize) { recovered[k] ^= b[k] }
+        }
+        for i in blockStart..<blockEnd where i != missing {
+            guard let frag = frags[UInt16(i)] else { return }
+            frag.withUnsafeBytes { (b: UnsafeRawBufferPointer) in
+                for k in 0..<min(b.count, payloadSize) { recovered[k] ^= b[k] }
+            }
+        }
+
+        frags[UInt16(missing)] = Data(recovered)
+        fragmentBuffers[frameId] = frags
+        _fecRecovered += 1
+    }
+
     /// Strip the encryption/plaintext prefix and decrypt if needed, then parse.
     private func decryptAndParse(_ data: Data) -> LocalCastPacket? {
         guard !data.isEmpty else { return nil }
