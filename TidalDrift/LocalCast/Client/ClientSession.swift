@@ -383,7 +383,21 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             lcDebug("[INPUT-DIAG]    payload: \(payload.count) bytes, seq: \(inputSendCount)")
         }
 
-        transport.send(packet: packet, to: endpoint)
+        // Reliability: clicks and keystrokes must not be lost on a lossy UDP
+        // link (a dropped click is very noticeable). Send these a few times; the
+        // host dedups by sequence number so they fire exactly once. Moves/drags
+        // are idempotent and high-rate, so a single send is fine (the next move
+        // corrects any loss).
+        let copies: Int
+        switch input {
+        case .mouseDown, .mouseUp, .keyDown, .keyUp, .scroll:
+            copies = 3
+        default:
+            copies = 1
+        }
+        for _ in 0..<copies {
+            transport.send(packet: packet, to: endpoint)
+        }
     }
 
     /// Ask the host to resize the streamed window to match the viewer dimensions.

@@ -118,6 +118,26 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     private static let regionLowStreakNeeded = 3
     private static let regionFullRefreshInterval: TimeInterval = 4.0
 
+    // MARK: - Input dedup (reliability)
+    //
+    // The client sends clicks/keys multiple times so a dropped UDP packet
+    // doesn't lose the event. Dedup by sequence number so each fires once.
+    private var recentInputSeqs: Set<UInt32> = []
+    private var recentInputSeqOrder: [UInt32] = []
+    private let recentInputSeqCap = 600
+
+    /// Returns true if this sequence number is new (should be processed).
+    private func markInputSeqSeen(_ seq: UInt32) -> Bool {
+        if recentInputSeqs.contains(seq) { return false }
+        recentInputSeqs.insert(seq)
+        recentInputSeqOrder.append(seq)
+        if recentInputSeqOrder.count > recentInputSeqCap {
+            let old = recentInputSeqOrder.removeFirst()
+            recentInputSeqs.remove(old)
+        }
+        return true
+    }
+
     /// Run `body` while holding the capture-state lock. Synchronous generic so
     /// it is callable from async contexts (stop, stream-request handling)
     /// without the "NSLock used from async context" warning; the lock is never
@@ -640,6 +660,9 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             lowCoverageStreak = 0
             lastFullRefresh = .distantPast
             pendingFullRefresh = true
+            // Fresh input stream: clear dedup history (client seq restarts at 1).
+            recentInputSeqs.removeAll()
+            recentInputSeqOrder.removeAll()
             logger.info("👤 Active viewer → \(String(describing: endpoint)) (loopback: \(self.isLoopbackConnection))")
         }
     }
@@ -816,6 +839,9 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         switch packet.type {
         case .inputEvent:
             receivedInputCount += 1
+
+            // Drop redundant (reliability) copies so a click/key fires once.
+            guard markInputSeqSeen(packet.sequenceNumber) else { return }
 
             // Rate limit check
             if let limiter = inputRateLimiter, !limiter.shouldAllow() {
