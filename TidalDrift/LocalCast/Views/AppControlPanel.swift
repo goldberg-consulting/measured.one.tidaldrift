@@ -1,9 +1,9 @@
 import SwiftUI
 import AppKit
 
-// Floating per-app control panel. Dormant behind #if DEBUG while the
-// full-desktop Metal pipeline is the priority.
-#if DEBUG
+// Floating per-app control panel that pairs with macOS Screen Sharing: it
+// rides TidalDrift's control channel to enumerate, focus, and isolate remote
+// apps while the picture comes from VNC ("best of both worlds").
 
 // MARK: - Floating App Control Panel (NSPanel)
 
@@ -430,5 +430,3 @@ struct AppControlPanelView: View {
         }
     }
 }
-
-#endif

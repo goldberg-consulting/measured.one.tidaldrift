@@ -15,6 +15,7 @@ struct DeviceDetailSheet: View {
     @State private var isRunningSpeedTest = false
     @State private var speedTestResult: SpeedTestService.Result?
     @State private var optimizedApplied = false
+    @State private var isOpeningAppControl = false
 
     enum WakeResult {
         case success
@@ -568,6 +569,33 @@ struct DeviceDetailSheet: View {
                     .padding(.vertical, 4)
                 }
             }
+
+            Divider()
+
+            Button {
+                isOpeningAppControl = true
+                Task {
+                    try? await LocalCastService.shared.openAppControl(for: device)
+                    await MainActor.run { isOpeningAppControl = false }
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    if isOpeningAppControl {
+                        ProgressView().scaleEffect(0.6)
+                    } else {
+                        Image(systemName: "macwindow.on.rectangle")
+                    }
+                    Text("Screen Share + App Control")
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(isOpeningAppControl)
+            .help("Opens macOS Screen Sharing for the picture plus a panel to focus or isolate a single app on the remote Mac.")
+
+            Text("Picture comes from macOS Screen Sharing; \"Isolate\" hides the remote's other apps so you see just one. Requires LocalCast hosting on the remote Mac (for the control channel).")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .padding(16)
         .background(
