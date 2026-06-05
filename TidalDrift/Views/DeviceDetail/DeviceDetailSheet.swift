@@ -14,6 +14,7 @@ struct DeviceDetailSheet: View {
     // Speed test state
     @State private var isRunningSpeedTest = false
     @State private var speedTestResult: SpeedTestService.Result?
+    @State private var optimizedApplied = false
 
     enum WakeResult {
         case success
@@ -428,6 +429,10 @@ struct DeviceDetailSheet: View {
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+
+                if r.downloadMbps > 0 {
+                    recommendationView(SpeedTestService.recommend(from: r))
+                }
             } else if !isRunningSpeedTest {
                 Text("Measures latency and UDP throughput to this peer using the same transport as LocalCast. Both Macs must be updated to a version with the speed-test responder.")
                     .font(.caption2)
@@ -443,6 +448,54 @@ struct DeviceDetailSheet: View {
                         .stroke(Color.purple.opacity(0.2), lineWidth: 1)
                 )
         )
+    }
+
+    @ViewBuilder
+    private func recommendationView(_ rec: SpeedTestService.Recommendation) -> some View {
+        Divider().padding(.vertical, 2)
+        VStack(alignment: .leading, spacing: 6) {
+            Label("Recommended LocalCast settings", systemImage: "wand.and.stars")
+                .font(.subheadline.bold())
+            Text(rec.headline)
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            ForEach(rec.bullets, id: \.self) { bullet in
+                Text("• \(bullet)")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack(spacing: 8) {
+                Button {
+                    applyRecommendation(rec)
+                } label: {
+                    Label(optimizedApplied ? "Applied" : "Apply optimized settings",
+                          systemImage: optimizedApplied ? "checkmark.circle.fill" : "checkmark.circle")
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(optimizedApplied)
+
+                if optimizedApplied {
+                    Text("Applies on the next session")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+            }
+            .padding(.top, 2)
+        }
+    }
+
+    private func applyRecommendation(_ rec: SpeedTestService.Recommendation) {
+        let defaults = UserDefaults.standard
+        defaults.set(rec.maxDimension, forKey: "localCastMaxDimension")
+        defaults.set(rec.regionAware, forKey: "localCastRegionAware")
+        defaults.set(rec.adaptive, forKey: "localCastAdaptive")
+        defaults.set(rec.dropToNewest, forKey: "localCastDropToNewest")
+        defaults.set(rec.lossRecovery, forKey: "localCastLossRecovery")
+        defaults.set(rec.codec, forKey: "localCastCodec")
+        optimizedApplied = true
     }
 
     private func speedRow(_ label: String, _ value: String) -> some View {
@@ -477,6 +530,7 @@ struct DeviceDetailSheet: View {
     private func runSpeedTest() {
         isRunningSpeedTest = true
         speedTestResult = nil
+        optimizedApplied = false
         Task {
             let result = await SpeedTestService.shared.runTest(toHost: device.ipAddress)
             await MainActor.run {

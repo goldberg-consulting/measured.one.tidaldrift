@@ -380,3 +380,84 @@ final class SpeedTestService {
         )
     }
 }
+
+// MARK: - Settings recommendation
+
+extension SpeedTestService {
+    /// Recommended LocalCast settings derived from a speed-test result. Maps to
+    /// the `localCast*` UserDefaults keys the host/client read at session start.
+    struct Recommendation {
+        let maxDimension: Int        // 0 = native
+        let regionAware: Bool
+        let adaptive: Bool
+        let dropToNewest: Bool
+        let lossRecovery: Bool
+        let codec: String            // "h264" or "hevc"
+        let headline: String
+        let bullets: [String]
+    }
+
+    /// Turn measured link quality into a concrete settings recommendation. Uses
+    /// the more constrained of the two directions as the budget, since either
+    /// Mac may be the host. Resilience options stay on (no-ops on a clean link);
+    /// resolution and codec scale with bandwidth, and region-aware turns on for
+    /// lossy or low-bandwidth links.
+    static func recommend(from r: Result) -> Recommendation {
+        let up = r.uploadMbps > 0 ? r.uploadMbps : r.downloadMbps
+        let budget = min(r.downloadMbps, up)
+        let loss = max(r.downloadLossPct, r.uploadLossPct)
+        let lossy = loss > 5
+        let highJitter = r.jitterMs > 20
+
+        let dimension: Int
+        let resLabel: String
+        switch budget {
+        case 300...:    dimension = 0;    resLabel = "Native"
+        case 120..<300: dimension = 2560; resLabel = "1440p"
+        case 50..<120:  dimension = 1920; resLabel = "1080p"
+        default:        dimension = 1280; resLabel = "720p"
+        }
+
+        let regionAware = lossy || budget < 50
+        let useHEVC = budget < 80
+        let codec = useHEVC ? "hevc" : "h264"
+
+        var bullets: [String] = []
+        bullets.append("Resolution: \(resLabel) — sized to about \(Int(budget)) Mbps of usable bandwidth.")
+        bullets.append("Adaptive bitrate: On — eases quality under load, restores it when the link clears.")
+        bullets.append("Drop-to-newest + loss recovery: On — keeps motion smooth and heals quickly.")
+        if regionAware {
+            bullets.append("Region-aware: On — send only changed regions; lighter on a \(lossy ? "lossy" : "limited") link and crisper for text/UI.")
+        } else {
+            bullets.append("Region-aware: Off — plenty of clean bandwidth for full-frame video.")
+        }
+        bullets.append(useHEVC
+            ? "Codec: HEVC — better compression for a constrained link (experimental)."
+            : "Codec: H.264 — reliable at this bandwidth.")
+        if highJitter {
+            bullets.append("Note: jitter is high (±\(Int(r.jitterMs)) ms); the adaptive jitter buffer adds a little smoothing latency.")
+        }
+
+        let headline: String
+        if r.downloadMbps <= 0 {
+            headline = "Couldn't measure the link — re-run with both Macs updated."
+        } else if lossy {
+            headline = "Lossy link: optimized for resilience over maximum sharpness."
+        } else if budget < 50 {
+            headline = "Limited bandwidth: trade some resolution for smoothness."
+        } else {
+            headline = "Healthy link: you can run high quality."
+        }
+
+        return Recommendation(
+            maxDimension: dimension,
+            regionAware: regionAware,
+            adaptive: true,
+            dropToNewest: true,
+            lossRecovery: true,
+            codec: codec,
+            headline: headline,
+            bullets: bullets
+        )
+    }
+}
