@@ -98,7 +98,8 @@ struct LocalCastSettingsView: View {
                         Text("HEVC (Smaller)").tag(LocalCastConfiguration.Codec.hevc)
                     }
                     
-                    Toggle("Show latency overlay", isOn: $showOverlay)
+                    Toggle("Show stats overlay (resolution, codec, mode, bitrate, loss)", isOn: $showOverlay)
+                        .help("Live readout on the stream so you can verify settings took effect (resolution/codec/region-aware apply on the next session).")
                     
                     Toggle("Auto-host on launch", isOn: $autoHost)
                         .help("Automatically start hosting when TidalDrift launches")

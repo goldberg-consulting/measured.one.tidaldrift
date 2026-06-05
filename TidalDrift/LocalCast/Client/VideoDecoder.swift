@@ -23,6 +23,9 @@ class VideoDecoder {
     private var isHEVC = false
     private var frameCount = 0
     private var hasLoggedFirstFrame = false
+
+    /// Codec currently being decoded, for the stats HUD.
+    var codecName: String { isHEVC ? "HEVC" : "H.264" }
     
     deinit {
         // SAFETY: The VTDecompressionSession callback holds an unretained pointer
