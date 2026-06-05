@@ -332,10 +332,42 @@ class LocalCastService: ObservableObject {
     // Metal viewer (via connect(to:)) as two independent entry points;
     // there is no longer a combined mode.
 
-    #if DEBUG
-    /// Strong references to active app control panels (dormant per-app path).
+    /// Strong references to active app control panels so their sessions/windows
+    /// stay alive for the lifetime of the panel.
     private var activeControlPanels: [AppControlPanelController] = []
-    #endif
+
+    /// "Best of both worlds": open macOS Screen Sharing (VNC) for the picture
+    /// and a floating App Control panel over our control channel to focus /
+    /// isolate a single remote app. Isolate hides the host's other apps so the
+    /// Screen Sharing view shows just the chosen app.
+    @discardableResult
+    func openAppControl(for device: DiscoveredDevice, password: String? = nil) async throws -> AppControlPanelController {
+        // Pixels come from macOS Screen Sharing.
+        try? await ScreenShareConnectionService.shared.connect(to: device)
+
+        // App control rides the LocalCast control channel (port 5904), so the
+        // host needs LocalCast hosting on. Resolve auth the same way as connect.
+        var resolvedPassword = device.localCastAuthRequired == false ? nil : password
+        if device.localCastAuthRequired == true && (resolvedPassword?.isEmpty ?? true) {
+            let creds = await Task.detached(priority: .userInitiated) {
+                try? KeychainService.shared.getCredential(for: device)
+            }.value
+            resolvedPassword = creds?.password
+        }
+
+        let session = ClientSession(device: device)
+        try await session.connect(password: resolvedPassword)
+
+        let controller = AppControlPanelController(device: device, session: session)
+        activeControlPanels.append(controller)
+        controller.onClose = { [weak self] closed in
+            self?.activeControlPanels.removeAll { $0 === closed }
+        }
+        controller.showWindow(nil)
+        controller.window?.makeKeyAndOrderFront(nil)
+        session.requestAppList()
+        return controller
+    }
 
     func disconnect(from device: DiscoveredDevice) {
         activeConnections.removeAll { $0.device.id == device.id }
