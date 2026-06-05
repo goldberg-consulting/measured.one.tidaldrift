@@ -680,7 +680,8 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             codec: decoder.codecName,
             mode: mode,
             droppedPerSec: lostFrameCount,
-            bufferDepth: renderer?.currentBufferDepth ?? 0
+            bufferDepth: renderer?.currentBufferDepth ?? 0,
+            fecRecoveredPerSec: transport.takeFECRecovered()
         )
 
         frameCount = 0

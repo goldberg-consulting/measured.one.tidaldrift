@@ -51,6 +51,7 @@ struct LocalCastStats {
     var mode: String = "—"          // "Full-frame", "Region tiles", or "Mixed"
     var droppedPerSec: Int = 0
     var bufferDepth: Int = 0
+    var fecRecoveredPerSec: Int = 0
 }
 
 struct LocalCastConnection: Identifiable {

@@ -835,6 +835,7 @@ struct LocalCastStatsOverlay: View {
                 row("Latency", "\(Int(stats.latencyMs)) ms")
                 row("Dropped", "\(stats.droppedPerSec)/s",
                     warn: stats.droppedPerSec > 0)
+                row("Recovered", "\(stats.fecRecoveredPerSec)/s")
                 row("Buffer", "\(stats.bufferDepth)")
             }
             .padding(8)

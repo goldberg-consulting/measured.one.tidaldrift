@@ -12,6 +12,7 @@ struct LocalCastSettingsView: View {
     @AppStorage("localCastDropToNewest") var dropToNewest = true
     @AppStorage("localCastLossRecovery") var lossRecovery = true
     @AppStorage("localCastRegionAware") var regionAware = false
+    @AppStorage("localCastFEC") var forwardErrorCorrection = false
     
     @State private var hostPassword = ""
     
@@ -128,6 +129,9 @@ struct LocalCastSettingsView: View {
 
                     Toggle("Loss-triggered recovery", isOn: $lossRecovery)
                         .help("Request a fresh keyframe immediately when a frame is lost, so the picture heals in ~1 round trip instead of waiting for the next scheduled keyframe. Client-side; applies to the next connection.")
+
+                    Toggle("Forward error correction (FEC)", isOn: $forwardErrorCorrection)
+                        .help("Send XOR parity so the viewer can rebuild a lost packet without a retransmit (Moonlight/Sunshine-style). Best for lossy Wi-Fi; adds ~6% bandwidth. Host-side; both Macs should be updated. Watch \"Recovered/s\" in the stats overlay.")
 
                     Text("On lossy Wi-Fi these keep motion smooth and recover quickly. On a clean wired link they have little effect. Turn them off to force fixed-bitrate, play-everything behavior.")
                         .font(.caption)
