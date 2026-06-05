@@ -67,7 +67,12 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
     private var hostEndpoint: NWEndpoint?
     private var heartbeatTimer: Timer?
     private var lastHeartbeatResponse: Date?
+    private var lastHeartbeatSent: Date?
+    private var lastRTTms: Double = 0
     private var frameCount: Int = 0
+    private var tileUpdateCount: Int = 0
+    private var receivedMediaBytes: Int = 0
+    private var lostFrameCount: Int = 0
     private var lastStatsUpdate: Date = Date()
     private var connectionStartTime: Date?
     private var diagnosticTimer: Timer?
@@ -441,6 +446,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
     private static let lossKeyframeMinInterval: TimeInterval = 0.3
 
     func udpTransportDidLoseFrames(_ transport: UDPTransport) {
+        lostFrameCount += 1
         guard lossRecoveryEnabled, isConnected else { return }
         let now = Date()
         guard now.timeIntervalSince(lastLossKeyframeRequest) >= Self.lossKeyframeMinInterval else { return }
@@ -635,6 +641,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
     private func sendHeartbeat() {
         guard let endpoint = hostEndpoint else { return }
         heartbeatsSent += 1
+        lastHeartbeatSent = Date()
         let heartbeat = LocalCastPacket(
             type: .heartbeat,
             sequenceNumber: UInt32(heartbeatsSent),
@@ -642,6 +649,47 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             payload: Data()
         )
         transport.send(packet: heartbeat, to: endpoint)
+        publishStatsIfDue()
+    }
+
+    /// Aggregate the last window's counters into the published stats. Driven by
+    /// the 1s heartbeat tick so it updates even when only tiles (not full
+    /// frames) are arriving.
+    private func publishStatsIfDue() {
+        let now = Date()
+        let elapsed = now.timeIntervalSince(lastStatsUpdate)
+        guard elapsed >= 1.0 else { return }
+
+        let updates = frameCount + tileUpdateCount
+        let mbps = Double(receivedMediaBytes) * 8 / elapsed / 1_000_000
+        let mode: String
+        if updates == 0 {
+            mode = "—"
+        } else if tileUpdateCount > 0 && frameCount > 0 {
+            mode = "Mixed"
+        } else if tileUpdateCount > 0 {
+            mode = "Region tiles"
+        } else {
+            mode = "Full-frame"
+        }
+        let stats = LocalCastStats(
+            latencyMs: lastRTTms,
+            fps: updates,
+            bitrateMbps: mbps,
+            resolution: remoteResolution ?? .zero,
+            codec: decoder.codecName,
+            mode: mode,
+            droppedPerSec: lostFrameCount,
+            bufferDepth: renderer?.currentBufferDepth ?? 0
+        )
+
+        frameCount = 0
+        tileUpdateCount = 0
+        receivedMediaBytes = 0
+        lostFrameCount = 0
+        lastStatsUpdate = now
+
+        DispatchQueue.main.async { [weak self] in self?.stats = stats }
     }
 
     // MARK: - UDPTransportDelegate
@@ -650,6 +698,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         switch packet.type {
         case .videoFrame:
             frameCount += 1
+            receivedMediaBytes += packet.payload.count
             if frameCount == 1 || frameCount % 60 == 0 {
                 lcDebug("📦 ClientSession: Received video frame #\(frameCount), size: \(packet.payload.count) bytes")
             }
@@ -665,25 +714,11 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
                 }
             }
 
-            // Update stats every second
-            let now = Date()
-            if now.timeIntervalSince(lastStatsUpdate) >= 1.0 {
-                let fps = frameCount
-                frameCount = 0
-                lastStatsUpdate = now
-
-                DispatchQueue.main.async { [weak self] in
-                    self?.stats = LocalCastStats(
-                        latencyMs: 0,
-                        fps: fps,
-                        bitrateMbps: 0
-                    )
-                }
-            }
-
         case .tileUpdate:
             // Region-aware: a changed screen region. Decode and patch the canvas.
             if let tile = TileCodec.decode(packet.payload) {
+                tileUpdateCount += 1
+                receivedMediaBytes += packet.payload.count
                 renderer?.applyTile(x: tile.x, y: tile.y, width: tile.width, height: tile.height, bgra: tile.bgra)
                 if !isConnected {
                     DispatchQueue.main.async { [weak self] in
@@ -696,8 +731,11 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             }
 
         case .heartbeat:
-            // Pong received - calculate latency
+            // Pong received - record round-trip latency for the HUD.
             lastHeartbeatResponse = Date()
+            if let sent = lastHeartbeatSent {
+                lastRTTms = Date().timeIntervalSince(sent) * 1000
+            }
             heartbeatsReceived += 1
             if !isConnected {
                 DispatchQueue.main.async { [weak self] in

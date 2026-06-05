@@ -44,6 +44,13 @@ struct LocalCastStats {
     let latencyMs: Double
     let fps: Int
     let bitrateMbps: Double
+    // Verification fields for the live HUD: what is actually being streamed,
+    // so settings changes (resolution, codec, region-aware) are observable.
+    var resolution: CGSize = .zero
+    var codec: String = "—"
+    var mode: String = "—"          // "Full-frame", "Region tiles", or "Mixed"
+    var droppedPerSec: Int = 0
+    var bufferDepth: Int = 0
 }
 
 struct LocalCastConnection: Identifiable {

@@ -822,19 +822,36 @@ struct MetalViewRepresentable: NSViewRepresentable {
 
 struct LocalCastStatsOverlay: View {
     let stats: LocalCastStats?
-    
+
     var body: some View {
         if let stats = stats {
-            VStack(alignment: .trailing, spacing: 2) {
-                Text("\(Int(stats.latencyMs))ms")
-                    .font(.system(.caption, design: .monospaced))
-                Text("\(stats.fps) fps")
-                    .font(.system(.caption, design: .monospaced))
-                Text("\(String(format: "%.1f", stats.bitrateMbps)) Mbps")
-                    .font(.system(.caption, design: .monospaced))
+            VStack(alignment: .leading, spacing: 2) {
+                row("Resolution", stats.resolution.width > 0
+                    ? "\(Int(stats.resolution.width))×\(Int(stats.resolution.height))" : "—")
+                row("Codec", stats.codec)
+                row("Mode", stats.mode)
+                row("Rate", "\(stats.fps)/s")
+                row("Bitrate", String(format: "%.1f Mbps", stats.bitrateMbps))
+                row("Latency", "\(Int(stats.latencyMs)) ms")
+                row("Dropped", "\(stats.droppedPerSec)/s",
+                    warn: stats.droppedPerSec > 0)
+                row("Buffer", "\(stats.bufferDepth)")
             }
-            .padding(6)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 6))
+            .padding(8)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 8))
+        }
+    }
+
+    private func row(_ label: String, _ value: String, warn: Bool = false) -> some View {
+        HStack(spacing: 8) {
+            Text(label)
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .frame(width: 70, alignment: .leading)
+            Text(value)
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .foregroundStyle(warn ? .orange : .primary)
+            Spacer(minLength: 0)
         }
     }
 }

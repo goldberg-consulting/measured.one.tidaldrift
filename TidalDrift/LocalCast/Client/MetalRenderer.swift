@@ -58,6 +58,12 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     // present are committed to one queue in order (no GPU read/write race).
     private var canvasMode = false
     private var canvasTexture: MTLTexture?
+
+    /// Current jitter-buffer depth (frames queued), for the stats HUD.
+    var currentBufferDepth: Int {
+        frameQueueLock.lock(); defer { frameQueueLock.unlock() }
+        return frameQueue.count
+    }
     private var vertices: MTLBuffer?
     private var texCoords: MTLBuffer?
     
