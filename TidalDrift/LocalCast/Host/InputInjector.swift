@@ -18,6 +18,9 @@ class InputInjector {
     /// subsequent move can be injected as a drag rather than a plain move.
     /// `inject(_:)` is called sequentially per client, so a plain var is safe.
     private var heldMouseButton: Int?
+
+    /// Limits the release-visible click-mapping diagnostic to the first few clicks.
+    private var mouseDownLogCount = 0
     
     enum RemoteInput {
         case mouseMove(x: Double, y: Double)
@@ -243,6 +246,14 @@ class InputInjector {
             
         case .mouseDown(let button, let x, let y):
             let point = normalizedToScreenCoordinates(x: x, y: y)
+            // Release-visible mapping log for the first few clicks so a coordinate
+            // offset (esp. single-window/app streaming) can be diagnosed from a
+            // normal build via Console: filter subsystem com.tidaldrift.
+            if mouseDownLogCount < 4 {
+                mouseDownLogCount += 1
+                let b = captureBounds.map { "(\(Int($0.origin.x)),\(Int($0.origin.y)) \(Int($0.width))x\(Int($0.height)))" } ?? "fullDisplay"
+                logger.info("🖱️ map norm(\(String(format: "%.3f", x)), \(String(format: "%.3f", y))) -> screen(\(Int(point.x)), \(Int(point.y))) bounds=\(b)")
+            }
             let type: CGEventType = button == 0 ? .leftMouseDown : (button == 1 ? .rightMouseDown : .otherMouseDown)
             guard let event = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: point, mouseButton: CGMouseButton(rawValue: UInt32(button))!) else {
                 lcDebug("[INPUT-DIAG] ❌ INJECT FAILED: could not create mouseDown CGEvent at norm(\(x), \(y))")
