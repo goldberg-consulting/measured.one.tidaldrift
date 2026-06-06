@@ -13,6 +13,20 @@ struct LocalCastConfiguration: Codable {
         case h264       // Wider compatibility, faster encode
         case hevc       // Better compression, newer Macs only
     }
+
+    enum LatencyMode: String, CaseIterable, Codable {
+        case smooth
+        case balanced
+        case low
+
+        var displayName: String {
+            switch self {
+            case .smooth: return "Smooth"
+            case .balanced: return "Balanced"
+            case .low: return "Low Latency"
+            }
+        }
+    }
     
     var qualityPreset: QualityPreset = .ultra
     /// HEVC is the preferred Mac-to-Mac codec: it is hardware accelerated via
@@ -39,6 +53,10 @@ struct LocalCastConfiguration: Codable {
     /// the client can recover a single lost fragment per FEC block without a
     /// retransmit. Host-side and safe to update live.
     var forwardErrorCorrection: Bool = false
+
+    /// Client-side presentation policy. Balanced smooths jitter; Low Latency
+    /// keeps the buffer minimal for faster cursor/control feedback.
+    var latencyMode: LatencyMode = .balanced
     
     // Security
     var requireAuthentication: Bool = true

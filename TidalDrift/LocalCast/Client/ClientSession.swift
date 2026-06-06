@@ -672,6 +672,8 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         } else {
             mode = "Full-frame"
         }
+        let recovered = transport.takeFECRecovered()
+        let bufferDepth = renderer?.currentBufferDepth ?? 0
         let stats = LocalCastStats(
             latencyMs: lastRTTms,
             fps: updates,
@@ -680,9 +682,11 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             codec: decoder.codecName,
             mode: mode,
             droppedPerSec: lostFrameCount,
-            bufferDepth: renderer?.currentBufferDepth ?? 0,
-            fecRecoveredPerSec: transport.takeFECRecovered()
+            bufferDepth: bufferDepth,
+            fecRecoveredPerSec: recovered
         )
+
+        sendTelemetry(stats)
 
         frameCount = 0
         tileUpdateCount = 0
@@ -691,6 +695,25 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         lastStatsUpdate = now
 
         DispatchQueue.main.async { [weak self] in self?.stats = stats }
+    }
+
+    private func sendTelemetry(_ stats: LocalCastStats) {
+        guard let endpoint = hostEndpoint,
+              let payload = try? JSONEncoder().encode(LocalCastClientTelemetry(
+                droppedPerSec: stats.droppedPerSec,
+                fecRecoveredPerSec: stats.fecRecoveredPerSec,
+                latencyMs: stats.latencyMs,
+                bufferDepth: stats.bufferDepth,
+                bitrateMbps: stats.bitrateMbps
+              )) else { return }
+
+        let packet = LocalCastPacket(
+            type: .stats,
+            sequenceNumber: UInt32(heartbeatsSent),
+            timestamp: CFAbsoluteTimeGetCurrent() + kCFAbsoluteTimeIntervalSince1970,
+            payload: payload
+        )
+        transport.send(packet: packet, to: endpoint)
     }
 
     // MARK: - UDPTransportDelegate

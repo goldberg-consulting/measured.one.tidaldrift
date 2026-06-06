@@ -112,6 +112,28 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     private static let adaptiveDecreaseCooldown: TimeInterval = 0.5
     private static let adaptiveRecoveryQuiet: TimeInterval = 2.5
 
+    private func noteClientTelemetry(_ telemetry: LocalCastClientTelemetry) {
+        guard configuration.adaptiveQuality else { return }
+        let now = Date()
+        guard now >= adaptiveGraceUntil else { return }
+
+        adaptiveQueue.async { [weak self] in
+            guard let self else { return }
+            if telemetry.droppedPerSec > 0,
+               now.timeIntervalSince(self.lastAdaptiveDecrease) >= Self.adaptiveDecreaseCooldown,
+               self.adaptiveScale > Self.adaptiveMinScale {
+                self.adaptiveScale = max(Self.adaptiveMinScale, self.adaptiveScale * Self.adaptiveDecreaseFactor)
+                self.lastAdaptiveDecrease = now
+                self.applyAdaptiveBitrate()
+                self.logger.info("📉 Adaptive bitrate down from telemetry: dropped=\(telemetry.droppedPerSec), recovered=\(telemetry.fecRecoveredPerSec), scale=\(String(format: "%.2f", self.adaptiveScale))")
+            } else if telemetry.droppedPerSec == 0 {
+                // FEC is either keeping up (recovered > 0) or the link is clean.
+                // Schedule a conservative recovery toward the configured target.
+                self.scheduleAdaptiveRecovery()
+            }
+        }
+    }
+
     // MARK: - Region-aware streaming (experimental)
     //
     // When enabled, frames with a small changed area are sent as lossless tiles
@@ -808,6 +830,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
 
     private var receivedInputCount: UInt64 = 0
 
+    // swiftlint:disable cyclomatic_complexity function_body_length
     func udpTransport(_ transport: UDPTransport, didReceivePacket packet: LocalCastPacket, from endpoint: NWEndpoint) {
         // Update client endpoint if not already set
         if clientEndpoint == nil {
@@ -946,10 +969,16 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         case .qualityUpdate:
             handleQualityUpdate(payload: packet.payload)
 
+        case .stats:
+            if let telemetry = try? JSONDecoder().decode(LocalCastClientTelemetry.self, from: packet.payload) {
+                noteClientTelemetry(telemetry)
+            }
+
         default:
             lcDebug("❓ HostSession: Received unknown packet type: \(packet.type)")
         }
     }
+    // swiftlint:enable cyclomatic_complexity function_body_length
 
     // MARK: - App List & Stream Request Handling
     //
