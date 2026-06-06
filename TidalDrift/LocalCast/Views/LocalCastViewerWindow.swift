@@ -140,7 +140,12 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
             // rect. Converting into MTKView space created a mixed coordinate
             // basis after toolbar fold/unfold and caused large cursor offsets.
             let point = contentView.convert(event.locationInWindow, from: nil)
-            self.handleMouseEvent(event, at: point, viewSize: contentView.frame.size)
+            self.handleMouseEvent(
+                event,
+                at: point,
+                viewSize: contentView.frame.size,
+                contentViewIsFlipped: contentView.isFlipped
+            )
             if self.diagCount <= 20 { lcDebug("🖱️ FORWARDED to remote at (\(point.x / contentView.frame.width), \(point.y / contentView.frame.height))") }
             return nil
         }
@@ -172,7 +177,12 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
         localMonitors.append(keyMonitor as Any)
     }
     
-    private func handleMouseEvent(_ event: NSEvent, at point: NSPoint, viewSize: CGSize) {
+    private func handleMouseEvent(
+        _ event: NSEvent,
+        at point: NSPoint,
+        viewSize: CGSize,
+        contentViewIsFlipped: Bool
+    ) {
         guard viewSize.width > 0, viewSize.height > 0 else { return }
 
         // Scroll carries deltas, not a position; forward it regardless of where
@@ -191,11 +201,10 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
 
         let rawX = (point.x - videoRect.minX) / videoRect.width
         let yFromBottom = (point.y - videoRect.minY) / videoRect.height
-        // The remote expects top-left origin (y down). NSHostingView can report
-        // flipped geometry differently across titlebar/fullscreen/layout states;
-        // using contentView.isFlipped made Y reverse after toolbar fold/unfold.
-        // `event.locationInWindow` is bottom-origin, so convert explicitly.
-        let rawY = 1.0 - yFromBottom
+        // The remote expects top-left origin (y down). NSHostingView is usually
+        // flipped, so its converted point is already top-origin. When it is not
+        // flipped, convert from AppKit's bottom-origin coordinates.
+        let rawY = contentViewIsFlipped ? yFromBottom : (1.0 - yFromBottom)
         // Clamp into [0,1] rather than dropping clicks in the letterbox bars, so
         // a mouse-up that lands on a bar can't leave a stuck button on the host.
         let relativeX = min(max(rawX, 0), 1)
