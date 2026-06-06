@@ -63,3 +63,13 @@ struct LocalCastPacket {
         }
     }
 }
+
+/// Lightweight client -> host stream-health telemetry used to adapt bitrate and
+/// pacing. Sent about once per second over the existing control path.
+struct LocalCastClientTelemetry: Codable {
+    let droppedPerSec: Int
+    let fecRecoveredPerSec: Int
+    let latencyMs: Double
+    let bufferDepth: Int
+    let bitrateMbps: Double
+}

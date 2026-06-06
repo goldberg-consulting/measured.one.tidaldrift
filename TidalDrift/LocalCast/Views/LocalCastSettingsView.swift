@@ -13,6 +13,7 @@ struct LocalCastSettingsView: View {
     @AppStorage("localCastLossRecovery") var lossRecovery = true
     @AppStorage("localCastRegionAware") var regionAware = false
     @AppStorage("localCastFEC") var forwardErrorCorrection = false
+    @AppStorage("localCastLatencyMode") var latencyMode: LocalCastConfiguration.LatencyMode = .balanced
     
     @State private var hostPassword = ""
     @State private var isRestartingStream = false
@@ -156,6 +157,13 @@ struct LocalCastSettingsView: View {
 
                     Toggle("Forward error correction (FEC)", isOn: $forwardErrorCorrection)
                         .help("Send two parity packets per 16 video fragments so the viewer can rebuild up to two lost packets without a retransmit (Moonlight/Sunshine-style). Best for lossy Wi-Fi; adds ~12% bandwidth. Host-side; applies live. Watch \"Recovered/s\" in the stats overlay.")
+
+                    Picker("Latency mode", selection: $latencyMode) {
+                        ForEach(LocalCastConfiguration.LatencyMode.allCases, id: \.self) { mode in
+                            Text(mode.displayName).tag(mode)
+                        }
+                    }
+                    .help("Client-side jitter buffer policy. Low Latency reduces buffering for snappier cursor/control; Smooth adds more cushion for uneven Wi-Fi. Applies to the next viewer connection.")
 
                     Text("On lossy Wi-Fi these keep motion smooth and recover quickly. On a clean wired link they have little effect. Turn them off to force fixed-bitrate, play-everything behavior.")
                         .font(.caption)

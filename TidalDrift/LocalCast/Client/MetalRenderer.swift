@@ -44,8 +44,25 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     private var arrivalIntervalEWMA: Double = 1.0 / 60.0  // est. source frame interval
     private var jitterEWMA: Double = 0
     private var targetDepth = 2
-    private let minDepth = 1
-    private let maxDepth = 6
+    var latencyMode: LocalCastConfiguration.LatencyMode =
+        (UserDefaults.standard.string(forKey: "localCastLatencyMode")
+            .flatMap(LocalCastConfiguration.LatencyMode.init(rawValue:))) ?? .balanced
+
+    private var minDepth: Int {
+        switch latencyMode {
+        case .low: return 0
+        case .balanced: return 1
+        case .smooth: return 2
+        }
+    }
+
+    private var maxDepth: Int {
+        switch latencyMode {
+        case .low: return 2
+        case .balanced: return 6
+        case .smooth: return 10
+        }
+    }
 
     // MARK: - Region-aware canvas
     //
