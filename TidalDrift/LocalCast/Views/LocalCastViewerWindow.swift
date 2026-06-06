@@ -135,14 +135,12 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
                 return event
             }
             
-            // Normalize against the actual Metal video view, not the hosting
-            // view. The hosting view also contains toolbar/bottom overlays; in
-            // full screen those can shift the perceived video area and make the
-            // top edge click mapping drift.
-            let pointInContent = contentView.convert(event.locationInWindow, from: nil)
-            let point = self.clientSession.renderer?.viewPoint(fromContentPoint: pointInContent, in: contentView) ?? pointInContent
-            let viewSize = self.clientSession.renderer?.viewSize ?? contentView.frame.size
-            self.handleMouseEvent(event, at: point, viewSize: viewSize)
+            // Normalize against the SwiftUI hosting content view. The Metal view
+            // is full-bleed in that view, and overlays do not change the video
+            // rect. Converting into MTKView space created a mixed coordinate
+            // basis after toolbar fold/unfold and caused large cursor offsets.
+            let point = contentView.convert(event.locationInWindow, from: nil)
+            self.handleMouseEvent(event, at: point, viewSize: contentView.frame.size)
             if self.diagCount <= 20 { lcDebug("🖱️ FORWARDED to remote at (\(point.x / contentView.frame.width), \(point.y / contentView.frame.height))") }
             return nil
         }
@@ -175,7 +173,6 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
     }
     
     private func handleMouseEvent(_ event: NSEvent, at point: NSPoint, viewSize: CGSize) {
-        guard let window = self.window, let contentView = window.contentView else { return }
         guard viewSize.width > 0, viewSize.height > 0 else { return }
 
         // Scroll carries deltas, not a position; forward it regardless of where
@@ -194,9 +191,11 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
 
         let rawX = (point.x - videoRect.minX) / videoRect.width
         let yFromBottom = (point.y - videoRect.minY) / videoRect.height
-        // The remote expects top-left origin (y down). Content view is bottom-left
-        // origin (y up) unless flipped.
-        let rawY = contentView.isFlipped ? yFromBottom : (1.0 - yFromBottom)
+        // The remote expects top-left origin (y down). NSHostingView can report
+        // flipped geometry differently across titlebar/fullscreen/layout states;
+        // using contentView.isFlipped made Y reverse after toolbar fold/unfold.
+        // `event.locationInWindow` is bottom-origin, so convert explicitly.
+        let rawY = 1.0 - yFromBottom
         // Clamp into [0,1] rather than dropping clicks in the letterbox bars, so
         // a mouse-up that lands on a bar can't leave a stuck button on the host.
         let relativeX = min(max(rawX, 0), 1)

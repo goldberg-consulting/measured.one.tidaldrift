@@ -125,20 +125,20 @@ class UDPTransport {
     private let pacingGapMicros = 700          // gap between bursts (~256 Mbps ceiling)
     private let paceQueue = DispatchQueue(label: "com.tidaldrift.localcast.sendpace", qos: .userInteractive)
 
-    // Forward error correction (XOR parity). When enabled (host/sender side),
-    // each block of `fecBlockSize` video data fragments gets one parity fragment
-    // = XOR of the block's payloads (zero-padded to the fragment payload size).
-    // The receiver can reconstruct exactly one lost data fragment per block
-    // without a retransmit. Parity reuses the 10-byte fragment header with the
-    // high bit of `fragmentIndex` set, so the wire format is unchanged for peers
-    // that don't understand FEC (they simply ignore parity, since it's kept in a
-    // separate buffer and never counted toward frame completion). Recovery on
-    // the receiver is always attempted; only the sender's parity emission is
-    // gated by the toggle.
+    // Forward error correction. When enabled (host/sender side), each block of
+    // `fecBlockSize` video data fragments gets two parity fragments:
+    //   P = XOR(data[i])
+    //   Q = XOR((i + 1) * data[i]) over GF(256)
+    // The receiver can reconstruct up to two lost data fragments per block
+    // without a retransmit. Parity reuses the 10-byte fragment header: high bit
+    // of `fragmentIndex` marks parity and the next bit marks Q parity, so the
+    // base header stays unchanged.
     var fecEnabled = UserDefaults.standard.object(forKey: "localCastFEC") as? Bool ?? false
     private let fecBlockSize = 16
     private static let fecParityFlag: UInt16 = 0x8000
-    private var parityBuffers: [UInt32: [UInt16: Data]] = [:] // frameId -> blockIndex -> parity payload
+    private static let fecQParityFlag: UInt16 = 0x4000
+    private var parityBuffers: [UInt32: [UInt16: Data]] = [:] // P parity: frameId -> blockIndex -> payload
+    private var qParityBuffers: [UInt32: [UInt16: Data]] = [:] // Q parity: frameId -> blockIndex -> payload
     private var _fecRecovered = 0  // guarded by fragmentLock
     
     var localPort: UInt16? {
@@ -320,29 +320,41 @@ class UDPTransport {
             fragments.append(fragmentData)
         }
 
-        // Optionally interleave one XOR parity fragment after each block of data
-        // fragments, so the receiver can recover a single lost fragment per block.
+        // Optionally interleave two parity fragments after each block of data
+        // fragments, so the receiver can recover up to two lost fragments per
+        // block without a retransmit.
         var sendList = fragments
         if fecEnabled && droppable && totalFragments > 1 {
             sendList = []
-            sendList.reserveCapacity(fragments.count + fragments.count / fecBlockSize + 1)
+            sendList.reserveCapacity(fragments.count + (fragments.count / fecBlockSize + 1) * 2)
             var index = 0
             var blockIndex: UInt16 = 0
             while index < fragments.count {
                 let blockEnd = min(index + fecBlockSize, fragments.count)
                 for j in index..<blockEnd { sendList.append(fragments[j]) }
 
-                let parityPayload = xorParity(of: data, fragmentRange: index..<blockEnd, payloadSize: payloadSize)
-                let parityHeader = FragmentHeader(
+                let parity = fecParity(of: data, fragmentRange: index..<blockEnd, payloadSize: payloadSize)
+                let pHeader = FragmentHeader(
                     frameId: frameId,
                     fragmentIndex: Self.fecParityFlag | blockIndex,
                     totalFragments: totalFragments,
-                    payloadLength: UInt16(parityPayload.count)
+                    payloadLength: UInt16(parity.p.count)
                 )
-                var parityData = Data()
-                parityData.append(parityHeader.serialize())
-                parityData.append(parityPayload)
-                sendList.append(parityData)
+                var pData = Data()
+                pData.append(pHeader.serialize())
+                pData.append(parity.p)
+                sendList.append(pData)
+
+                let qHeader = FragmentHeader(
+                    frameId: frameId,
+                    fragmentIndex: Self.fecParityFlag | Self.fecQParityFlag | blockIndex,
+                    totalFragments: totalFragments,
+                    payloadLength: UInt16(parity.q.count)
+                )
+                var qData = Data()
+                qData.append(qHeader.serialize())
+                qData.append(parity.q)
+                sendList.append(qData)
 
                 index = blockEnd
                 blockIndex += 1
@@ -375,10 +387,11 @@ class UDPTransport {
         return v
     }
 
-    /// XOR of the given data fragments (each zero-padded to `payloadSize`),
-    /// forming the parity payload for one FEC block.
-    private func xorParity(of data: Data, fragmentRange: Range<Int>, payloadSize: Int) -> Data {
-        var parity = [UInt8](repeating: 0, count: payloadSize)
+    /// P/Q parity of the given data fragments (each zero-padded to
+    /// `payloadSize`), forming the FEC payloads for one block.
+    private func fecParity(of data: Data, fragmentRange: Range<Int>, payloadSize: Int) -> (p: Data, q: Data) {
+        var pParity = [UInt8](repeating: 0, count: payloadSize)
+        var qParity = [UInt8](repeating: 0, count: payloadSize)
         data.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
             guard let base = buf.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
             let count = buf.count
@@ -386,16 +399,19 @@ class UDPTransport {
                 let start = i * payloadSize
                 guard start < count else { continue }
                 let end = min(start + payloadSize, count)
+                let coefficient = UInt8((i - fragmentRange.lowerBound) + 1)
                 var k = 0
                 var p = start
                 while p < end {
-                    parity[k] ^= base[p]
+                    let byte = base[p]
+                    pParity[k] ^= byte
+                    qParity[k] ^= Self.gfMul(coefficient, byte)
                     k += 1
                     p += 1
                 }
             }
         }
-        return Data(parity)
+        return (Data(pParity), Data(qParity))
     }
     
     /// Drain a frame's fragments in small bursts separated by a short gap,
@@ -603,9 +619,15 @@ class UDPTransport {
         // stored normally. Either way, attempt FEC recovery on the affected
         // block, which can fill in a single missing data fragment.
         if (header.fragmentIndex & Self.fecParityFlag) != 0 {
-            let blockIndex = header.fragmentIndex & ~Self.fecParityFlag
-            if parityBuffers[realFrameId] == nil { parityBuffers[realFrameId] = [:] }
-            parityBuffers[realFrameId]?[blockIndex] = Data(payload)
+            let isQParity = (header.fragmentIndex & Self.fecQParityFlag) != 0
+            let blockIndex = header.fragmentIndex & ~(Self.fecParityFlag | Self.fecQParityFlag)
+            if isQParity {
+                if qParityBuffers[realFrameId] == nil { qParityBuffers[realFrameId] = [:] }
+                qParityBuffers[realFrameId]?[blockIndex] = Data(payload)
+            } else {
+                if parityBuffers[realFrameId] == nil { parityBuffers[realFrameId] = [:] }
+                parityBuffers[realFrameId]?[blockIndex] = Data(payload)
+            }
             recoverBlock(realFrameId, blockIndex: blockIndex, totalFragments: Int(header.totalFragments))
         } else {
             fragmentBuffers[realFrameId]?[header.fragmentIndex] = Data(payload)
@@ -624,6 +646,7 @@ class UDPTransport {
                 fragmentCounts.removeValue(forKey: fid)
                 frameDroppable.removeValue(forKey: fid)
                 parityBuffers.removeValue(forKey: fid)
+                qParityBuffers.removeValue(forKey: fid)
             }
         }
 
@@ -634,6 +657,7 @@ class UDPTransport {
             fragmentCounts.removeValue(forKey: oldest)
             frameDroppable.removeValue(forKey: oldest)
             parityBuffers.removeValue(forKey: oldest)
+            qParityBuffers.removeValue(forKey: oldest)
         }
         
         // Check if we have all fragments
@@ -654,6 +678,7 @@ class UDPTransport {
             fragmentCounts.removeValue(forKey: realFrameId)
             frameDroppable.removeValue(forKey: realFrameId)
             parityBuffers.removeValue(forKey: realFrameId)
+            qParityBuffers.removeValue(forKey: realFrameId)
             fragmentLock.unlock()
             
             // Parse and deliver (decrypt if needed)
@@ -670,13 +695,13 @@ class UDPTransport {
         }
     }
     
-    /// Reconstruct a single missing data fragment in `blockIndex` from its XOR
-    /// parity. Must be called with `fragmentLock` held. Recovers only when the
-    /// block has exactly one missing data fragment and parity is present, and
-    /// never the frame's last (short) fragment whose length can't be inferred.
+    /// Reconstruct up to two missing data fragments in `blockIndex` from P/Q
+    /// parity. Must be called with `fragmentLock` held. We still skip the
+    /// frame's last (short) fragment because its exact payload length is not in
+    /// the frame metadata; all earlier fragments are full-sized.
     private func recoverBlock(_ frameId: UInt32, blockIndex: UInt16, totalFragments: Int) {
         guard totalFragments > 0,
-              let parity = parityBuffers[frameId]?[blockIndex],
+              let pParity = parityBuffers[frameId]?[blockIndex],
               var frags = fragmentBuffers[frameId] else { return }
 
         let payloadSize = maxPayloadSize - FragmentHeader.size
@@ -685,29 +710,103 @@ class UDPTransport {
         let blockEnd = min(blockStart + fecBlockSize, totalFragments)
         let lastFrameIndex = totalFragments - 1
 
-        var missing = -1
+        var missing: [Int] = []
         for i in blockStart..<blockEnd where frags[UInt16(i)] == nil {
-            if missing >= 0 { return }            // more than one missing: XOR can't recover
-            missing = i
+            missing.append(i)
         }
-        guard missing >= 0 else { return }        // nothing missing
-        guard missing != lastFrameIndex else { return }  // unknown length; skip
+        guard !missing.isEmpty else { return }
+        guard missing.count <= 2 else { return }
+        guard !missing.contains(lastFrameIndex) else { return }
 
-        // recovered = parity XOR (present data fragments, each padded to payloadSize)
-        var recovered = [UInt8](repeating: 0, count: payloadSize)
-        parity.withUnsafeBytes { (b: UnsafeRawBufferPointer) in
-            for k in 0..<min(b.count, payloadSize) { recovered[k] ^= b[k] }
-        }
-        for i in blockStart..<blockEnd where i != missing {
-            guard let frag = frags[UInt16(i)] else { return }
-            frag.withUnsafeBytes { (b: UnsafeRawBufferPointer) in
+        if missing.count == 1 {
+            var recovered = [UInt8](repeating: 0, count: payloadSize)
+            pParity.withUnsafeBytes { (b: UnsafeRawBufferPointer) in
                 for k in 0..<min(b.count, payloadSize) { recovered[k] ^= b[k] }
+            }
+            for i in blockStart..<blockEnd where i != missing[0] {
+                guard let frag = frags[UInt16(i)] else { return }
+                xorInto(&recovered, fragment: frag, payloadSize: payloadSize)
+            }
+            frags[UInt16(missing[0])] = Data(recovered)
+            fragmentBuffers[frameId] = frags
+            _fecRecovered += 1
+            return
+        }
+
+        guard let qParity = qParityBuffers[frameId]?[blockIndex] else { return }
+        let missingA = missing[0]
+        let missingB = missing[1]
+        let coeffA = UInt8((missingA - blockStart) + 1)
+        let coeffB = UInt8((missingB - blockStart) + 1)
+        let denom = coeffA ^ coeffB
+        guard denom != 0 else { return }
+        let invDenom = Self.gfInv(denom)
+
+        var pSyndrome = [UInt8](repeating: 0, count: payloadSize)
+        var qSyndrome = [UInt8](repeating: 0, count: payloadSize)
+        pParity.withUnsafeBytes { (b: UnsafeRawBufferPointer) in
+            for k in 0..<min(b.count, payloadSize) { pSyndrome[k] ^= b[k] }
+        }
+        qParity.withUnsafeBytes { (b: UnsafeRawBufferPointer) in
+            for k in 0..<min(b.count, payloadSize) { qSyndrome[k] ^= b[k] }
+        }
+        for i in blockStart..<blockEnd where i != missingA && i != missingB {
+            guard let frag = frags[UInt16(i)] else { return }
+            let coeff = UInt8((i - blockStart) + 1)
+            frag.withUnsafeBytes { (b: UnsafeRawBufferPointer) in
+                let n = min(b.count, payloadSize)
+                for k in 0..<n {
+                    let byte = b[k]
+                    pSyndrome[k] ^= byte
+                    qSyndrome[k] ^= Self.gfMul(coeff, byte)
+                }
             }
         }
 
-        frags[UInt16(missing)] = Data(recovered)
+        var recoveredA = [UInt8](repeating: 0, count: payloadSize)
+        var recoveredB = [UInt8](repeating: 0, count: payloadSize)
+        for k in 0..<payloadSize {
+            let rhs = qSyndrome[k] ^ Self.gfMul(coeffB, pSyndrome[k])
+            let a = Self.gfMul(rhs, invDenom)
+            recoveredA[k] = a
+            recoveredB[k] = pSyndrome[k] ^ a
+        }
+
+        frags[UInt16(missingA)] = Data(recoveredA)
+        frags[UInt16(missingB)] = Data(recoveredB)
         fragmentBuffers[frameId] = frags
-        _fecRecovered += 1
+        _fecRecovered += 2
+    }
+
+    private func xorInto(_ target: inout [UInt8], fragment: Data, payloadSize: Int) {
+        fragment.withUnsafeBytes { (b: UnsafeRawBufferPointer) in
+            for k in 0..<min(b.count, payloadSize) { target[k] ^= b[k] }
+        }
+    }
+
+    /// GF(256) multiply with primitive polynomial 0x11d (represented as 0x1d
+    /// after the high bit is shifted out).
+    private static func gfMul(_ a: UInt8, _ b: UInt8) -> UInt8 {
+        var a = a
+        var b = b
+        var p: UInt8 = 0
+        for _ in 0..<8 {
+            if (b & 1) != 0 { p ^= a }
+            let hi = (a & 0x80) != 0
+            a <<= 1
+            if hi { a ^= 0x1d }
+            b >>= 1
+        }
+        return p
+    }
+
+    private static func gfInv(_ a: UInt8) -> UInt8 {
+        guard a != 0 else { return 0 }
+        var result: UInt8 = 1
+        for _ in 0..<254 {
+            result = gfMul(result, a)
+        }
+        return result
     }
 
     /// Strip the encryption/plaintext prefix and decrypt if needed, then parse.

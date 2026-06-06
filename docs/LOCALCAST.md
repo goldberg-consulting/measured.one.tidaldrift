@@ -196,7 +196,7 @@ so typing is already a small frame. Region-aware's wins are avoiding full-frame
 keyframes, not re-encoding the whole panel every tick (ultrawide), and
 lowest-latency localized updates.
 
-### Fix 5: forward error correction (FEC, experimental, 1.6.30)
+### Fix 5: forward error correction (FEC, experimental, 1.6.30; strengthened 1.6.34)
 
 The Moonlight/Sunshine borrow: recover lost UDP packets without a retransmit.
 Toggle in Metal Streaming settings ("Forward error correction"), host-side,
@@ -204,18 +204,20 @@ default off. Both Macs should be updated.
 
 - Sender ([UDPTransport.sendFragmented](../TidalDrift/LocalCast/Transport/UDPTransport.swift)):
   for droppable (video) frames, after each block of `fecBlockSize` (16) data
-  fragments, emit one parity fragment = XOR of the block's payloads zero-padded
-  to the fragment payload size. Parity reuses the 10-byte header with the high
-  bit of `fragmentIndex` set, so the wire format is unchanged for peers that
-  don't understand FEC. Parity is interleaved after its block and paced with it.
-- Receiver: parity is stored in a separate `parityBuffers` (never counted toward
-  completion). `recoverBlock` reconstructs a single missing data fragment per
-  block via XOR, except the frame's last (short) fragment whose length can't be
-  inferred. Recovery is always attempted regardless of the local toggle.
-- Why XOR not Reed-Solomon: XOR recovers exactly one loss per block, which is
-  the common Wi-Fi pattern, with ~6% overhead and no new dependency. If the
-  stats HUD's "Recovered/s" is high but "Dropped/s" stays non-zero (multiple
-  losses per block), move to multi-parity Reed-Solomon (Phase 1b).
+  fragments, emit two parity fragments:
+  - P = XOR(data[i])
+  - Q = XOR((i + 1) * data[i]) over GF(256)
+  Parity reuses the 10-byte header: high bit of `fragmentIndex` marks parity;
+  the next bit marks Q parity. No header growth. Parity is interleaved after its
+  block and paced with it.
+- Receiver: P and Q parity are stored separately from data fragments (never
+  counted toward completion). `recoverBlock` reconstructs up to two missing data
+  fragments per block, except the frame's last (short) fragment whose length
+  can't be inferred. Recovery is always attempted regardless of the local toggle.
+- Why this instead of full Reed-Solomon: two-parity GF(256) FEC covers the
+  common "multiple losses in one block" case with ~12% overhead and no external
+  dependency. If the stats HUD's "Recovered/s" is high but "Dropped/s" stays
+  non-zero, the next escalation is broader Reed-Solomon blocks or selective NACK.
 - Stats: the HUD now shows "Recovered/s" (`fecRecoveredPerSec`).
 
 Codec note for AV1: M3/M4 can hardware-*decode* AV1 (see the Moonlight/
