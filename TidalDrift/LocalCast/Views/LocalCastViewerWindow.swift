@@ -20,7 +20,7 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
         
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1280, height: 720),
-            styleMask: [.titled, .closable, .resizable, .miniaturizable],
+            styleMask: [.titled, .closable, .resizable, .miniaturizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
@@ -29,6 +29,8 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
         window.isReleasedWhenClosed = false
         window.center()
         window.acceptsMouseMovedEvents = true
+        window.collectionBehavior = [.fullScreenPrimary]
+        window.titlebarAppearsTransparent = true
         
         // Set up Metal view
         let mtkView = MTKView()
@@ -126,15 +128,21 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
             let contentHeight = contentView.frame.height
             let y = event.locationInWindow.y
             
-            let isInToolbar = y > (contentHeight - self.toolbarRegionHeight)
+            let isInToolbar = y > (contentHeight - 24)
             let isInBottomBar = y < self.bottomBarRegionHeight
             if isInToolbar || isInBottomBar {
                 if self.diagCount <= 20 { lcDebug("🖱️ PASS-THROUGH: toolbar=\(isInToolbar) bottomBar=\(isInBottomBar) y=\(Int(y)) h=\(Int(contentHeight))") }
                 return event
             }
             
-            let point = contentView.convert(event.locationInWindow, from: nil)
-            self.handleMouseEvent(event, at: point)
+            // Normalize against the actual Metal video view, not the hosting
+            // view. The hosting view also contains toolbar/bottom overlays; in
+            // full screen those can shift the perceived video area and make the
+            // top edge click mapping drift.
+            let pointInContent = contentView.convert(event.locationInWindow, from: nil)
+            let point = self.clientSession.renderer?.viewPoint(fromContentPoint: pointInContent, in: contentView) ?? pointInContent
+            let viewSize = self.clientSession.renderer?.viewSize ?? contentView.frame.size
+            self.handleMouseEvent(event, at: point, viewSize: viewSize)
             if self.diagCount <= 20 { lcDebug("🖱️ FORWARDED to remote at (\(point.x / contentView.frame.width), \(point.y / contentView.frame.height))") }
             return nil
         }
@@ -166,9 +174,8 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
         localMonitors.append(keyMonitor as Any)
     }
     
-    private func handleMouseEvent(_ event: NSEvent, at point: NSPoint) {
+    private func handleMouseEvent(_ event: NSEvent, at point: NSPoint, viewSize: CGSize) {
         guard let window = self.window, let contentView = window.contentView else { return }
-        let viewSize = contentView.frame.size
         guard viewSize.width > 0, viewSize.height > 0 else { return }
 
         // Scroll carries deltas, not a position; forward it regardless of where
@@ -387,6 +394,7 @@ struct LocalCastContentView: View {
                     withAnimation(.easeInOut(duration: 0.2)) {
                         toolbarExpanded.toggle()
                     }
+                    syncOverlayState()
                     if !toolbarExpanded {
                         showAppPicker = false
                     }
@@ -463,6 +471,7 @@ struct LocalCastContentView: View {
         }
         .onChange(of: showAppPicker) { _ in syncOverlayState() }
         .onChange(of: showQualityPanel) { _ in syncOverlayState() }
+        .onChange(of: toolbarExpanded) { _ in syncOverlayState() }
         .onReceive(tuning.objectWillChange.debounce(for: .milliseconds(200), scheduler: DispatchQueue.main)) { _ in
             DispatchQueue.main.async {
                 session.sendQualityUpdate(tuning)
@@ -471,7 +480,7 @@ struct LocalCastContentView: View {
     }
     
     private func syncOverlayState() {
-        session.isOverlayActive = showAppPicker || showQualityPanel
+        session.isOverlayActive = toolbarExpanded || showAppPicker || showQualityPanel
     }
     
     @ViewBuilder

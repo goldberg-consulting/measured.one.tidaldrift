@@ -54,7 +54,8 @@ class VideoEncoder {
         currentQuality = quality
         
         let vtCodec: CMVideoCodecType = codec == .hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264
-        
+        var createdSession: VTCompressionSession?
+
         let status = VTCompressionSessionCreate(
             allocator: kCFAllocatorDefault,
             width: Int32(width),
@@ -65,13 +66,20 @@ class VideoEncoder {
             compressedDataAllocator: nil,
             outputCallback: compressionCallback,
             refcon: Unmanaged.passUnretained(self).toOpaque(),
-            compressionSessionOut: &session
+            compressionSessionOut: &createdSession
         )
-        
-        guard status == noErr, let session = session else {
-            logger.error("Failed to create compression session: \(status)")
+
+        guard status == noErr, let session = createdSession else {
+            logger.error("Failed to create \(codec == .hevc ? "HEVC" : "H.264") compression session: \(status)")
+            if codec == .hevc {
+                logger.warning("Falling back to H.264 encoder")
+                setup(width: width, height: height, codec: .h264, bitrateMbps: bitrateMbps, fps: fps, quality: quality)
+            }
             return
         }
+
+        self.session = session
+        currentCodec = codec
         
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: fps as CFNumber)

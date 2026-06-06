@@ -249,6 +249,15 @@ class LocalCastService: ObservableObject {
         configuration.adaptiveQuality = defaults.object(forKey: "localCastAdaptive") as? Bool ?? true
         configuration.maxDimensionOverride = defaults.object(forKey: "localCastMaxDimension") as? Int ?? 0
         configuration.regionAware = defaults.object(forKey: "localCastRegionAware") as? Bool ?? false
+        configuration.forwardErrorCorrection = defaults.object(forKey: "localCastFEC") as? Bool ?? false
+    }
+
+    /// Apply settings that can change without recreating the capture/encoder
+    /// session. Codec/resolution still require restart; resilience toggles should
+    /// not.
+    func applyLiveResilienceSettingsFromDefaults() {
+        reloadConfigurationFromDefaults()
+        hostSession?.updateRuntimeConfiguration(configuration)
     }
 
     /// Restart the active host session with the same share target, reloading all
