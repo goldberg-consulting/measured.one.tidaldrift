@@ -113,8 +113,13 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     private var lowCoverageStreak = 0
     private var lastFullRefresh = Date.distantPast
     private var pendingFullRefresh = false
-    private static let regionTileMaxCoverage = 0.30   // stay/enter TILE at or below
-    private static let regionVideoCoverage = 0.45     // switch to VIDEO above (hysteresis)
+    // Region-aware should be for tiny/static UI changes (typing, caret, small
+    // controls). During window drags the dirty rects are the old and new window
+    // positions; if we tile those, any lost/stale tile looks like tearing around
+    // the moving window. Fall back to video much earlier for motion-like frames.
+    private static let regionTileMaxCoverage = 0.06   // stay/enter TILE at or below
+    private static let regionVideoCoverage = 0.12     // switch to VIDEO above (hysteresis)
+    private static let regionMotionRectCoverage = 0.025
     private static let regionLowStreakNeeded = 3
     private static let regionFullRefreshInterval: TimeInterval = 4.0
 
@@ -501,7 +506,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         }
 
         // Large change -> VIDEO (entering from TILE forces a keyframe).
-        if change.coverage >= Self.regionVideoCoverage {
+        if change.coverage >= Self.regionVideoCoverage || isLikelyMotion(change) {
             if frameMode == .tile {
                 encoder.forceKeyFrame()
                 lastFullRefresh = now
@@ -520,6 +525,14 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         }
 
         return sendDirtyTiles(sampleBuffer, rects: change.dirtyRects)
+    }
+
+    /// Multiple dirty rects with non-trivial coverage usually means motion
+    /// (e.g. a window drag: old rect + new rect). Use the video path for this so
+    /// the moving object is temporally coherent rather than patched by independent
+    /// tiles that can go stale or arrive unevenly.
+    private func isLikelyMotion(_ change: ScreenCaptureManager.FrameChangeInfo) -> Bool {
+        change.dirtyRects.count > 1 && change.coverage >= Self.regionMotionRectCoverage
     }
 
     /// Crop the dirty bounding box and send it as a lossless tile. Returns true

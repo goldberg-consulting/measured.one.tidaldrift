@@ -106,6 +106,7 @@ class LocalCastService: ObservableObject {
                 // objectWillChange fires *before* the value changes,
                 // so dispatch async to read the new values.
                 Task { @MainActor in
+                    self.streamingTuning.saveToDefaults()
                     self.applyTuningToHostSession()
                 }
             }
@@ -209,8 +210,12 @@ class LocalCastService: ObservableObject {
             self.isAuthEnabled = false
         }
         
-        // Sync initial tuning from the configuration preset
-        streamingTuning.syncFrom(configuration)
+        // Use saved live tuning if the user has tuned it; otherwise initialize
+        // from the quality preset. This keeps restart-to-apply from resetting
+        // the slider/overrides back to "auto".
+        if !streamingTuning.loadFromDefaults() {
+            streamingTuning.syncFrom(configuration)
+        }
         
         let session = HostSession(configuration: configuration, password: hostPassword)
         try await session.start(target: target)
@@ -253,7 +258,20 @@ class LocalCastService: ObservableObject {
         guard isHosting else { return }
         let target = currentHostTarget
         let name = shareTargetName
-        stopHosting()
+        streamingTuning.saveToDefaults()
+
+        // Stop synchronously before re-binding the UDP listener. The public
+        // stopHosting() is intentionally fire-and-forget for UI responsiveness,
+        // but a settings restart immediately starts a new listener on the same
+        // port (5904). If the old listener is still closing, clients see a
+        // transient "host can't be reached".
+        let oldSession = hostSession
+        isHosting = false
+        isAuthEnabled = false
+        stopAdvertisement()
+        hostSession = nil
+        await oldSession?.stop()
+        delegate?.localCastDidStopHosting()
 
         do {
             try await startHosting(target: target)

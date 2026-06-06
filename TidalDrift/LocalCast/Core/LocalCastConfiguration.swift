@@ -103,6 +103,13 @@ struct LocalCastConfiguration: Codable {
 /// values between the "low" and "ultra" extremes. Individual overrides let
 /// power users fine-tune specific axes.
 class StreamingTuning: ObservableObject {
+    private enum DefaultsKey {
+        static let quality = "localCastLiveQuality"
+        static let fps = "localCastLiveFpsOverride"
+        static let bitrate = "localCastLiveBitrateOverride"
+        static let encoderQuality = "localCastLiveEncoderQualityOverride"
+        static let maxDimension = "localCastLiveMaxDimensionOverride"
+    }
     
     // MARK: - Master slider (0.0 = lowest, 1.0 = best)
     
@@ -216,6 +223,41 @@ class StreamingTuning: ObservableObject {
         encoderQualityOverride = payload.encoderQualityOverride
         maxDimensionOverride = payload.maxDimensionOverride
     }
+
+    /// Persist the live tuning values so a host restart (needed for codec,
+    /// resolution, FEC, or region-aware changes) does not reset the slider back
+    /// to the preset. This mirrors game-streaming clients: negotiated session
+    /// parameters stay stable until the user changes them.
+    func saveToDefaults() {
+        let defaults = UserDefaults.standard
+        defaults.set(quality, forKey: DefaultsKey.quality)
+        setOptional(fpsOverride, forKey: DefaultsKey.fps, defaults: defaults)
+        setOptional(bitrateOverride, forKey: DefaultsKey.bitrate, defaults: defaults)
+        if let encoderQualityOverride {
+            defaults.set(Double(encoderQualityOverride), forKey: DefaultsKey.encoderQuality)
+        } else {
+            defaults.removeObject(forKey: DefaultsKey.encoderQuality)
+        }
+        setOptional(maxDimensionOverride, forKey: DefaultsKey.maxDimension, defaults: defaults)
+    }
+
+    /// Load live tuning values, if present. Returns true when a saved live tune
+    /// was found; false means callers should sync from the quality preset.
+    @discardableResult
+    func loadFromDefaults() -> Bool {
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: DefaultsKey.quality) != nil else { return false }
+        quality = defaults.double(forKey: DefaultsKey.quality)
+        fpsOverride = optionalInt(DefaultsKey.fps, defaults: defaults)
+        bitrateOverride = optionalInt(DefaultsKey.bitrate, defaults: defaults)
+        if defaults.object(forKey: DefaultsKey.encoderQuality) != nil {
+            encoderQualityOverride = Float(defaults.double(forKey: DefaultsKey.encoderQuality))
+        } else {
+            encoderQualityOverride = nil
+        }
+        maxDimensionOverride = optionalInt(DefaultsKey.maxDimension, defaults: defaults)
+        return true
+    }
     
     // MARK: - Interpolation helpers
     
@@ -225,6 +267,18 @@ class StreamingTuning: ObservableObject {
     
     private static func interpolateDouble(low: Double, high: Double, t: Double) -> Double {
         low + (high - low) * t
+    }
+
+    private func setOptional(_ value: Int?, forKey key: String, defaults: UserDefaults) {
+        if let value {
+            defaults.set(value, forKey: key)
+        } else {
+            defaults.removeObject(forKey: key)
+        }
+    }
+
+    private func optionalInt(_ key: String, defaults: UserDefaults) -> Int? {
+        defaults.object(forKey: key) == nil ? nil : defaults.integer(forKey: key)
     }
 }
 
