@@ -85,6 +85,7 @@ class LocalCastService: ObservableObject {
     var configuration: LocalCastConfiguration = .default
 
     private var hostSession: HostSession?
+    private var currentHostTarget: HostCaptureTarget = .fullDisplay
     private var tuningSubscription: AnyCancellable?
     private var advertisementProcess: Process?
     private let serviceType = "_tidaldrift-cast._udp"
@@ -159,6 +160,7 @@ class LocalCastService: ObservableObject {
 
     private func setShareTarget(_ target: HostCaptureTarget, name: String) async {
         if isHosting, let session = hostSession {
+            currentHostTarget = target
             await session.retarget(to: target)
             shareTargetName = name
         } else {
@@ -172,6 +174,7 @@ class LocalCastService: ObservableObject {
     }
 
     private func startHosting(target: HostCaptureTarget) async throws {
+        currentHostTarget = target
         let permissions = LocalCastPermissions()
 
         if !(await permissions.requestScreenCaptureIfNeeded()) {
@@ -188,17 +191,7 @@ class LocalCastService: ObservableObject {
             permissions.requestAccessibilityPermission()
         }
         
-        // Sync security settings from UserDefaults (set by LocalCastSettingsView)
-        let defaults = UserDefaults.standard
-        configuration.requireAuthentication = defaults.object(forKey: "localCastRequireAuth") as? Bool ?? true
-        configuration.inputRateLimit = defaults.object(forKey: "localCastInputRateLimit") as? Int ?? 120
-        configuration.adaptiveQuality = defaults.object(forKey: "localCastAdaptive") as? Bool ?? true
-        configuration.maxDimensionOverride = defaults.object(forKey: "localCastMaxDimension") as? Int ?? 0
-        configuration.regionAware = defaults.object(forKey: "localCastRegionAware") as? Bool ?? false
-        if let codecRaw = defaults.string(forKey: "localCastCodec"),
-           let codec = LocalCastConfiguration.Codec(rawValue: codecRaw) {
-            configuration.codec = codec
-        }
+        reloadConfigurationFromDefaults()
 
         // Read the host password for auth (Keychain first, legacy UserDefaults fallback)
         let hostPassword: String?
@@ -228,6 +221,46 @@ class LocalCastService: ObservableObject {
         self.isHosting = true
         delegate?.localCastDidStartHosting()
         logger.info("Hosting started")
+    }
+
+    /// Reload every setting that affects a new capture/encoder/transport
+    /// session. These values are edited via `@AppStorage` in
+    /// LocalCastSettingsView; keeping this in one place prevents "settings say
+    /// 1080p/H.264 but the stream is still 4K/HEVC" mismatches.
+    private func reloadConfigurationFromDefaults() {
+        let defaults = UserDefaults.standard
+
+        if let presetRaw = defaults.string(forKey: "localCastQuality"),
+           let preset = LocalCastConfiguration.QualityPreset(rawValue: presetRaw) {
+            configuration.qualityPreset = preset
+        }
+        if let codecRaw = defaults.string(forKey: "localCastCodec"),
+           let codec = LocalCastConfiguration.Codec(rawValue: codecRaw) {
+            configuration.codec = codec
+        }
+
+        configuration.requireAuthentication = defaults.object(forKey: "localCastRequireAuth") as? Bool ?? true
+        configuration.inputRateLimit = defaults.object(forKey: "localCastInputRateLimit") as? Int ?? 120
+        configuration.adaptiveQuality = defaults.object(forKey: "localCastAdaptive") as? Bool ?? true
+        configuration.maxDimensionOverride = defaults.object(forKey: "localCastMaxDimension") as? Int ?? 0
+        configuration.regionAware = defaults.object(forKey: "localCastRegionAware") as? Bool ?? false
+    }
+
+    /// Restart the active host session with the same share target, reloading all
+    /// non-live settings first (codec, resolution cap, region-aware, FEC, etc.).
+    /// Live bitrate/fps tuning still flows through `StreamingTuning`.
+    func restartHostingToApplySettings() async {
+        guard isHosting else { return }
+        let target = currentHostTarget
+        let name = shareTargetName
+        stopHosting()
+
+        do {
+            try await startHosting(target: target)
+            shareTargetName = name
+        } catch {
+            logger.error("Failed to restart hosting with updated settings: \(error.localizedDescription)")
+        }
     }
 
     func stopHosting() {

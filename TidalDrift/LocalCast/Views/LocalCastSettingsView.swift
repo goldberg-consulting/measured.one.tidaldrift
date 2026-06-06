@@ -15,6 +15,7 @@ struct LocalCastSettingsView: View {
     @AppStorage("localCastFEC") var forwardErrorCorrection = false
     
     @State private var hostPassword = ""
+    @State private var isRestartingStream = false
     
     @StateObject private var permissions = LocalCastPermissions()
     @ObservedObject private var service = LocalCastService.shared
@@ -71,12 +72,35 @@ struct LocalCastSettingsView: View {
                 )
                 
                 if service.isHosting {
-                    HStack(spacing: 6) {
-                        Image(systemName: "info.circle")
-                        Text("Quality changes apply instantly to the active stream.")
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "info.circle")
+                            Text("The live quality slider applies immediately. Codec, resolution, FEC, and region-aware changes require a stream restart.")
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                        Button {
+                            isRestartingStream = true
+                            Task {
+                                await service.restartHostingToApplySettings()
+                                await MainActor.run { isRestartingStream = false }
+                            }
+                        } label: {
+                            HStack(spacing: 6) {
+                                if isRestartingStream {
+                                    ProgressView().scaleEffect(0.7)
+                                } else {
+                                    Image(systemName: "arrow.clockwise")
+                                }
+                                Text(isRestartingStream ? "Restarting stream..." : "Restart stream to apply settings")
+                            }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        .disabled(isRestartingStream)
+                        .help("Restarts Metal Streaming with the current codec, resolution, region-aware, FEC, and resilience settings.")
                     }
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
                 }
                 
                 Divider()
