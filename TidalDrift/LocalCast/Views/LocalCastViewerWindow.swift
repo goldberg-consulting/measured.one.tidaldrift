@@ -373,6 +373,8 @@ struct LocalCastContentView: View {
                         
                         if showOverlay {
                             LocalCastStatsOverlay(stats: session.stats)
+                                .frame(width: 170, alignment: .leading)
+                                .allowsHitTesting(false)
                         }
                     }
                     .padding(.horizontal, 8)
