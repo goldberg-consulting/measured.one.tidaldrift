@@ -2,7 +2,7 @@ import SwiftUI
 
 struct LocalCastSettingsView: View {
     @AppStorage("localCastQuality") var quality: LocalCastConfiguration.QualityPreset = .high
-    @AppStorage("localCastCodec") var codec: LocalCastConfiguration.Codec = .h264
+    @AppStorage("localCastCodec") var codec: LocalCastConfiguration.Codec = .hevc
     @AppStorage("localCastAdaptive") var adaptiveQuality = true
     @AppStorage("showLatencyOverlay") var showOverlay = false
     @AppStorage("localCastAutoHost") var autoHost = false
@@ -75,7 +75,7 @@ struct LocalCastSettingsView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         HStack(spacing: 6) {
                             Image(systemName: "info.circle")
-                            Text("The live quality slider applies immediately. Codec, resolution, FEC, and region-aware changes require a stream restart.")
+                            Text("The live quality slider plus adaptive/FEC/region-aware apply immediately. Codec and resolution require a stream restart.")
                         }
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -99,7 +99,7 @@ struct LocalCastSettingsView: View {
                         .buttonStyle(.borderedProminent)
                         .controlSize(.small)
                         .disabled(isRestartingStream)
-                        .help("Restarts Metal Streaming with the current codec, resolution, region-aware, FEC, and resilience settings.")
+                        .help("Restarts Metal Streaming with the current codec and resolution. Resilience settings apply live.")
                     }
                 }
                 
@@ -146,7 +146,7 @@ struct LocalCastSettingsView: View {
                     .help("Caps the captured frame's longest edge (aspect ratio preserved). Native streams the full panel resolution, including ultrawide (5120x1440). Applies to the next session.")
 
                     Toggle("Adaptive bitrate", isOn: $adaptiveQuality)
-                        .help("Automatically lowers bitrate when the link drops packets so motion (e.g. dragging) stays smooth, then restores quality when it clears. Host-side; applies to the next session.")
+                        .help("Automatically lowers bitrate when the link drops packets so motion (e.g. dragging) stays smooth, then restores quality when it clears. Host-side; applies live.")
 
                     Toggle("Drop to newest frame", isOn: $dropToNewest)
                         .help("Skip stale/incomplete frames instead of playing through a backlog. Client-side; applies to the next connection.")
@@ -155,14 +155,14 @@ struct LocalCastSettingsView: View {
                         .help("Request a fresh keyframe immediately when a frame is lost, so the picture heals in ~1 round trip instead of waiting for the next scheduled keyframe. Client-side; applies to the next connection.")
 
                     Toggle("Forward error correction (FEC)", isOn: $forwardErrorCorrection)
-                        .help("Send XOR parity so the viewer can rebuild a lost packet without a retransmit (Moonlight/Sunshine-style). Best for lossy Wi-Fi; adds ~6% bandwidth. Host-side; both Macs should be updated. Watch \"Recovered/s\" in the stats overlay.")
+                        .help("Send XOR parity so the viewer can rebuild a lost packet without a retransmit (Moonlight/Sunshine-style). Best for lossy Wi-Fi; adds ~6% bandwidth. Host-side; applies live. Watch \"Recovered/s\" in the stats overlay.")
 
                     Text("On lossy Wi-Fi these keep motion smooth and recover quickly. On a clean wired link they have little effect. Turn them off to force fixed-bitrate, play-everything behavior.")
                         .font(.caption)
                         .foregroundColor(.secondary)
 
                     Toggle("Region-aware streaming (experimental)", isOn: $regionAware)
-                        .help("Send only changed screen regions as crisp lossless tiles, falling back to full-frame video on large motion. Reduces bandwidth and sharpens static content (text, UI), especially on large/ultrawide displays. Host-side; applies to the next session.")
+                        .help("Send only changed screen regions as crisp lossless tiles, falling back to full-frame video on large motion. Reduces bandwidth and sharpens static content (text, UI), especially on large/ultrawide displays. Host-side; applies live.")
 
                     if regionAware {
                         Text("Experimental. Best for desktop/text work; large continuous motion still uses full-frame video. Both Macs must run a build with region-aware support.")
@@ -266,6 +266,9 @@ struct LocalCastSettingsView: View {
         .onChange(of: hostPassword) { newValue in
             LocalCastPasswordStore.save(newValue)
         }
+        .onChange(of: adaptiveQuality) { _ in service.applyLiveResilienceSettingsFromDefaults() }
+        .onChange(of: forwardErrorCorrection) { _ in service.applyLiveResilienceSettingsFromDefaults() }
+        .onChange(of: regionAware) { _ in service.applyLiveResilienceSettingsFromDefaults() }
     }
 }
 

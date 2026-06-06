@@ -56,6 +56,7 @@ class TidalDriftPeerService: NSObject, ObservableObject {
     // Fallback: Use NetService for reliable Bonjour advertising
     private var netService: NetService?
     private var netServiceBrowser: NetServiceBrowser?
+    private var resolvingNetServices: [String: NetService] = [:]
     
     private var telemetryTimer: Timer?
     private var peerPruneTimer: Timer?
@@ -441,6 +442,7 @@ class TidalDriftPeerService: NSObject, ObservableObject {
         Self.log("Starting discovery for \(serviceType) via dns-sd")
         launchBrowseProcess()
         startBrowseMonitor()
+        startNativeBrowseFallback()
         
         if peerPruneTimer == nil {
             DispatchQueue.main.async { [weak self] in
@@ -459,6 +461,20 @@ class TidalDriftPeerService: NSObject, ObservableObject {
                 }
             }
         }
+    }
+
+    /// Start a native NetServiceBrowser in parallel with the hardened dns-sd
+    /// subprocess path. Raw `dns-sd -B` often sees peers immediately, while the
+    /// app can lag in the `-L`/`-G` resolve chain. NetService resolves TXT + IPv4
+    /// through mDNSResponder directly and gives us a faster second path without
+    /// removing the proven dns-sd fallback yet.
+    private func startNativeBrowseFallback() {
+        guard netServiceBrowser == nil else { return }
+        let browser = NetServiceBrowser()
+        browser.delegate = self
+        netServiceBrowser = browser
+        browser.searchForServices(ofType: serviceType, inDomain: "local.")
+        Self.log("✅ NetService browser started for \(serviceType)")
     }
 
     /// Re-resolve already-discovered peers so their lastSeen stays current.
@@ -529,6 +545,7 @@ class TidalDriftPeerService: NSObject, ObservableObject {
         
         netServiceBrowser?.stop()
         netServiceBrowser = nil
+        resolvingNetServices.removeAll()
         
         browseOutputPipe?.fileHandleForReading.readabilityHandler = nil
         if let process = browseProcess, process.isRunning {
@@ -1171,7 +1188,6 @@ extension TidalDriftPeerService: NetServiceBrowserDelegate {
     }
     
     func netServiceBrowser(_ browser: NetServiceBrowser, didFind service: NetService, moreComing: Bool) {
-        print("🔎🔎🔎 FOUND SERVICE: \(service.name)")
         Self.log("🔎 Discovered service: '\(service.name)' type: \(service.type)")
         
         // Note: For single-computer testing, we don't skip ourselves
@@ -1182,7 +1198,8 @@ extension TidalDriftPeerService: NetServiceBrowserDelegate {
         
         // Resolve the service to get IP address and TXT record
         service.delegate = self
-        service.resolve(withTimeout: 10.0)
+        resolvingNetServices[service.name] = service
+        service.resolve(withTimeout: 5.0)
     }
     
     func netServiceBrowser(_ browser: NetServiceBrowser, didRemove service: NetService, moreComing: Bool) {
@@ -1263,12 +1280,14 @@ extension TidalDriftPeerService: NetServiceBrowserDelegate {
             self.discoveredPeers[ipAddress] = peer
             self.peerLastSeen[ipAddress] = Date()
             self.notifyNetworkDiscovery(peer: peer)
+            self.resolvingNetServices.removeValue(forKey: sender.name)
         }
     }
     
     func netService(_ sender: NetService, didNotResolve errorDict: [String : NSNumber]) {
         let errorCode = errorDict[NetService.errorCode]?.intValue ?? -1
         Self.log("❌ Failed to resolve \(sender.name): code=\(errorCode)")
+        resolvingNetServices.removeValue(forKey: sender.name)
     }
 }
 

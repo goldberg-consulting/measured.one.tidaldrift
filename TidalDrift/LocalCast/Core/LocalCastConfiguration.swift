@@ -15,7 +15,10 @@ struct LocalCastConfiguration: Codable {
     }
     
     var qualityPreset: QualityPreset = .ultra
-    var codec: Codec = .h264  // Use H.264 for reliable NAL parsing (HEVC has different NAL format)
+    /// HEVC is the preferred Mac-to-Mac codec: it is hardware accelerated via
+    /// VideoToolbox on modern Macs and uses fewer bits than H.264 at similar
+    /// visual quality. The encoder falls back to H.264 if HEVC setup fails.
+    var codec: Codec = .hevc
     var targetFrameRate: Int = 60
     var adaptiveQuality: Bool = false // Disable by default for "fastest pipe" on LAN
     var showLatencyOverlay: Bool = false
@@ -31,6 +34,11 @@ struct LocalCastConfiguration: Codable {
     /// Region-aware streaming (experimental): send only changed screen regions as
     /// lossless tiles, falling back to full-frame video on large changes.
     var regionAware: Bool = false
+
+    /// Forward error correction over UDP video fragments. Adds parity packets so
+    /// the client can recover a single lost fragment per FEC block without a
+    /// retransmit. Host-side and safe to update live.
+    var forwardErrorCorrection: Bool = false
     
     // Security
     var requireAuthentication: Bool = true

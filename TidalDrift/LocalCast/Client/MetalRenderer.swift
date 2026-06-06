@@ -64,6 +64,17 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         frameQueueLock.lock(); defer { frameQueueLock.unlock() }
         return frameQueue.count
     }
+
+    /// MTKView size for input coordinate normalization.
+    var viewSize: CGSize { mtkView.frame.size }
+
+    /// Convert a point from the SwiftUI hosting content view into the MTKView's
+    /// coordinate space. This keeps input aligned in full screen where overlays
+    /// live in the hosting view but the video is rendered by the Metal view.
+    func viewPoint(fromContentPoint point: NSPoint, in contentView: NSView) -> NSPoint {
+        let windowPoint = contentView.convert(point, to: nil)
+        return mtkView.convert(windowPoint, from: nil)
+    }
     private var vertices: MTLBuffer?
     private var texCoords: MTLBuffer?
     

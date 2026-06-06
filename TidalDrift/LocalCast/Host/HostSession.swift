@@ -22,7 +22,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     private let inputInjector = InputInjector()
     private let transport = UDPTransport()
 
-    private let configuration: LocalCastConfiguration
+    private var configuration: LocalCastConfiguration
     private var isRunning = false
     private var sequenceNumber: UInt32 = 0
 
@@ -82,6 +82,16 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     /// even though the encoder guard discarded every frame.
     private var captureActive = false
     private let captureStateLock = NSLock()
+
+    /// Apply host-side runtime settings that do not require rebuilding the
+    /// capture or encoder session. Codec/resolution still require a restart.
+    func updateRuntimeConfiguration(_ newConfig: LocalCastConfiguration) {
+        configuration.adaptiveQuality = newConfig.adaptiveQuality
+        configuration.regionAware = newConfig.regionAware
+        configuration.forwardErrorCorrection = newConfig.forwardErrorCorrection
+        transport.fecEnabled = newConfig.forwardErrorCorrection
+        logger.info("Runtime LocalCast settings: adaptive=\(newConfig.adaptiveQuality), regionAware=\(newConfig.regionAware), FEC=\(newConfig.forwardErrorCorrection)")
+    }
 
     // MARK: - Adaptive bitrate (AIMD on client loss signals)
     //
@@ -204,6 +214,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
 
         self.captureTarget = target
         logger.info("Starting host session with target: \(String(describing: target))")
+        transport.fecEnabled = configuration.forwardErrorCorrection
 
         // Check and log accessibility permission status (but don't prompt repeatedly)
         if inputInjector.hasAccessibilityPermission {

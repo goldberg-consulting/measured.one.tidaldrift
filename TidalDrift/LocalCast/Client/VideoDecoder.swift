@@ -516,6 +516,9 @@ class VideoDecoder {
         sps = nil
         pps = nil
         vps = nil
+        isHEVC = false
+        frameCount = 0
+        hasLoggedFirstFrame = false
     }
     
     private static var decodedFrameCount = 0
