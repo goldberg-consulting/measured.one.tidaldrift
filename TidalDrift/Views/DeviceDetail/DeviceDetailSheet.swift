@@ -575,7 +575,7 @@ struct DeviceDetailSheet: View {
             Button {
                 isOpeningAppControl = true
                 Task {
-                    try? await LocalCastService.shared.openAppControl(for: device)
+                    _ = try? await LocalCastService.shared.openAppControl(for: device)
                     await MainActor.run { isOpeningAppControl = false }
                 }
             } label: {
