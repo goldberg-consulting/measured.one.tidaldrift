@@ -135,18 +135,31 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
                 return event
             }
             
-            // Normalize against the SwiftUI hosting content view. The Metal view
-            // is full-bleed in that view, and overlays do not change the video
-            // rect. Converting into MTKView space created a mixed coordinate
-            // basis after toolbar fold/unfold and caused large cursor offsets.
-            let point = contentView.convert(event.locationInWindow, from: nil)
+            // Normalize against the Metal view's own surface, which is where the
+            // video is actually drawn. With a full-size content view + transparent
+            // titlebar, SwiftUI insets the Metal view by the top safe area in
+            // windowed mode, so mapping against the hosting view left a vertical
+            // offset that disappeared in full screen. Fall back to the hosting
+            // view only if the renderer is not available yet.
+            let point: NSPoint
+            let mapSize: CGSize
+            let mapFlipped: Bool
+            if let renderer = self.clientSession.renderer, renderer.viewSize.width > 0 {
+                point = renderer.viewPoint(fromWindowPoint: event.locationInWindow)
+                mapSize = renderer.viewSize
+                mapFlipped = renderer.isViewFlipped
+            } else {
+                point = contentView.convert(event.locationInWindow, from: nil)
+                mapSize = contentView.frame.size
+                mapFlipped = contentView.isFlipped
+            }
             self.handleMouseEvent(
                 event,
                 at: point,
-                viewSize: contentView.frame.size,
-                contentViewIsFlipped: contentView.isFlipped
+                viewSize: mapSize,
+                contentViewIsFlipped: mapFlipped
             )
-            if self.diagCount <= 20 { lcDebug("🖱️ FORWARDED to remote at (\(point.x / contentView.frame.width), \(point.y / contentView.frame.height))") }
+            if self.diagCount <= 20 { lcDebug("🖱️ FORWARDED to remote at (\(point.x / mapSize.width), \(point.y / mapSize.height)) flipped=\(mapFlipped)") }
             return nil
         }
         
