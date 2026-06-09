@@ -62,6 +62,22 @@ The whole chain is hardware-accelerated, which is why TidalDrift sits near
   typing). The renderer now retains the current buffer and wrapper, and extends
   their lifetime through the GPU draw via the command-buffer completion handler.
 
+- **Cursor offset in resized windows (1.6.37).** Input was normalized against
+  the SwiftUI hosting view, but the video is drawn in the `MTKView`. With a
+  full-size content view + transparent titlebar, SwiftUI insets the Metal view
+  by the top safe area in windowed mode, leaving a vertical offset that vanished
+  in full screen (no titlebar). Input now maps through the `MTKView`'s own
+  coordinate space (`viewPoint(fromWindowPoint:)`, `viewSize`), so it matches the
+  rendered surface in both windowed and full-screen.
+- **System-shortcut forwarding (1.6.38).** A plain `NSEvent` local monitor never
+  sees system hotkeys (`Cmd+Space`, `Cmd+Tab`, Mission Control, screenshot
+  combos): the window server dispatches them first. The client now installs a
+  `CGEventTap` (`RemoteKeyboardTap`) at the session level, so while the viewer is
+  the key window and Control is on, those combos are swallowed locally and
+  injected on the host instead. `Cmd+Shift+I` always toggles control back so the
+  user is never trapped; falls back to the `NSEvent` monitor if the tap can't be
+  created (no Accessibility grant).
+
 Coordinate model: the client sends normalized `(x, y)` with a top-left origin
 relative to the video. The host maps them with `InputInjector`:
 `captureBounds` (the window/app frame in Quartz coords) for window/app capture,
@@ -224,6 +240,24 @@ Codec note for AV1: M3/M4 can hardware-*decode* AV1 (see the Moonlight/
 Jellyfin-ffmpeg builds), but Apple Silicon has no hardware AV1 *encoder* exposed
 to VideoToolbox, and software AV1 is too slow for interactive Mac-to-Mac. HEVC
 remains the target codec; AV1 is a deferred research spike, not a dependency.
+
+### Fix 6: low-latency rate control + frictionless settings (1.6.38)
+
+- **Low-latency rate controller.** `VideoEncoder` now passes
+  `kVTVideoEncoderSpecification_EnableLowLatencyRateControl` at session creation
+  (Apple Silicon, macOS 11.3+). This is the encoder mode built for real-time
+  streaming: it reacts to bitrate changes within a frame or two and holds latency
+  far better than the default controller under motion and loss. Falls back
+  silently on hardware without it.
+- **Codec/resolution apply without a manual restart.** Changing codec or the
+  resolution cap while hosting needs a fresh capture/encoder session, but the
+  user shouldn't hunt for a button. The settings view now auto-applies them via a
+  debounced (~0.6 s) background restart, coalescing rapid edits into one. Live
+  settings (bitrate/fps slider, adaptive, FEC, region-aware) still apply in place.
+- **Unified viewer controls.** The separate floating quality and app-picker
+  menus are consolidated into one tabbed panel (`LocalCastControlsPanel`:
+  Quality / Apps / Info), reachable from a single Controls button, instead of the
+  chevron-then-drill-down flow.
 
 ### Plan (remaining, toward Screen-Sharing parity)
 

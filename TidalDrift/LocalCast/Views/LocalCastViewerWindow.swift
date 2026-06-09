@@ -6,6 +6,8 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
     private let device: DiscoveredDevice
     private let clientSession: ClientSession
     private var localMonitors: [Any] = []
+    private let keyboardTap = RemoteKeyboardTap()
+    private var keyboardTapActive = false
     private var remoteResolution: CGSize = CGSize(width: 1280, height: 720)
     private var didCleanup = false
     
@@ -163,30 +165,57 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
             return nil
         }
         
+        localMonitors.append(mouseMonitor as Any)
+        setupKeyboardCapture()
+    }
+
+    /// Keyboard: prefer a CGEventTap so system shortcuts (Cmd+Space, Cmd+Tab,
+    /// Mission Control, screenshot combos) forward to the host instead of being
+    /// swallowed locally. Falls back to an NSEvent monitor (ordinary keys only)
+    /// if the tap can't be created (e.g. Accessibility not granted).
+    private func setupKeyboardCapture() {
+        keyboardTap.shouldCapture = { [weak self] in
+            guard let self, let window = self.window else { return false }
+            return window.isKeyWindow
+                && self.clientSession.inputCaptureEnabled
+                && !self.clientSession.isOverlayActive
+        }
+        keyboardTap.onToggleCapture = { [weak self] in
+            DispatchQueue.main.async { self?.clientSession.inputCaptureEnabled.toggle() }
+        }
+        keyboardTap.onKey = { [weak self] keyCode, modifiers, down in
+            guard let self else { return }
+            if down {
+                self.clientSession.sendInput(.keyDown(keyCode: keyCode, modifiers: modifiers))
+            } else {
+                self.clientSession.sendInput(.keyUp(keyCode: keyCode, modifiers: modifiers))
+            }
+        }
+        keyboardTapActive = keyboardTap.start()
+        guard !keyboardTapActive else { return }
+
         let keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged]) { [weak self] event in
-            guard let self = self else { return event }
-            guard let window = self.window else { return event }
-            guard event.window == window else { return event }
-            
-            // Cmd+Shift+I toggles input capture
-            if event.type == .keyDown,
-               event.modifierFlags.contains(.command),
-               event.modifierFlags.contains(.shift),
-               event.keyCode == 34 {
-                DispatchQueue.main.async {
-                    self.clientSession.inputCaptureEnabled.toggle()
+                guard let self = self else { return event }
+                guard let window = self.window else { return event }
+                guard event.window == window else { return event }
+
+                // Cmd+Shift+I toggles input capture
+                if event.type == .keyDown,
+                   event.modifierFlags.contains(.command),
+                   event.modifierFlags.contains(.shift),
+                   event.keyCode == 34 {
+                    DispatchQueue.main.async {
+                        self.clientSession.inputCaptureEnabled.toggle()
+                    }
+                    return nil
                 }
+
+                guard self.clientSession.inputCaptureEnabled else { return event }
+                if self.clientSession.isOverlayActive { return event }
+
+                self.handleKeyEvent(event)
                 return nil
             }
-            
-            guard self.clientSession.inputCaptureEnabled else { return event }
-            if self.clientSession.isOverlayActive { return event }
-            
-            self.handleKeyEvent(event)
-            return nil
-        }
-        
-        localMonitors.append(mouseMonitor as Any)
         localMonitors.append(keyMonitor as Any)
     }
     
@@ -288,6 +317,8 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
         guard !didCleanup else { return }
         didCleanup = true
 
+        keyboardTap.stop()
+        keyboardTapActive = false
         for monitor in localMonitors {
             NSEvent.removeMonitor(monitor)
         }
@@ -338,9 +369,8 @@ struct LocalCastContentView: View {
     @ObservedObject var tuning: StreamingTuning
     @AppStorage("showLatencyOverlay") var showOverlay = false
     @State private var toolbarExpanded = false
-    @State private var showQualityPanel = false
-    @State private var showAppPicker = false
-    @State private var selectedRemoteApp: RemoteAppInfo?
+    @State private var showControlsPanel = false
+    @State private var controlsTab: LocalCastControlsPanel.Tab = .quality
     
     var body: some View {
         ZStack {
@@ -354,35 +384,26 @@ struct LocalCastContentView: View {
             VStack(spacing: 0) {
                 if toolbarExpanded {
                     HStack {
+                        // Single entry point for all stream controls — one tabbed
+                        // panel (Quality / Apps / Info) instead of separate menus.
                         Button {
                             if session.remoteApps.isEmpty {
                                 session.requestAppList()
                             }
-                            showAppPicker.toggle()
+                            withAnimation(.easeInOut(duration: 0.2)) { showControlsPanel.toggle() }
                         } label: {
                             HStack(spacing: 4) {
-                                Image(systemName: "square.stack.3d.up")
-                                Text("Apps")
+                                Image(systemName: "slider.horizontal.3")
+                                Text("Controls")
                             }
                             .padding(.horizontal, 8)
                             .padding(.vertical, 4)
                         }
                         .buttonStyle(.bordered)
+                        .help("Quality, apps, and stream info")
 
                         CompactQualitySlider(tuning: tuning, isLive: true)
-                        
-                        Button {
-                            withAnimation(.easeInOut(duration: 0.2)) {
-                                showQualityPanel.toggle()
-                            }
-                        } label: {
-                            Image(systemName: "slider.horizontal.3")
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 4)
-                        }
-                        .buttonStyle(.bordered)
-                        .help("Quality Controls")
-                        
+
                         Button {
                             session.inputCaptureEnabled.toggle()
                         } label: {
@@ -417,7 +438,7 @@ struct LocalCastContentView: View {
                     }
                     syncOverlayState()
                     if !toolbarExpanded {
-                        showAppPicker = false
+                        showControlsPanel = false
                     }
                 } label: {
                     HStack(spacing: 4) {
@@ -443,55 +464,23 @@ struct LocalCastContentView: View {
                 }
             }
             
-            // App picker panel
-            if showAppPicker {
-                RemoteAppPickerView(
+            // Unified, tabbed controls panel (Quality / Apps / Info).
+            if showControlsPanel {
+                LocalCastControlsPanel(
                     session: session,
-                    isPresented: $showAppPicker,
-                    selectedApp: $selectedRemoteApp
+                    tuning: tuning,
+                    selectedTab: $controlsTab,
+                    isPresented: $showControlsPanel
                 )
             }
 
-            
-            // Quality control panel
-            if showQualityPanel {
-                VStack(spacing: 0) {
-                    HStack {
-                        Text("Quality Controls")
-                            .font(.headline)
-                        Spacer()
-                        Button {
-                            withAnimation { showQualityPanel = false }
-                        } label: {
-                            Image(systemName: "xmark.circle.fill")
-                                .foregroundStyle(.secondary)
-                        }
-                        .buttonStyle(.borderless)
-                    }
-                    .padding()
-                    
-                    Divider()
-                    
-                    ScrollView {
-                        StreamingQualityControlView(tuning: tuning, isLive: true)
-                            .padding()
-                    }
-                }
-                .frame(idealWidth: 400, maxHeight: 500)
-                .background(.regularMaterial)
-                .clipShape(RoundedRectangle(cornerRadius: 12))
-                .shadow(radius: 20)
-                .padding(40)
-            }
-            
             // Bottom status bar
             VStack {
                 Spacer()
                 bottomStatusBar
             }
         }
-        .onChange(of: showAppPicker) { _ in syncOverlayState() }
-        .onChange(of: showQualityPanel) { _ in syncOverlayState() }
+        .onChange(of: showControlsPanel) { _ in syncOverlayState() }
         .onChange(of: toolbarExpanded) { _ in syncOverlayState() }
         .onReceive(tuning.objectWillChange.debounce(for: .milliseconds(200), scheduler: DispatchQueue.main)) { _ in
             DispatchQueue.main.async {
@@ -501,7 +490,7 @@ struct LocalCastContentView: View {
     }
     
     private func syncOverlayState() {
-        session.isOverlayActive = toolbarExpanded || showAppPicker || showQualityPanel
+        session.isOverlayActive = toolbarExpanded || showControlsPanel
     }
     
     @ViewBuilder
@@ -511,7 +500,8 @@ struct LocalCastContentView: View {
                 if session.remoteApps.isEmpty {
                     session.requestAppList()
                 }
-                showAppPicker.toggle()
+                controlsTab = .apps
+                withAnimation(.easeInOut(duration: 0.2)) { showControlsPanel = true }
             } label: {
                 HStack(spacing: 4) {
                     Image(systemName: session.streamingTargetName == "Full Display" ? "display" : "app.fill")
@@ -552,129 +542,171 @@ struct LocalCastContentView: View {
     }
 }
 
-// Remote app picker + per-app row. Lets the viewer switch the LocalCast
-// stream from the full desktop to a single app or window.
+// Unified, tabbed controls panel for the LocalCast viewer. Replaces the
+// separate floating quality and app-picker menus so all stream controls live
+// behind one button: Quality, Apps, and Info (stats + shortcuts).
 
-/// View for picking which remote app to stream
-struct RemoteAppPickerView: View {
+struct LocalCastControlsPanel: View {
+    enum Tab: Hashable { case quality, apps, info }
+
     @ObservedObject var session: ClientSession
+    @ObservedObject var tuning: StreamingTuning
+    @Binding var selectedTab: Tab
     @Binding var isPresented: Bool
-    @Binding var selectedApp: RemoteAppInfo?
     @State private var expandedAppID: Int32?
-    
+
     var body: some View {
         VStack(spacing: 0) {
-            // Header
             HStack {
-                Text("Remote Apps")
+                Text("Stream Controls")
                     .font(.headline)
                 Spacer()
-                
-                Button {
-                    session.requestAppList()
-                } label: {
-                    Image(systemName: "arrow.clockwise")
+                if selectedTab == .apps {
+                    Button {
+                        session.requestAppList()
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(session.isLoadingApps)
                 }
-                .buttonStyle(.borderless)
-                .disabled(session.isLoadingApps)
-                
                 Button {
-                    isPresented = false
+                    withAnimation { isPresented = false }
                 } label: {
                     Image(systemName: "xmark.circle.fill")
                         .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.borderless)
             }
-            .padding()
-            
+            .padding([.horizontal, .top])
+            .padding(.bottom, 8)
+
+            Picker("", selection: $selectedTab) {
+                Text("Quality").tag(Tab.quality)
+                Text("Apps").tag(Tab.apps)
+                Text("Info").tag(Tab.info)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .padding(.horizontal)
+            .padding(.bottom, 8)
+
             Divider()
-            
-            if session.isLoadingApps {
-                VStack {
-                    ProgressView()
-                    Text("Loading apps...")
-                        .foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if session.remoteApps.isEmpty {
-                VStack(spacing: 12) {
-                    Image(systemName: "app.dashed")
-                        .font(.largeTitle)
-                        .foregroundStyle(.secondary)
-                    Text("No apps available")
-                        .foregroundStyle(.secondary)
-                    Button("Refresh") {
-                        session.requestAppList()
-                    }
-                    .buttonStyle(.bordered)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                ScrollView {
-                    LazyVStack(spacing: 2) {
-                        // Full display option
-                        Button {
-                            session.requestStreamFullDisplay()
-                            isPresented = false
-                        } label: {
-                            HStack {
-                                Image(systemName: "display")
-                                    .frame(width: 32, height: 32)
-                                    .foregroundStyle(.blue)
-                                Text("Full Display")
-                                    .fontWeight(.medium)
-                                Spacer()
-                                Image(systemName: "play.circle")
-                                    .foregroundStyle(.green)
-                            }
-                            .padding(.horizontal)
-                            .padding(.vertical, 8)
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .background(Color.blue.opacity(0.1))
-                        
-                        Divider()
-                            .padding(.vertical, 4)
-                        
-                        // App list
-                        ForEach(session.remoteApps, id: \.processID) { app in
-                            RemoteAppRowView(
-                                app: app,
-                                isExpanded: expandedAppID == app.processID,
-                                onTap: {
-                                    withAnimation {
-                                        if expandedAppID == app.processID {
-                                            expandedAppID = nil
-                                        } else {
-                                            expandedAppID = app.processID
-                                        }
-                                    }
-                                },
-                                onFocusApp: {
-                                    session.requestFocusApp(processID: app.processID, appName: app.name)
-                                },
-                                onStreamApp: {
-                                    session.requestStreamApp(processID: app.processID, appName: app.name)
-                                    isPresented = false
-                                },
-                                onStreamWindow: { window in
-                                    session.requestStreamWindow(windowID: window.windowID, windowTitle: "\(app.name) - \(window.title)")
-                                    isPresented = false
-                                }
-                            )
-                        }
-                    }
-                    .padding(.vertical, 8)
+
+            Group {
+                switch selectedTab {
+                case .quality: qualityTab
+                case .apps: appsTab
+                case .info: infoTab
                 }
             }
         }
-        .frame(width: 320, height: 400)
+        .frame(width: 360, height: 460)
         .background(.regularMaterial)
         .clipShape(RoundedRectangle(cornerRadius: 12))
         .shadow(radius: 20)
         .padding(40)
+    }
+
+    private var qualityTab: some View {
+        ScrollView {
+            StreamingQualityControlView(tuning: tuning, isLive: true)
+                .padding()
+        }
+    }
+
+    private var infoTab: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                LocalCastStatsOverlay(stats: session.stats)
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("⌘⇧I toggles remote control", systemImage: "keyboard")
+                    Label("System shortcuts (⌘Space, ⌘Tab, screenshots) are sent to the remote Mac while Control is on", systemImage: "command")
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding()
+        }
+    }
+
+    @ViewBuilder
+    private var appsTab: some View {
+        if session.isLoadingApps {
+            VStack {
+                ProgressView()
+                Text("Loading apps...")
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if session.remoteApps.isEmpty {
+            VStack(spacing: 12) {
+                Image(systemName: "app.dashed")
+                    .font(.largeTitle)
+                    .foregroundStyle(.secondary)
+                Text("No apps available")
+                    .foregroundStyle(.secondary)
+                Button("Refresh") {
+                    session.requestAppList()
+                }
+                .buttonStyle(.bordered)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            ScrollView {
+                LazyVStack(spacing: 2) {
+                    Button {
+                        session.requestStreamFullDisplay()
+                        isPresented = false
+                    } label: {
+                        HStack {
+                            Image(systemName: "display")
+                                .frame(width: 32, height: 32)
+                                .foregroundStyle(.blue)
+                            Text("Full Display")
+                                .fontWeight(.medium)
+                            Spacer()
+                            Image(systemName: "play.circle")
+                                .foregroundStyle(.green)
+                        }
+                        .padding(.horizontal)
+                        .padding(.vertical, 8)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .background(Color.blue.opacity(0.1))
+
+                    Divider()
+                        .padding(.vertical, 4)
+
+                    ForEach(session.remoteApps, id: \.processID) { app in
+                        RemoteAppRowView(
+                            app: app,
+                            isExpanded: expandedAppID == app.processID,
+                            onTap: {
+                                withAnimation {
+                                    expandedAppID = (expandedAppID == app.processID) ? nil : app.processID
+                                }
+                            },
+                            onFocusApp: {
+                                session.requestFocusApp(processID: app.processID, appName: app.name)
+                            },
+                            onStreamApp: {
+                                session.requestStreamApp(processID: app.processID, appName: app.name)
+                                isPresented = false
+                            },
+                            onStreamWindow: { window in
+                                session.requestStreamWindow(windowID: window.windowID, windowTitle: "\(app.name) - \(window.title)")
+                                isPresented = false
+                            }
+                        )
+                    }
+                }
+                .padding(.vertical, 8)
+            }
+        }
     }
 }
 
