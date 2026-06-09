@@ -92,6 +92,20 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         let windowPoint = contentView.convert(point, to: nil)
         return mtkView.convert(windowPoint, from: nil)
     }
+
+    /// Convert a window-base point (e.g. `NSEvent.locationInWindow`) into the
+    /// MTKView's coordinate space. Input must be normalized against the Metal
+    /// view's own bounds, not the hosting view: with a full-size content view and
+    /// a transparent titlebar SwiftUI insets the Metal view by the top safe area
+    /// in windowed mode, so mapping against the hosting view leaves a vertical
+    /// offset that vanishes in full screen (no titlebar). This routes input
+    /// through the exact surface the video is drawn on.
+    func viewPoint(fromWindowPoint point: NSPoint) -> NSPoint {
+        mtkView.convert(point, from: nil)
+    }
+
+    /// Whether the Metal view uses a flipped (top-left origin) coordinate space.
+    var isViewFlipped: Bool { mtkView.isFlipped }
     private var vertices: MTLBuffer?
     private var texCoords: MTLBuffer?
     
