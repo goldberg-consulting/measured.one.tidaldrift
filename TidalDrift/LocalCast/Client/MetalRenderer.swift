@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import MetalKit
 import OSLog
 import CoreVideo
@@ -46,7 +47,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     private var targetDepth = 2
     var latencyMode: LocalCastConfiguration.LatencyMode =
         (UserDefaults.standard.string(forKey: "localCastLatencyMode")
-            .flatMap(LocalCastConfiguration.LatencyMode.init(rawValue:))) ?? .balanced
+            .flatMap(LocalCastConfiguration.LatencyMode.init(rawValue:))) ?? .low
 
     private var minDepth: Int {
         switch latencyMode {
@@ -219,7 +220,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         // tick to pace against, so we cannot use draw-on-demand here.
         mtkView.isPaused = false
         mtkView.enableSetNeedsDisplay = false
-        mtkView.preferredFramesPerSecond = 60
+        mtkView.preferredFramesPerSecond = Self.displayMaxFPS(for: mtkView)
         mtkView.framebufferOnly = false  // Allow texture sampling
         
         if pipelineState != nil {
@@ -376,10 +377,21 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         }
     }
     
+    /// Maximum refresh rate of the screen hosting the view (falling back to the
+    /// main screen, then 60). 120 on ProMotion panels, so a 120fps stream is not
+    /// halved by the display link.
+    private static func displayMaxFPS(for view: NSView) -> Int {
+        let fps = (view.window?.screen ?? NSScreen.main)?.maximumFramesPerSecond ?? 60
+        return fps > 0 ? fps : 60
+    }
+
     // MARK: - MTKViewDelegate
     
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
         logger.info("View size changed to \(size.width)x\(size.height)")
+        // The view has a window by now (and may have moved displays), so refresh
+        // the display-link cap from the hosting screen's real refresh rate.
+        view.preferredFramesPerSecond = Self.displayMaxFPS(for: view)
         // Recalculate aspect ratio using the new size (not the possibly-stale drawableSize)
         updateVertexBufferForAspectRatio(viewSize: size)
         // Trigger a redraw so the new vertices take effect immediately
@@ -406,10 +418,18 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         }
         if primed {
             let interval = max(arrivalIntervalEWMA, 1.0 / 120.0)
-            let due = (now - lastPresentTime) >= interval * 0.85
+            // Low latency: with at most one queued frame there is no backlog to
+            // pace through, so present it on this tick instead of waiting out
+            // the gate (saves up to a display interval per frame). Pacing still
+            // applies in .low when the queue is deeper, and always in the
+            // other modes.
+            let bypassPacing = latencyMode == .low && frameQueue.count <= 1
+            let due = bypassPacing || (now - lastPresentTime) >= interval * 0.85
             if due {
                 if frameQueue.isEmpty {
-                    primed = false  // underrun: re-buffer before resuming
+                    if !bypassPacing {
+                        primed = false  // underrun: re-buffer before resuming
+                    }
                 } else {
                     lastPresentedFrame = frameQueue.removeFirst()
                     lastPresentTime = now

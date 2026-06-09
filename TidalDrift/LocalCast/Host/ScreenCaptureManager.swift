@@ -74,6 +74,12 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
         stream = nil
     }
     
+    /// Whether the host cursor is composited into captured frames. Off by
+    /// default: the viewer's local cursor is the pointer, so pointer motion
+    /// does not round-trip the streaming pipeline. Read at stream setup;
+    /// `updateCursorCapture` applies changes to a live stream on macOS 14+.
+    var captureCursor = false
+
     /// Current capture mode
     private(set) var captureMode: CaptureMode?
     
@@ -266,7 +272,7 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
         config.queueDepth = 3  // Lower buffering for latency; still enough to absorb jitter
         config.pixelFormat = kCVPixelFormatType_32BGRA
         config.colorSpaceName = CGColorSpace.sRGB
-        config.showsCursor = true
+        config.showsCursor = captureCursor
         activeConfig = config
         
         logger.info("Creating SCStream for \(description)...")
@@ -321,6 +327,27 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
     
+    /// Update cursor compositing live without stopping/restarting the stream.
+    /// Uses `SCStream.updateConfiguration()` on macOS 14+; on older versions
+    /// the new value takes effect on the next session.
+    func updateCursorCapture(_ show: Bool) async {
+        captureCursor = show
+        guard let stream = stream, let config = activeConfig else { return }
+        if config.showsCursor == show { return }
+        config.showsCursor = show
+
+        if #available(macOS 14.0, *) {
+            do {
+                try await stream.updateConfiguration(config)
+                logger.info("Live capture update: showsCursor → \(show)")
+            } catch {
+                logger.warning("Failed to update cursor capture: \(error.localizedDescription)")
+            }
+        } else {
+            logger.info("Live cursor capture update requires macOS 14+ (applies on next session)")
+        }
+    }
+
     func stopCapture() async {
         do {
             try await stream?.stopCapture()
