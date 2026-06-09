@@ -89,8 +89,12 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         configuration.adaptiveQuality = newConfig.adaptiveQuality
         configuration.regionAware = newConfig.regionAware
         configuration.forwardErrorCorrection = newConfig.forwardErrorCorrection
+        configuration.captureCursor = newConfig.captureCursor
         transport.fecEnabled = newConfig.forwardErrorCorrection
-        logger.info("Runtime LocalCast settings: adaptive=\(newConfig.adaptiveQuality), regionAware=\(newConfig.regionAware), FEC=\(newConfig.forwardErrorCorrection)")
+        Task {
+            await captureManager.updateCursorCapture(newConfig.captureCursor)
+        }
+        logger.info("Runtime LocalCast settings: adaptive=\(newConfig.adaptiveQuality), regionAware=\(newConfig.regionAware), FEC=\(newConfig.forwardErrorCorrection), remoteCursor=\(newConfig.captureCursor)")
     }
 
     // MARK: - Adaptive bitrate (AIMD on client loss signals)
@@ -200,6 +204,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     init(configuration: LocalCastConfiguration, password: String? = nil) {
         self.configuration = configuration
         captureManager.delegate = self
+        captureManager.captureCursor = configuration.captureCursor
         encoder.delegate = self
         transport.delegate = self
 
@@ -464,6 +469,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         await captureManager.stopCapture()
         encoder.invalidate()
         transport.stopListening()
+        transport.sessionKey = nil
 
         // Clear input bounds
         inputInjector.captureBounds = nil
@@ -499,6 +505,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             clientConnection = nil
             lastClientPacketAt = nil
             hasSentFirstVideoPacket = false
+            resetAuthForNewClient()
             suspendCaptureForIdleClient()
             return
         }
@@ -831,7 +838,15 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     private var receivedInputCount: UInt64 = 0
 
     // swiftlint:disable cyclomatic_complexity function_body_length
-    func udpTransport(_ transport: UDPTransport, didReceivePacket packet: LocalCastPacket, from endpoint: NWEndpoint) {
+    func udpTransport(_ transport: UDPTransport, didReceivePacket packet: LocalCastPacket, wasAuthenticated: Bool, from endpoint: NWEndpoint) {
+        // Once the session key is established, only packets decrypted under it
+        // are trusted; a plaintext packet must never reach input injection or
+        // any other post-auth handler. Sessions without a key (auth disabled)
+        // legitimately run in plaintext and are unaffected.
+        if transport.sessionKey != nil, !wasAuthenticated {
+            return
+        }
+
         // Update client endpoint if not already set
         if clientEndpoint == nil {
             clientEndpoint = endpoint
@@ -873,7 +888,11 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             }
         }
 
-        // Post-auth: still handle authRequest for potential re-auth
+        // Post-auth re-auth: for keyed sessions this path is unreachable, since
+        // the transport drops plaintext packets once a key is installed. A new
+        // client can authenticate only after resetAuthForNewClient re-arms the
+        // handshake (idle timeout or session stop). Kept for keyless sessions
+        // and as the dispatch point once re-arming has cleared the key.
         if packet.type == .authRequest {
             handleAuthRequest(payload: packet.payload, from: endpoint)
             return
@@ -973,6 +992,19 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             if let telemetry = try? JSONDecoder().decode(LocalCastClientTelemetry.self, from: packet.payload) {
                 noteClientTelemetry(telemetry)
             }
+
+        case .disconnect:
+            // Graceful client departure. The wasAuthenticated gate above means a
+            // keyed session cannot be torn down by a forged plaintext packet.
+            // Re-arming immediately lets the next client authenticate without
+            // waiting out the idle timeout.
+            logger.info("👋 Client sent disconnect, releasing endpoint")
+            clientEndpoint = nil
+            clientConnection = nil
+            lastClientPacketAt = nil
+            hasSentFirstVideoPacket = false
+            resetAuthForNewClient()
+            suspendCaptureForIdleClient()
 
         default:
             lcDebug("❓ HostSession: Received unknown packet type: \(packet.type)")
@@ -1274,6 +1306,19 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     }
 
     // MARK: - Auth Handshake (Host Side)
+
+    /// Re-arm the handshake after the previous client goes away. The transport
+    /// drops every plaintext packet while a key is installed, so without this
+    /// reset a new client's authRequest could never be processed.
+    private func resetAuthForNewClient() {
+        guard hostPassword != nil else { return }
+        sessionKey = SessionCrypto.generateSessionKey()
+        transport.sessionKey = nil
+        clientNonce = nil
+        hostNonce = nil
+        authState = .waitingForAuth
+        logger.info("🔐 Auth re-armed, waiting for new client")
+    }
 
     /// Handle authRequest from client: generate hostNonce, derive pairingKey, encrypt sessionKey, reply with authChallenge.
     private func handleAuthRequest(payload: Data, from endpoint: NWEndpoint) {

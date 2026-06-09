@@ -287,9 +287,6 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             return
         }
 
-        // Store the session key temporarily (we'll set it on transport after authSuccess)
-        self.pendingSessionKey = sessionKey
-
         guard let endpoint = hostEndpoint else { return }
         let packet = LocalCastPacket(
             type: .authComplete,
@@ -299,21 +296,39 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         )
         transport.send(packet: packet, to: endpoint)
         logger.info("🔐 Sent authComplete proof")
+
+        // The host's authSuccess reply arrives encrypted under the session key,
+        // so the key must be live on the transport before that packet lands.
+        // send(packet:on:) wraps the authComplete plaintext synchronously above,
+        // so installing the key here cannot affect the proof packet.
+        transport.sessionKey = sessionKey
+
+        // UDP gives no delivery guarantee and there is no auth retransmit layer.
+        // If the single authComplete datagram is lost the handshake deadlocks:
+        // the host never installs the key, so it drops every encrypted packet
+        // we send and we drop its plaintext replies. Retransmit the proof in
+        // plaintext a few times; a host that already received it has the key
+        // installed and silently drops the duplicates.
+        retryAuthComplete(packet: packet, to: endpoint, attempt: 1)
     }
 
-    /// Temporary storage for session key between authChallenge and authSuccess.
-    private var pendingSessionKey: SymmetricKey?
+    /// Retransmit authComplete until authSuccess arrives, up to 3 attempts.
+    private func retryAuthComplete(packet: LocalCastPacket, to endpoint: NWEndpoint, attempt: Int) {
+        guard attempt <= 3 else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            guard let self = self, self.isAuthenticating else { return }
+            self.transport.send(packet: packet, to: endpoint, forcePlaintext: true)
+            self.logger.info("🔐 Retransmitted authComplete (attempt \(attempt + 1))")
+            self.retryAuthComplete(packet: packet, to: endpoint, attempt: attempt + 1)
+        }
+    }
 
-    /// Step 3: handle authSuccess from host — enable encryption and start streaming.
+    /// Step 3: handle authSuccess from host — encryption is already active; finish the flow.
     private func handleAuthSuccess(payload: Data) {
-        guard let sessionKey = pendingSessionKey else {
-            logger.warning("🔐 authSuccess received but no pending session key")
+        guard transport.sessionKey != nil else {
+            logger.warning("🔐 authSuccess received but no session key installed")
             return
         }
-
-        // Enable encryption on the transport
-        transport.sessionKey = sessionKey
-        pendingSessionKey = nil
 
         logger.info("🔐 ✅ Authenticated — encryption enabled")
 
@@ -344,7 +359,22 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         heartbeatTimer = nil
         diagnosticTimer?.invalidate()
         diagnosticTimer = nil
+
+        // Tell the host we are leaving so it can re-arm auth immediately
+        // instead of waiting out the idle timeout. Encrypted under the
+        // session key when one is active, so it cannot be forged.
+        if let endpoint = hostEndpoint {
+            let bye = LocalCastPacket(
+                type: .disconnect,
+                sequenceNumber: 0,
+                timestamp: CFAbsoluteTimeGetCurrent() + kCFAbsoluteTimeIntervalSince1970,
+                payload: Data()
+            )
+            transport.send(packet: bye, to: endpoint)
+        }
+
         transport.stopListening()
+        transport.sessionKey = nil
         decoder.invalidate()
         isConnected = false
         connectionPhase = .disconnected
@@ -718,7 +748,14 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
 
     // MARK: - UDPTransportDelegate
 
-    func udpTransport(_ transport: UDPTransport, didReceivePacket packet: LocalCastPacket, from endpoint: NWEndpoint) {
+    func udpTransport(_ transport: UDPTransport, didReceivePacket packet: LocalCastPacket, wasAuthenticated: Bool, from endpoint: NWEndpoint) {
+        // Once the session key is established, only packets decrypted under it
+        // are trusted. Sessions without a key (auth disabled) legitimately run
+        // in plaintext and are unaffected.
+        if transport.sessionKey != nil, !wasAuthenticated {
+            return
+        }
+
         switch packet.type {
         case .videoFrame:
             frameCount += 1

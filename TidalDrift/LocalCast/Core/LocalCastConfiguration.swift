@@ -36,7 +36,12 @@ struct LocalCastConfiguration: Codable {
     var targetFrameRate: Int = 60
     var adaptiveQuality: Bool = false // Disable by default for "fastest pipe" on LAN
     var showLatencyOverlay: Bool = false
-    var captureCursor: Bool = true
+    /// When false (default), the host omits its cursor from the capture and the
+    /// pointer the viewer sees is the local macOS cursor, so pointer motion
+    /// never round-trips the capture/encode/decode pipeline. Enable to
+    /// composite the host cursor into the stream (view-only sessions where the
+    /// client follows the host user's pointer).
+    var captureCursor: Bool = false
     var captureAudio: Bool = false  // Future
 
     /// User override for the capture's longest-edge dimension in pixels. 0 means
@@ -54,9 +59,10 @@ struct LocalCastConfiguration: Codable {
     /// retransmit. Host-side and safe to update live.
     var forwardErrorCorrection: Bool = false
 
-    /// Client-side presentation policy. Balanced smooths jitter; Low Latency
-    /// keeps the buffer minimal for faster cursor/control feedback.
-    var latencyMode: LatencyMode = .balanced
+    /// Client-side presentation policy. Low Latency (default) keeps the buffer
+    /// minimal for the fastest cursor/control feedback; Balanced and Smooth add
+    /// cushion for jittery links.
+    var latencyMode: LatencyMode = .low
     
     // Security
     var requireAuthentication: Bool = true

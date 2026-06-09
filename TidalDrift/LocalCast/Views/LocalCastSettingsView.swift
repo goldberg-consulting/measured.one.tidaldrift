@@ -13,7 +13,8 @@ struct LocalCastSettingsView: View {
     @AppStorage("localCastLossRecovery") var lossRecovery = true
     @AppStorage("localCastRegionAware") var regionAware = false
     @AppStorage("localCastFEC") var forwardErrorCorrection = false
-    @AppStorage("localCastLatencyMode") var latencyMode: LocalCastConfiguration.LatencyMode = .balanced
+    @AppStorage("localCastLatencyMode") var latencyMode: LocalCastConfiguration.LatencyMode = .low
+    @AppStorage("localCastCaptureCursor") var captureCursor = false
     
     @State private var hostPassword = ""
     @State private var isRestartingStream = false
@@ -147,7 +148,10 @@ struct LocalCastSettingsView: View {
                             Text(mode.displayName).tag(mode)
                         }
                     }
-                    .help("Client-side jitter buffer policy. Low Latency reduces buffering for snappier cursor/control; Smooth adds more cushion for uneven Wi-Fi. Applies to the next viewer connection.")
+                    .help("Client-side jitter buffer policy. Low Latency (default) reduces buffering for snappier cursor/control; Smooth adds more cushion for uneven Wi-Fi. Applies to the next viewer connection.")
+
+                    Toggle("Show remote cursor in stream", isOn: $captureCursor)
+                        .help("Composites the host's cursor into the video. Off (default), your local cursor is the pointer, removing the network round trip from pointer motion. Turn on for view-only sessions. Applies live on macOS 14+, otherwise next session.")
 
                     Text("On lossy Wi-Fi these keep motion smooth and recover quickly. On a clean wired link they have little effect. Turn them off to force fixed-bitrate, play-everything behavior.")
                         .font(.caption)
@@ -261,6 +265,7 @@ struct LocalCastSettingsView: View {
         .onChange(of: adaptiveQuality) { _ in service.applyLiveResilienceSettingsFromDefaults() }
         .onChange(of: forwardErrorCorrection) { _ in service.applyLiveResilienceSettingsFromDefaults() }
         .onChange(of: regionAware) { _ in service.applyLiveResilienceSettingsFromDefaults() }
+        .onChange(of: captureCursor) { _ in service.applyLiveResilienceSettingsFromDefaults() }
         // Codec and resolution need a fresh capture/encoder session, but the user
         // shouldn't have to find and click a button. Re-apply them automatically
         // (debounced) so changing them while hosting "just works".

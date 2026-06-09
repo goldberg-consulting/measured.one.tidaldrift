@@ -19,7 +19,10 @@ func lcDebug(_ message: @autoclosure () -> String) {
 }
 
 protocol UDPTransportDelegate: AnyObject {
-    func udpTransport(_ transport: UDPTransport, didReceivePacket packet: LocalCastPacket, from endpoint: NWEndpoint)
+    /// `wasAuthenticated` is true only when the packet arrived encrypted and
+    /// was decrypted under the session key. Delegates must require it for
+    /// security-sensitive packets once a session key exists.
+    func udpTransport(_ transport: UDPTransport, didReceivePacket packet: LocalCastPacket, wasAuthenticated: Bool, from endpoint: NWEndpoint)
     func udpTransport(_ transport: UDPTransport, clientDidConnect endpoint: NWEndpoint, connection: NWConnection)
     /// Called when reassembly abandons one or more incomplete frames because a
     /// newer frame superseded them (i.e. at least one fragment was lost). The
@@ -230,17 +233,20 @@ class UDPTransport {
     private var _sendCount = 0
     private var _receiveCount = 0
     
-    /// Send packet using a specific connection (for replying on incoming connections)
-    func send(packet: LocalCastPacket, on connection: NWConnection) {
+    /// Send packet using a specific connection (for replying on incoming connections).
+    /// `forcePlaintext` bypasses session-key encryption; use it only for handshake
+    /// retransmits, where the peer may not have installed the key yet and a keyed
+    /// peer will simply drop the duplicate.
+    func send(packet: LocalCastPacket, on connection: NWConnection, forcePlaintext: Bool = false) {
         let raw = packet.serialize()
         statsLock.lock()
         _sendCount += 1
         let count = _sendCount
         statsLock.unlock()
-        
+
         // Encrypt or wrap with plaintext flag
         let data: Data
-        if let key = sessionKey {
+        if let key = sessionKey, !forcePlaintext {
             guard let encrypted = SessionCrypto.encrypt(raw, using: key) else {
                 logger.error("Failed to encrypt packet of type \(packet.type.rawValue)")
                 return
@@ -442,7 +448,7 @@ class UDPTransport {
         paceQueue.async { drain(from: 0) }
     }
     
-    func send(packet: LocalCastPacket, to endpoint: NWEndpoint) {
+    func send(packet: LocalCastPacket, to endpoint: NWEndpoint, forcePlaintext: Bool = false) {
         let endpointKey = describeEndpoint(endpoint)
         
         // Verbose logging for input events
@@ -457,7 +463,7 @@ class UDPTransport {
             if packet.type == .inputEvent {
                 lcDebug("   Using INCOMING connection, state: \(incomingConn.state)")
             }
-            send(packet: packet, on: incomingConn)
+            send(packet: packet, on: incomingConn, forcePlaintext: forcePlaintext)
             return
         }
         
@@ -493,10 +499,10 @@ class UDPTransport {
                 if packet.type == .inputEvent {
                     lcDebug("   Delayed send, connection state now: \(connection.state)")
                 }
-                self?.send(packet: packet, on: connection)
+                self?.send(packet: packet, on: connection, forcePlaintext: forcePlaintext)
             }
         } else {
-            send(packet: packet, on: connection)
+            send(packet: packet, on: connection, forcePlaintext: forcePlaintext)
         }
     }
     
@@ -541,14 +547,14 @@ class UDPTransport {
         // Parse fragment header
         guard let header = FragmentHeader.deserialize(data) else {
             // Try parsing as raw packet (for backwards compatibility)
-            if let packet = decryptAndParse(data) {
+            if let (packet, wasAuthenticated) = decryptAndParse(data) {
                 if packet.type != .videoFrame {
                     lcDebug("📨 UDPTransport: Received \(packet.type) packet (raw, no fragment header)")
                 }
                 if packet.type == .inputEvent {
                     lcDebug("🎮 UDPTransport: *** INPUT EVENT RECEIVED *** from \(describeEndpoint(endpoint))")
                 }
-                delegate?.udpTransport(self, didReceivePacket: packet, from: endpoint)
+                delegate?.udpTransport(self, didReceivePacket: packet, wasAuthenticated: wasAuthenticated, from: endpoint)
             } else {
                 lcDebug("⚠️ UDPTransport: Could not parse received data (\(data.count) bytes)")
             }
@@ -559,7 +565,7 @@ class UDPTransport {
         
         // Single fragment (no reassembly needed)
         if header.totalFragments == 1 {
-            if let packet = decryptAndParse(Data(payload)) {
+            if let (packet, wasAuthenticated) = decryptAndParse(Data(payload)) {
                 // Log non-video packets
                 if packet.type != .videoFrame {
                     lcDebug("📨 UDPTransport: Received \(packet.type) packet #\(count), payload: \(packet.payload.count) bytes")
@@ -567,7 +573,7 @@ class UDPTransport {
                 if packet.type == .inputEvent {
                     lcDebug("🎮 UDPTransport: *** INPUT EVENT RECEIVED *** from \(describeEndpoint(endpoint))")
                 }
-                delegate?.udpTransport(self, didReceivePacket: packet, from: endpoint)
+                delegate?.udpTransport(self, didReceivePacket: packet, wasAuthenticated: wasAuthenticated, from: endpoint)
             } else {
                 lcDebug("⚠️ UDPTransport: Could not parse packet from payload (\(payload.count) bytes)")
             }
@@ -682,9 +688,9 @@ class UDPTransport {
             fragmentLock.unlock()
             
             // Parse and deliver (decrypt if needed)
-            if let packet = decryptAndParse(fullData) {
+            if let (packet, wasAuthenticated) = decryptAndParse(fullData) {
                 logger.debug("Reassembled frame \(realFrameId): \(fullData.count) bytes from \(total) fragments")
-                delegate?.udpTransport(self, didReceivePacket: packet, from: endpoint)
+                delegate?.udpTransport(self, didReceivePacket: packet, wasAuthenticated: wasAuthenticated, from: endpoint)
             }
         } else {
             fragmentLock.unlock()
@@ -810,12 +816,17 @@ class UDPTransport {
     }
 
     /// Strip the encryption/plaintext prefix and decrypt if needed, then parse.
-    private func decryptAndParse(_ data: Data) -> LocalCastPacket? {
+    /// `wasAuthenticated` is true only when the packet was decrypted under the
+    /// session key. Once a session key is established, plaintext is rejected;
+    /// plaintext is accepted only before key establishment (the auth handshake
+    /// phase, or sessions that never set a key).
+    private func decryptAndParse(_ data: Data) -> (packet: LocalCastPacket, wasAuthenticated: Bool)? {
         guard !data.isEmpty else { return nil }
+        let key = sessionKey
         
         if data[0] == SessionCrypto.encryptedFlag {
             // Encrypted payload — need session key
-            guard let key = sessionKey else {
+            guard let key = key else {
                 logger.warning("Received encrypted packet but no session key set")
                 return nil
             }
@@ -823,15 +834,18 @@ class UDPTransport {
                 logger.warning("Failed to decrypt packet (\(data.count) bytes)")
                 return nil
             }
-            return LocalCastPacket.deserialize(decrypted)
-        } else if data[0] == SessionCrypto.plaintextFlag {
-            // Plaintext (auth handshake)
-            guard let unwrapped = SessionCrypto.unwrapPlaintext(data) else { return nil }
-            return LocalCastPacket.deserialize(unwrapped)
-        } else {
-            // Legacy/raw packet (no prefix) — backwards compat
-            return LocalCastPacket.deserialize(data)
+            guard let packet = LocalCastPacket.deserialize(decrypted) else { return nil }
+            return (packet, true)
         }
+        
+        guard key == nil else {
+            logger.warning("Rejected non-encrypted packet after session key establishment")
+            return nil
+        }
+        guard data[0] == SessionCrypto.plaintextFlag,
+              let unwrapped = SessionCrypto.unwrapPlaintext(data),
+              let packet = LocalCastPacket.deserialize(unwrapped) else { return nil }
+        return (packet, false)
     }
     
     private func removeConnection(endpointKey: String) {

@@ -23,6 +23,7 @@ struct LocalCastPacket {
         case restoreAppsRequest = 18  // Client asks host to unhide previously isolated apps
         case qualityUpdate = 19       // Client sends streaming quality tuning snapshot to host
         case tileUpdate = 20          // Host sends a changed screen region (region-aware streaming)
+        case disconnect = 21          // Client notifies host it is leaving so the host can re-arm auth
     }
     
     static let headerSize = 13 // 1 (type) + 4 (seq) + 8 (timestamp)
