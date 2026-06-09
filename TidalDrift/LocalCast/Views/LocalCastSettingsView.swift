@@ -17,6 +17,7 @@ struct LocalCastSettingsView: View {
     
     @State private var hostPassword = ""
     @State private var isRestartingStream = false
+    @State private var pendingRestart: Task<Void, Never>?
     
     @StateObject private var permissions = LocalCastPermissions()
     @ObservedObject private var service = LocalCastService.shared
@@ -73,35 +74,18 @@ struct LocalCastSettingsView: View {
                 )
                 
                 if service.isHosting {
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack(spacing: 6) {
-                            Image(systemName: "info.circle")
-                            Text("The live quality slider plus adaptive/FEC/region-aware apply immediately. Codec and resolution require a stream restart.")
+                    HStack(spacing: 6) {
+                        if isRestartingStream {
+                            ProgressView().scaleEffect(0.7)
+                            Text("Applying codec/resolution to the live stream...")
+                        } else {
+                            Image(systemName: "checkmark.circle")
+                                .foregroundStyle(.green)
+                            Text("Settings apply live. Codec and resolution re-apply automatically a moment after you change them.")
                         }
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-
-                        Button {
-                            isRestartingStream = true
-                            Task {
-                                await service.restartHostingToApplySettings()
-                                await MainActor.run { isRestartingStream = false }
-                            }
-                        } label: {
-                            HStack(spacing: 6) {
-                                if isRestartingStream {
-                                    ProgressView().scaleEffect(0.7)
-                                } else {
-                                    Image(systemName: "arrow.clockwise")
-                                }
-                                Text(isRestartingStream ? "Restarting stream..." : "Restart stream to apply settings")
-                            }
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.small)
-                        .disabled(isRestartingStream)
-                        .help("Restarts Metal Streaming with the current codec and resolution. Resilience settings apply live.")
                     }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 }
                 
                 Divider()
@@ -277,6 +261,28 @@ struct LocalCastSettingsView: View {
         .onChange(of: adaptiveQuality) { _ in service.applyLiveResilienceSettingsFromDefaults() }
         .onChange(of: forwardErrorCorrection) { _ in service.applyLiveResilienceSettingsFromDefaults() }
         .onChange(of: regionAware) { _ in service.applyLiveResilienceSettingsFromDefaults() }
+        // Codec and resolution need a fresh capture/encoder session, but the user
+        // shouldn't have to find and click a button. Re-apply them automatically
+        // (debounced) so changing them while hosting "just works".
+        .onChange(of: codec) { _ in scheduleAutoApply() }
+        .onChange(of: maxDimension) { _ in scheduleAutoApply() }
+        .onChange(of: quality) { _ in scheduleAutoApply() }
+        .onDisappear { pendingRestart?.cancel() }
+    }
+
+    /// Debounced auto-restart for settings that need a new session (codec,
+    /// resolution). Coalesces rapid changes into a single restart ~0.6s after
+    /// the last edit, so flipping through options doesn't thrash the stream.
+    private func scheduleAutoApply() {
+        guard service.isHosting else { return }
+        pendingRestart?.cancel()
+        pendingRestart = Task {
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            if Task.isCancelled { return }
+            await MainActor.run { isRestartingStream = true }
+            await service.restartHostingToApplySettings()
+            await MainActor.run { isRestartingStream = false }
+        }
     }
 }
 

@@ -56,12 +56,22 @@ class VideoEncoder {
         let vtCodec: CMVideoCodecType = codec == .hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264
         var createdSession: VTCompressionSession?
 
+        // Enable Apple's low-latency rate controller (Apple Silicon, macOS 11.3+).
+        // This is the encoder mode built for real-time/conferencing: it reacts to
+        // bitrate changes within a frame or two and holds latency far better than
+        // the default rate controller under motion and loss. Falls back silently
+        // to the default controller on hardware that doesn't support it.
+        var encoderSpec: [CFString: Any] = [:]
+        if #available(macOS 11.3, *) {
+            encoderSpec[kVTVideoEncoderSpecification_EnableLowLatencyRateControl] = kCFBooleanTrue as Any
+        }
+
         let status = VTCompressionSessionCreate(
             allocator: kCFAllocatorDefault,
             width: Int32(width),
             height: Int32(height),
             codecType: vtCodec,
-            encoderSpecification: nil,
+            encoderSpecification: encoderSpec.isEmpty ? nil : encoderSpec as CFDictionary,
             imageBufferAttributes: nil,
             compressedDataAllocator: nil,
             outputCallback: compressionCallback,
