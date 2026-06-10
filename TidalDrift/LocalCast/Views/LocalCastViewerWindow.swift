@@ -368,7 +368,6 @@ struct LocalCastContentView: View {
     @ObservedObject var session: ClientSession
     @ObservedObject var tuning: StreamingTuning
     @AppStorage("showLatencyOverlay") var showOverlay = false
-    @State private var toolbarExpanded = false
     @State private var showControlsPanel = false
     @State private var controlsTab: LocalCastControlsPanel.Tab = .quality
     
@@ -380,69 +379,20 @@ struct LocalCastContentView: View {
                 connectionStatusOverlay
             }
             
-            // Top edge: collapsible toolbar
+            // Top edge: the chevron opens the tabbed Stream Controls popup
+            // directly. No intermediate toolbar/submenu step; everything
+            // (quality, apps, stats) lives in one tabbed panel.
             VStack(spacing: 0) {
-                if toolbarExpanded {
-                    HStack {
-                        // Single entry point for all stream controls — one tabbed
-                        // panel (Quality / Apps / Info) instead of separate menus.
-                        Button {
-                            if session.remoteApps.isEmpty {
-                                session.requestAppList()
-                            }
-                            withAnimation(.easeInOut(duration: 0.2)) { showControlsPanel.toggle() }
-                        } label: {
-                            HStack(spacing: 4) {
-                                Image(systemName: "slider.horizontal.3")
-                                Text("Controls")
-                            }
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                        }
-                        .buttonStyle(.bordered)
-                        .help("Quality, apps, and stream info")
-
-                        CompactQualitySlider(tuning: tuning, isLive: true)
-
-                        Button {
-                            session.inputCaptureEnabled.toggle()
-                        } label: {
-                            HStack(spacing: 4) {
-                                Image(systemName: session.inputCaptureEnabled ? "keyboard.fill" : "keyboard")
-                                Text(session.inputCaptureEnabled ? "Control" : "View Only")
-                            }
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                        }
-                        .buttonStyle(.bordered)
-                        .tint(session.inputCaptureEnabled ? .blue : .gray)
-                        .help("Toggle remote input (⌘⇧I)")
-                        
-                        Spacer()
-                        
-                        if showOverlay {
-                            LocalCastStatsOverlay(stats: session.stats)
-                                .frame(width: 170, alignment: .leading)
-                                .allowsHitTesting(false)
-                        }
-                    }
-                    .padding(.horizontal, 8)
-                    .padding(.top, 6)
-                    .padding(.bottom, 2)
-                    .transition(.move(edge: .top).combined(with: .opacity))
-                }
-                
                 Button {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        toolbarExpanded.toggle()
+                    if !showControlsPanel, session.remoteApps.isEmpty {
+                        session.requestAppList()
                     }
-                    syncOverlayState()
-                    if !toolbarExpanded {
-                        showControlsPanel = false
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        showControlsPanel.toggle()
                     }
                 } label: {
                     HStack(spacing: 4) {
-                        Image(systemName: toolbarExpanded ? "chevron.up" : "chevron.down")
+                        Image(systemName: showControlsPanel ? "chevron.up" : "chevron.down")
                             .font(.system(size: 10, weight: .bold))
                     }
                     .foregroundStyle(.white.opacity(0.85))
@@ -452,15 +402,23 @@ struct LocalCastContentView: View {
                 }
                 .buttonStyle(.plain)
                 .padding(.bottom, 4)
+                .help("Stream controls (quality, apps, info)")
                 
                 Spacer()
             }
-            .background(alignment: .top) {
-                if toolbarExpanded {
-                    Rectangle()
-                        .fill(.ultraThinMaterial)
-                        .frame(height: 48)
-                        .transition(.move(edge: .top).combined(with: .opacity))
+
+            // Optional always-on stats readout, top-right, never intercepts input.
+            if showOverlay {
+                VStack {
+                    HStack {
+                        Spacer()
+                        LocalCastStatsOverlay(stats: session.stats)
+                            .frame(width: 170, alignment: .leading)
+                            .allowsHitTesting(false)
+                            .padding(.top, 28)
+                            .padding(.trailing, 8)
+                    }
+                    Spacer()
                 }
             }
             
@@ -481,7 +439,6 @@ struct LocalCastContentView: View {
             }
         }
         .onChange(of: showControlsPanel) { _ in syncOverlayState() }
-        .onChange(of: toolbarExpanded) { _ in syncOverlayState() }
         .onReceive(tuning.objectWillChange.debounce(for: .milliseconds(200), scheduler: DispatchQueue.main)) { _ in
             DispatchQueue.main.async {
                 session.sendQualityUpdate(tuning)
@@ -490,7 +447,7 @@ struct LocalCastContentView: View {
     }
     
     private func syncOverlayState() {
-        session.isOverlayActive = toolbarExpanded || showControlsPanel
+        session.isOverlayActive = showControlsPanel
     }
     
     @ViewBuilder
