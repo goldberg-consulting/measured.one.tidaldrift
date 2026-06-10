@@ -80,6 +80,14 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     /// `updateCursorCapture` applies changes to a live stream on macOS 14+.
     var captureCursor = false
 
+    /// Whether the active session captures for the region-aware (tile) path,
+    /// which copies tightly-packed 32BGRA sub-rects. When true the stream is
+    /// captured as 32BGRA so `cropBGRA`/`TileCodec` keep working; when false
+    /// (the default video path) the stream is captured as NV12 (4:2:0 biplanar,
+    /// full range) so the IOSurface stays zero-copy into VideoToolbox and Metal
+    /// with no BGRA<->NV12 conversions. Read at `startStream` time.
+    var regionAwareCapture = false
+
     /// Current capture mode
     private(set) var captureMode: CaptureMode?
     
@@ -270,7 +278,11 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
         config.height = height
         config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(frameRate))
         config.queueDepth = 3  // Lower buffering for latency; still enough to absorb jitter
-        config.pixelFormat = kCVPixelFormatType_32BGRA
+        // Region-aware tiling copies tightly-packed 32BGRA sub-rects, so that
+        // path stays BGRA. The default video path captures NV12 (full range) to
+        // avoid the BGRA->NV12 encode and NV12->BGRA decode conversions; the
+        // client samples it with full-range BT.709 coefficients to match.
+        config.pixelFormat = regionAwareCapture ? kCVPixelFormatType_32BGRA : kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
         config.colorSpaceName = CGColorSpace.sRGB
         config.showsCursor = captureCursor
         activeConfig = config

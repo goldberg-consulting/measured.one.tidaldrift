@@ -92,7 +92,15 @@ class UDPTransport {
     private let connectionsLock = NSLock()
     
     // Fragmentation constants
-    private let maxPayloadSize = 1400 // Larger payload per fragment (fits in 1500-byte ethernet MTU with IP/UDP headers)
+    static let defaultPayloadSize = 1400 // Fits a 1500-byte ethernet MTU with IP/UDP headers
+    static let jumboPayloadSize = 8900   // Fits a 9000-byte jumbo MTU with IP/UDP headers
+    /// Per-fragment payload ceiling. Read once per frame in sendFragmented so a
+    /// live change only takes effect on the next frame boundary. Guarded by
+    /// fragmentLock.
+    private var _maxPayloadSize = UDPTransport.defaultPayloadSize
+    private var maxPayloadSize: Int {
+        fragmentLock.lock(); defer { fragmentLock.unlock() }; return _maxPayloadSize
+    }
     private var frameCounter: UInt32 = 0 // Protected by fragmentLock
     
     // Fragment reassembly
@@ -108,7 +116,12 @@ class UDPTransport {
     // window and treat any abandoned-incomplete frame as a loss.
     var dropToNewestEnabled = UserDefaults.standard.object(forKey: "localCastDropToNewest") as? Bool ?? true
     private var highestFrameId: UInt32 = 0
-    private let inFlightFrameWindow: UInt32 = 4
+    static let defaultInFlightFrameWindow: UInt32 = 4
+    static let fastLANInFlightFrameWindow: UInt32 = 16
+    /// Reassembly slack before drop-to-newest prunes a frame. Widened in Fast
+    /// LAN so a brief receiver stall during a burst does not manufacture a loss.
+    /// Read only on the transport queue under fragmentLock.
+    private var inFlightFrameWindow: UInt32 = UDPTransport.defaultInFlightFrameWindow
     
     // Safety limits for fragment reassembly
     // Quality-focused encoding at 4K can produce keyframes of 2-5 MB.
@@ -134,9 +147,47 @@ class UDPTransport {
     // the base. Loopback connections skip pacing entirely (no uplink to
     // overrun, and the gaps only add latency).
     private var _pacingBypassed = false        // guarded by pacingLock
+    private var _fastLANEnabled = false        // guarded by pacingLock
     private var pacingGapScale = 1.0           // guarded by pacingLock
     private var pacingCleanTicks = 0           // guarded by pacingLock
     private let pacingLock = NSLock()
+
+    /// Read on the encoder callback queue in sendFragmented. Guarded by pacingLock.
+    private var fastLANEnabled: Bool {
+        pacingLock.lock(); defer { pacingLock.unlock() }; return _fastLANEnabled
+    }
+
+    /// Apply transport-level Fast LAN behavior. Pacing and the reassembly window
+    /// flip live; the jumbo payload size takes effect on the next sent frame.
+    /// `jumbo` is gated by the caller (explicit Fast LAN only) because it only
+    /// works when the path supports a 9000-byte MTU.
+    func setFastLAN(_ enabled: Bool, jumbo: Bool) {
+        pacingLock.lock()
+        _fastLANEnabled = enabled
+        // Enabling Fast LAN drops pacing, so clear any widened gap from a prior
+        // congested period; otherwise it would be frozen and carried into the
+        // resilient window after a later revert.
+        if enabled {
+            pacingGapScale = 1.0
+            pacingCleanTicks = 0
+        }
+        pacingLock.unlock()
+
+        fragmentLock.lock()
+        inFlightFrameWindow = enabled ? Self.fastLANInFlightFrameWindow : Self.defaultInFlightFrameWindow
+        _maxPayloadSize = (enabled && jumbo) ? Self.jumboPayloadSize : Self.defaultPayloadSize
+        fragmentLock.unlock()
+    }
+
+    /// Largest keyframe, in bytes, that fits under the receiver fragment cap at
+    /// the current payload size, with headroom. Drives the encoder's Fast LAN
+    /// DataRateLimits so a keyframe never produces more than maxTotalFragments
+    /// data fragments (which the receiver would reject, stalling the stream).
+    func keyframeByteCeiling() -> Int {
+        fragmentLock.lock(); defer { fragmentLock.unlock() }
+        let effectivePayload = _maxPayloadSize - FragmentHeader.size
+        return Int(0.7 * Double(Int(maxTotalFragments) * effectivePayload))
+    }
 
     /// Written on the transport queue (client changes), read on the encoder
     /// callback queue in sendFragmented.
@@ -153,6 +204,10 @@ class UDPTransport {
     func notePacingTelemetry(droppedPerSec: Int) {
         pacingLock.lock()
         defer { pacingLock.unlock() }
+        // Fast LAN never paces, so widening the gap in response to receiver-side
+        // drops would have no effect except to re-arm a stale scale if the link
+        // later falls back to resilient. Leave the scale at its baseline.
+        if _fastLANEnabled { return }
         if droppedPerSec > 0 {
             pacingCleanTicks = 0
             pacingGapScale = min(Self.pacingMaxScale, pacingGapScale + Self.pacingIncreaseStep)
@@ -343,9 +398,10 @@ class UDPTransport {
         fragmentLock.lock()
         frameCounter += 1
         let frameId = (frameCounter & ~Self.droppableFrameFlag) | (droppable ? Self.droppableFrameFlag : 0)
+        let currentMaxPayload = _maxPayloadSize
         fragmentLock.unlock()
         
-        let payloadSize = maxPayloadSize - FragmentHeader.size
+        let payloadSize = currentMaxPayload - FragmentHeader.size
         let totalFragments = UInt16((data.count + payloadSize - 1) / payloadSize)
         
         var fragments: [Data] = []
@@ -410,8 +466,9 @@ class UDPTransport {
         }
 
         // Small frames go out immediately; pacing them would only add latency
-        // and they are too small to overrun the uplink.
-        if pacingBypassed || totalFragments <= pacingFragmentThreshold {
+        // and they are too small to overrun the uplink. Fast LAN and loopback
+        // skip pacing entirely.
+        if pacingBypassed || fastLANEnabled || totalFragments <= pacingFragmentThreshold {
             for fragment in sendList {
                 connection.send(content: fragment, completion: .contentProcessed { [weak self] error in
                     if let error = error {
@@ -752,11 +809,15 @@ class UDPTransport {
               let pParity = parityBuffers[frameId]?[blockIndex],
               var frags = fragmentBuffers[frameId] else { return }
 
-        let payloadSize = maxPayloadSize - FragmentHeader.size
         let blockStart = Int(blockIndex) * fecBlockSize
         guard blockStart < totalFragments else { return }
         let blockEnd = min(blockStart + fecBlockSize, totalFragments)
         let lastFrameIndex = totalFragments - 1
+
+        // The P parity is always padded to the sender's payload size, so its
+        // length is the exact reference even when host and client run different
+        // MTUs (e.g. a jumbo host and a default-payload client).
+        let payloadSize = pParity.count
 
         var missing: [Int] = []
         for i in blockStart..<blockEnd where frags[UInt16(i)] == nil {

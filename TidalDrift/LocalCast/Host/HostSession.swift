@@ -86,15 +86,129 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     /// Apply host-side runtime settings that do not require rebuilding the
     /// capture or encoder session. Codec/resolution still require a restart.
     func updateRuntimeConfiguration(_ newConfig: LocalCastConfiguration) {
+        let regionAwareChanged = configuration.regionAware != newConfig.regionAware
+        let profileChanged = configuration.transportProfile != newConfig.transportProfile
         configuration.adaptiveQuality = newConfig.adaptiveQuality
         configuration.regionAware = newConfig.regionAware
         configuration.forwardErrorCorrection = newConfig.forwardErrorCorrection
         configuration.captureCursor = newConfig.captureCursor
+        configuration.transportProfile = newConfig.transportProfile
         transport.fecEnabled = newConfig.forwardErrorCorrection
-        Task {
-            await captureManager.updateCursorCapture(newConfig.captureCursor)
+        if profileChanged {
+            applyConfiguredTransportProfile()
         }
-        logger.info("Runtime LocalCast settings: adaptive=\(newConfig.adaptiveQuality), regionAware=\(newConfig.regionAware), FEC=\(newConfig.forwardErrorCorrection), remoteCursor=\(newConfig.captureCursor)")
+        Task {
+            // Toggling region-aware changes the capture pixel format (BGRA tiles
+            // vs NV12 video), which is fixed at stream creation. Restart the live
+            // capture so the format matches the new mode; the restart also applies
+            // the latest cursor setting, so updateCursorCapture is only needed
+            // when the capture is not being rebuilt.
+            if regionAwareChanged, self.withCaptureState({ self.captureActive }) {
+                self.captureManager.captureCursor = newConfig.captureCursor
+                await self.retarget(to: self.captureTarget)
+            } else {
+                await self.captureManager.updateCursorCapture(newConfig.captureCursor)
+            }
+        }
+        logger.info("Runtime LocalCast settings: adaptive=\(newConfig.adaptiveQuality), regionAware=\(newConfig.regionAware), FEC=\(newConfig.forwardErrorCorrection), remoteCursor=\(newConfig.captureCursor), transport=\(newConfig.transportProfile.rawValue)")
+    }
+
+    // MARK: - Transport profile (Fast LAN vs Resilient)
+    //
+    // The configured profile (auto/resilient/fastLAN) is resolved into a single
+    // `_fastLANActive` decision that gates pacing, the reassembly window, the
+    // keyframe rate cap, the bitrate target, and (explicit fastLAN only) jumbo
+    // payloads. Auto starts resilient and promotes once client telemetry shows a
+    // low-RTT, loss-free link, with hysteresis so the choice does not flap.
+    // `_fastLANActive` and the auto tick counters are mutated both on the
+    // transport queue (telemetry ticks) and on the main thread (manual profile
+    // switches via SwiftUI onChange), so all of them, and the apply that pushes
+    // the jumbo payload size / bitrate / window to the transport and encoder,
+    // are serialized under `profileLock`. This keeps a manual switch racing a
+    // telemetry tick from leaving the payload size and bitrate mismatched.
+    private var _fastLANActive = false     // guarded by profileLock
+    private var autoGoodTicks = 0          // guarded by profileLock
+    private var autoBadTicks = 0           // guarded by profileLock
+    private let profileLock = NSLock()
+    private static let autoFastRTTms = 1.5
+    private static let autoRevertRTTms = 3.0
+    private static let autoGoodTicksNeeded = 3
+    private static let autoBadTicksNeeded = 2
+
+    /// Effective encoder bitrate target for the active profile.
+    private var effectiveBitrateMbps: Int {
+        profileLock.lock(); defer { profileLock.unlock() }
+        return _fastLANActive ? configuration.fastLANBitrateMbps : configuration.bitrateMbps
+    }
+
+    /// Push the current `_fastLANActive` decision to the transport and encoder.
+    /// Must be called with `profileLock` held. Jumbo is restricted to explicit
+    /// Fast LAN: an auto-selected fast link keeps the 1400-byte payload because
+    /// the path MTU has not been confirmed. The keyframe ceiling is read from
+    /// the transport after the payload size is set so it reflects the active
+    /// jumbo state.
+    private func applyTransportProfileLocked() {
+        let active = _fastLANActive
+        let jumbo = active && configuration.transportProfile == .fastLAN
+        transport.setFastLAN(active, jumbo: jumbo)
+        let ceiling = active ? transport.keyframeByteCeiling() : nil
+        encoder.setFastLAN(keyframeCeilingBytes: ceiling)
+        if withCaptureState({ captureActive }) {
+            encoder.updateLiveParameters(bitrateMbps: active ? configuration.fastLANBitrateMbps : configuration.bitrateMbps)
+        }
+    }
+
+    /// Resolve the configured profile into the initial `_fastLANActive` decision.
+    /// Explicit modes apply immediately; auto starts on the resilient baseline
+    /// and is promoted later by telemetry.
+    private func applyConfiguredTransportProfile() {
+        profileLock.lock()
+        defer { profileLock.unlock() }
+        autoGoodTicks = 0
+        autoBadTicks = 0
+        switch configuration.transportProfile {
+        case .fastLAN: _fastLANActive = true
+        case .resilient, .auto: _fastLANActive = false
+        }
+        applyTransportProfileLocked()
+    }
+
+    /// Auto controller: promote to Fast LAN after a run of clean, low-RTT ticks
+    /// and revert on sustained loss or rising RTT. Called from the per-second
+    /// telemetry path; all profile state is serialized under `profileLock`.
+    private func updateAutoTransportProfile(_ telemetry: LocalCastClientTelemetry) {
+        profileLock.lock()
+        defer { profileLock.unlock() }
+        guard configuration.transportProfile == .auto else { return }
+        let rtt = telemetry.latencyMs
+        if _fastLANActive {
+            if telemetry.droppedPerSec > 0 || rtt >= Self.autoRevertRTTms {
+                autoBadTicks += 1
+                autoGoodTicks = 0
+                if autoBadTicks >= Self.autoBadTicksNeeded {
+                    autoBadTicks = 0
+                    _fastLANActive = false
+                    applyTransportProfileLocked()
+                    logger.info("🌐 Transport auto: reverted to Resilient (rtt=\(String(format: "%.2f", rtt))ms, dropped=\(telemetry.droppedPerSec))")
+                }
+            } else {
+                autoBadTicks = 0
+            }
+        } else {
+            let clean = telemetry.droppedPerSec == 0 && rtt > 0 && rtt < Self.autoFastRTTms
+            if clean {
+                autoGoodTicks += 1
+                autoBadTicks = 0
+                if autoGoodTicks >= Self.autoGoodTicksNeeded {
+                    autoGoodTicks = 0
+                    _fastLANActive = true
+                    applyTransportProfileLocked()
+                    logger.info("🚀 Transport auto: selected Fast LAN (rtt=\(String(format: "%.2f", rtt))ms, dropped=0)")
+                }
+            } else {
+                autoGoodTicks = 0
+            }
+        }
     }
 
     // MARK: - Adaptive bitrate (AIMD on client loss signals)
@@ -117,6 +231,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     private static let adaptiveRecoveryQuiet: TimeInterval = 2.5
 
     private func noteClientTelemetry(_ telemetry: LocalCastClientTelemetry) {
+        updateAutoTransportProfile(telemetry)
         transport.notePacingTelemetry(droppedPerSec: telemetry.droppedPerSec)
         guard configuration.adaptiveQuality else { return }
         let now = Date()
@@ -206,6 +321,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         self.configuration = configuration
         captureManager.delegate = self
         captureManager.captureCursor = configuration.captureCursor
+        captureManager.regionAwareCapture = configuration.regionAware
         encoder.delegate = self
         transport.delegate = self
 
@@ -226,6 +342,11 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             inputRateLimiter = InputRateLimiter(maxPerSecond: configuration.inputRateLimit)
             logger.info("⏱️ Input rate limit: \(configuration.inputRateLimit) events/sec")
         }
+
+        // Seed the transport/encoder with the configured profile so explicit
+        // Fast LAN is in effect before the first frame; auto stays on the
+        // resilient baseline until telemetry promotes it.
+        applyConfiguredTransportProfile()
     }
 
     /// Start hosting with full display capture (default)
@@ -282,6 +403,10 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
 
         Task {
             do {
+                // Region-aware tiles need tightly-packed BGRA; the default video
+                // path captures NV12. Choose the capture format from the current
+                // mode before the stream is created.
+                captureManager.regionAwareCapture = configuration.regionAware
                 switch captureTarget {
                 case .fullDisplay:
                     try await startFullDisplayCapture()
@@ -357,11 +482,11 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             width: width,
             height: height,
             codec: configuration.codec,
-            bitrateMbps: configuration.bitrateMbps,
+            bitrateMbps: effectiveBitrateMbps,
             fps: configuration.targetFrameRate,
             quality: configuration.encoderQuality
         )
-        logger.info("✅ Video encoder configured: \(self.configuration.codec.rawValue), \(self.configuration.bitrateMbps)Mbps, \(self.configuration.targetFrameRate)fps, quality=\(self.configuration.encoderQuality)")
+        logger.info("✅ Video encoder configured: \(self.configuration.codec.rawValue), \(self.effectiveBitrateMbps)Mbps, \(self.configuration.targetFrameRate)fps, quality=\(self.configuration.encoderQuality)")
 
         try await captureManager.startCapture(
             displayID: displayID,
@@ -388,7 +513,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             width: 1920,
             height: 1080,
             codec: configuration.codec,
-            bitrateMbps: configuration.bitrateMbps,
+            bitrateMbps: effectiveBitrateMbps,
             fps: configuration.targetFrameRate,
             quality: configuration.encoderQuality
         )
@@ -411,7 +536,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             width: 1920,
             height: 1080,
             codec: configuration.codec,
-            bitrateMbps: configuration.bitrateMbps,
+            bitrateMbps: effectiveBitrateMbps,
             fps: configuration.targetFrameRate,
             quality: configuration.encoderQuality
         )
@@ -588,6 +713,10 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     /// if handled; false to fall back to video (e.g. the union got too large).
     private func sendDirtyTiles(_ sampleBuffer: CMSampleBuffer, rects: [CGRect]) -> Bool {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return false }
+        // Tiles are cropped as tightly-packed 32BGRA. If the capture format does
+        // not match (a stale frame from before a mode switch), fall through to the
+        // video encoder rather than reinterpreting NV12 bytes as BGRA.
+        guard CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_32BGRA else { return false }
         let pw = CVPixelBufferGetWidth(pixelBuffer)
         let ph = CVPixelBufferGetHeight(pixelBuffer)
         guard pw > 0, ph > 0 else { return false }
@@ -758,7 +887,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
 
     /// Must be called on `adaptiveQueue`.
     private func applyAdaptiveBitrate() {
-        let target = configuration.bitrateMbps
+        let target = effectiveBitrateMbps
         let scaled = max(Int(Double(target) * adaptiveScale), Int(Double(target) * Self.adaptiveMinScale))
         encoder.updateLiveParameters(bitrateMbps: scaled)
     }

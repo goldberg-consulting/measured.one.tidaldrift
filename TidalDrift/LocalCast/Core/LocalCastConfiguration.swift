@@ -27,6 +27,24 @@ struct LocalCastConfiguration: Codable {
             }
         }
     }
+
+    /// Transport tuning profile. Resilient is the Wi-Fi tuned behavior (paced
+    /// sends, tight keyframe cap, narrow reassembly window). Fast LAN drops the
+    /// pacing and widens limits for a clean wired link. Auto starts resilient and
+    /// promotes to Fast LAN when telemetry shows a low-RTT, loss-free path.
+    enum TransportProfile: String, CaseIterable, Codable {
+        case auto
+        case resilient
+        case fastLAN
+
+        var displayName: String {
+            switch self {
+            case .auto: return "Auto"
+            case .resilient: return "Resilient (Wi-Fi)"
+            case .fastLAN: return "Fast LAN"
+            }
+        }
+    }
     
     var qualityPreset: QualityPreset = .ultra
     /// HEVC is the preferred Mac-to-Mac codec: it is hardware accelerated via
@@ -63,6 +81,10 @@ struct LocalCastConfiguration: Codable {
     /// minimal for the fastest cursor/control feedback; Balanced and Smooth add
     /// cushion for jittery links.
     var latencyMode: LatencyMode = .low
+
+    /// Transport tuning profile. Defaults to Auto, which selects Fast LAN
+    /// behavior on a measured fast wired link and Resilient otherwise.
+    var transportProfile: TransportProfile = .auto
     
     // Security
     var requireAuthentication: Bool = true
@@ -80,6 +102,13 @@ struct LocalCastConfiguration: Codable {
     
     var scaleFactor: CGFloat {
         qualityPreset == .low ? 0.75 : 1.0
+    }
+
+    /// Bitrate ceiling for the Fast LAN transport profile. A wired 10GbE link is
+    /// not bandwidth constrained, so target well above the Wi-Fi tuned preset to
+    /// keep the image sharp. Never lower than the preset's own bitrate.
+    var fastLANBitrateMbps: Int {
+        max(bitrateMbps, 150)
     }
     
     /// Maximum capture dimension (longest edge). A user override (if set) wins;

@@ -400,9 +400,12 @@ class VideoDecoder {
     private func createDecompressionSession(with formatDescription: CMFormatDescription) {
         logger.info("🎬 Creating decompression session...")
         
-        // Destination image buffer attributes
+        // Destination image buffer attributes. Keep decoded frames as NV12
+        // (4:2:0 biplanar, full range) so the renderer samples the YUV planes
+        // directly; requesting BGRA here would force a per-frame NV12->BGRA
+        // conversion the renderer no longer needs.
         let destinationAttributes: [CFString: Any] = [
-            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
             kCVPixelBufferMetalCompatibilityKey: true
         ]
         
