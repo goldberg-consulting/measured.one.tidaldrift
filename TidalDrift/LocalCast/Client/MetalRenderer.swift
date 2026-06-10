@@ -10,18 +10,23 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     private var pipelineState: MTLRenderPipelineState?
+    private var nv12PipelineState: MTLRenderPipelineState?
     
     private var textureCache: CVMetalTextureCache?
 
     /// A decoded frame plus the references that keep its IOSurface alive. The
-    /// MTLTexture is backed by the CVImageBuffer via the texture cache, so we
-    /// must retain both the CVMetalTexture wrapper and the source buffer for as
+    /// MTLTexture(s) are backed by the CVImageBuffer via the texture cache, so we
+    /// must retain both the CVMetalTexture wrapper(s) and the source buffer for as
     /// long as the texture is in use, or VideoToolbox recycles that IOSurface
     /// for a later frame and the GPU samples a buffer being overwritten (tearing).
+    /// NV12 frames carry a luma (`texture`, plane 0) and chroma (`chromaTexture`,
+    /// plane 1); BGRA frames (region-aware tiles' heal path) carry only `texture`.
     private struct DecodedFrame {
         let texture: MTLTexture
-        let cvTexture: CVMetalTexture
+        let chromaTexture: MTLTexture?
+        let cvTextures: [CVMetalTexture]
         let pixelBuffer: CVImageBuffer
+        let isNV12: Bool
         let width: Int
         let height: Int
     }
@@ -109,6 +114,9 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     var isViewFlipped: Bool { mtkView.isFlipped }
     private var vertices: MTLBuffer?
     private var texCoords: MTLBuffer?
+    /// Full-screen (-1..1) quad, used when converting an NV12 heal frame into
+    /// the BGRA canvas (no letterboxing, the target is exactly source-sized).
+    private var identityVertices: MTLBuffer?
     
     private var frameCount = 0
     private var hasLoggedSuccess = false
@@ -161,6 +169,25 @@ class MetalRenderer: NSObject, MTKViewDelegate {
             constexpr sampler textureSampler(mag_filter::linear, min_filter::linear);
             return texture.sample(textureSampler, in.texCoord);
         }
+        
+        // Full-range BT.709: Y is sampled from the luma (r8) plane, Cb/Cr from
+        // the chroma (rg8) plane. Capture is kCVPixelFormatType_420Yp...FullRange,
+        // so Y is not scaled (full 0..1) and only the chroma is centred at 0.5.
+        // These coefficients must match the capture range/primaries or output
+        // is washed out (wrong range) or tinted (wrong matrix).
+        fragment float4 fragmentShaderNV12(VertexOut in [[stage_in]],
+                                           texture2d<float> lumaTexture [[texture(0)]],
+                                           texture2d<float> chromaTexture [[texture(1)]]) {
+            constexpr sampler s(mag_filter::linear, min_filter::linear);
+            float y = lumaTexture.sample(s, in.texCoord).r;
+            float2 cbcr = chromaTexture.sample(s, in.texCoord).rg;
+            float cb = cbcr.r - 0.5;
+            float cr = cbcr.g - 0.5;
+            float r = y + 1.5748 * cr;
+            float g = y - 0.1873 * cb - 0.4681 * cr;
+            float b = y + 1.8556 * cb;
+            return float4(r, g, b, 1.0);
+        }
         """
         
         // Compile shaders
@@ -189,6 +216,23 @@ class MetalRenderer: NSObject, MTKViewDelegate {
                 logger.error("🖥️ MetalRenderer: Failed to create pipeline state: \(error.localizedDescription)")
                 self.pipelineState = nil
             }
+
+            // Separate pipeline for NV12 video frames: same vertex stage, YUV->RGB
+            // fragment stage sampling the two planes. The view's color format is
+            // bgra8Unorm, which also matches the canvas heal render target.
+            if let nv12Func = library.makeFunction(name: "fragmentShaderNV12") {
+                let nv12Descriptor = MTLRenderPipelineDescriptor()
+                nv12Descriptor.vertexFunction = vertexFunc
+                nv12Descriptor.fragmentFunction = nv12Func
+                nv12Descriptor.colorAttachments[0].pixelFormat = mtkView.colorPixelFormat
+                do {
+                    self.nv12PipelineState = try device.makeRenderPipelineState(descriptor: nv12Descriptor)
+                    logger.info("🖥️ MetalRenderer: Created NV12 render pipeline state")
+                } catch {
+                    logger.error("🖥️ MetalRenderer: Failed to create NV12 pipeline state: \(error.localizedDescription)")
+                    self.nv12PipelineState = nil
+                }
+            }
         } else {
             logger.error("🖥️ MetalRenderer: Could not create shader functions")
             self.pipelineState = nil
@@ -210,6 +254,14 @@ class MetalRenderer: NSObject, MTKViewDelegate {
             1.0, 0.0   // Top right
         ]
         self.texCoords = device.makeBuffer(bytes: texCoordData, length: texCoordData.count * MemoryLayout<Float>.stride, options: [])
+        
+        let identityData: [Float] = [
+            -1.0, -1.0,
+             1.0, -1.0,
+            -1.0,  1.0,
+             1.0,  1.0
+        ]
+        self.identityVertices = device.makeBuffer(bytes: identityData, length: identityData.count * MemoryLayout<Float>.stride, options: [])
         
         super.init()
         
@@ -285,60 +337,40 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         
         let width = CVPixelBufferGetWidth(imageBuffer)
         let height = CVPixelBufferGetHeight(imageBuffer)
-        
-        // Get pixel format
+
+        // Pick the pipeline per frame off the incoming pixel format so a mixed
+        // session renders both: decoded video arrives as NV12 (two planes), the
+        // region-aware heal path also arrives as NV12, and any BGRA buffer falls
+        // back to the single-texture pipeline.
         let pixelFormat = CVPixelBufferGetPixelFormatType(imageBuffer)
-        let mtlPixelFormat: MTLPixelFormat
-        
-        switch pixelFormat {
-        case kCVPixelFormatType_32BGRA:
-            mtlPixelFormat = .bgra8Unorm
-        case kCVPixelFormatType_32RGBA:
-            mtlPixelFormat = .rgba8Unorm
-        default:
-            // Try BGRA as default
-            mtlPixelFormat = .bgra8Unorm
-            if frameCount < 5 {
-                lcDebug("🖥️ MetalRenderer: Unknown pixel format \(pixelFormat), using BGRA")
-            }
-        }
-        
-        var cvTexture: CVMetalTexture?
-        let status = CVMetalTextureCacheCreateTextureFromImage(
-            kCFAllocatorDefault,
-            cache,
-            imageBuffer,
-            nil,
-            mtlPixelFormat,
-            width,
-            height,
-            0,
-            &cvTexture
-        )
-        
-        guard status == kCVReturnSuccess, let cvTex = cvTexture,
-              let mtlTexture = CVMetalTextureGetTexture(cvTex) else {
-            logger.error("🖥️ MetalRenderer: Failed to create Metal texture: \(status)")
+        // Only full-range routes to the NV12 pipeline: the shader applies
+        // full-range BT.709 math (no 16-235 expansion). Capture and decode are
+        // both FullRange, so a VideoRange buffer never reaches here; treating one
+        // as full range would wash the image out.
+        let isNV12 = pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+
+        guard let frame = isNV12
+            ? makeNV12Frame(imageBuffer, width: width, height: height, cache: cache)
+            : makeBGRAFrame(imageBuffer, width: width, height: height, cache: cache, pixelFormat: pixelFormat) else {
             return
         }
 
-        let frame = DecodedFrame(
-            texture: mtlTexture,
-            cvTexture: cvTex,
-            pixelBuffer: imageBuffer,
-            width: width,
-            height: height
-        )
-
         // Region-aware: a full frame replaces the canvas (it's the periodic /
-        // on-request refresh that heals lost tiles). Blit it in on the main
-        // thread so it orders correctly with tile blits and the present.
+        // on-request refresh that heals lost tiles). The canvas is BGRA (tiles
+        // arrive as BGRA), so an NV12 heal frame is converted to BGRA first. Done
+        // on the main thread so it orders correctly with tile blits and present.
         if canvasMode {
             frameCount += 1
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.ensureCanvas(width: width, height: height, seedFrom: nil)
-                self.blitIntoCanvas(frame.texture, atX: 0, y: 0, retain: frame)
+                if frame.isNV12 {
+                    if let bgra = self.renderNV12ToBGRA(frame) {
+                        self.blitIntoCanvas(bgra, atX: 0, y: 0, retain: bgra)
+                    }
+                } else {
+                    self.blitIntoCanvas(frame.texture, atX: 0, y: 0, retain: frame)
+                }
             }
             return
         }
@@ -401,10 +433,10 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     func draw(in view: MTKView) {
         guard pipelineState != nil else { return }
 
-        // Region-aware: present the persistent canvas every tick.
+        // Region-aware: present the persistent canvas every tick (always BGRA).
         if canvasMode {
             guard let canvas = canvasTexture else { return }
-            presentTexture(canvas, srcWidth: canvas.width, srcHeight: canvas.height, in: view, retain: nil)
+            presentTexture(canvas, chroma: nil, srcWidth: canvas.width, srcHeight: canvas.height, in: view, retain: nil)
             return
         }
 
@@ -440,14 +472,17 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         frameQueueLock.unlock()
 
         guard let frame = frame else { return }
-        presentTexture(frame.texture, srcWidth: frame.width, srcHeight: frame.height, in: view, retain: frame)
+        presentTexture(frame.texture, chroma: frame.chromaTexture, srcWidth: frame.width, srcHeight: frame.height, in: view, retain: frame)
     }
 
     /// Draw a texture to the view's drawable with aspect-ratio letterboxing.
-    /// `retain` is held until the GPU finishes so a recycled IOSurface can't be
-    /// overwritten mid-read.
-    private func presentTexture(_ texture: MTLTexture, srcWidth: Int, srcHeight: Int, in view: MTKView, retain: Any?) {
-        guard let pipelineState = pipelineState,
+    /// When `chroma` is non-nil the source is NV12 and the YUV->RGB pipeline runs
+    /// (luma at index 0, chroma at index 1); otherwise the BGRA pipeline samples
+    /// `texture` directly. `retain` is held until the GPU finishes so a recycled
+    /// IOSurface can't be overwritten mid-read.
+    private func presentTexture(_ texture: MTLTexture, chroma: MTLTexture?, srcWidth: Int, srcHeight: Int, in view: MTKView, retain: Any?) {
+        let pipeline = chroma != nil ? nv12PipelineState : pipelineState
+        guard let pipeline,
               let drawable = view.currentDrawable,
               let renderPassDescriptor = view.currentRenderPassDescriptor else {
             return
@@ -470,16 +505,117 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         renderPassDescriptor.colorAttachments[0].loadAction = .clear
         guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else { return }
 
-        renderEncoder.setRenderPipelineState(pipelineState)
+        renderEncoder.setRenderPipelineState(pipeline)
         renderEncoder.setVertexBuffer(vertices, offset: 0, index: 0)
         renderEncoder.setVertexBuffer(texCoords, offset: 0, index: 1)
         renderEncoder.setFragmentTexture(texture, index: 0)
+        if let chroma { renderEncoder.setFragmentTexture(chroma, index: 1) }
         renderEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         renderEncoder.endEncoding()
 
         if let retain { commandBuffer.addCompletedHandler { _ in _ = retain } }
         commandBuffer.present(drawable)
         commandBuffer.commit()
+    }
+
+    /// Wrap an NV12 image buffer as two Metal textures: plane 0 luma as `.r8Unorm`
+    /// (full res) and plane 1 chroma as `.rg8Unorm` (half res). Both texture-cache
+    /// wrappers are retained so the source IOSurface stays alive while in use.
+    private func makeNV12Frame(_ imageBuffer: CVImageBuffer, width: Int, height: Int, cache: CVMetalTextureCache) -> DecodedFrame? {
+        let lumaWidth = CVPixelBufferGetWidthOfPlane(imageBuffer, 0)
+        let lumaHeight = CVPixelBufferGetHeightOfPlane(imageBuffer, 0)
+        let chromaWidth = CVPixelBufferGetWidthOfPlane(imageBuffer, 1)
+        let chromaHeight = CVPixelBufferGetHeightOfPlane(imageBuffer, 1)
+
+        var lumaCV: CVMetalTexture?
+        var chromaCV: CVMetalTexture?
+        let lumaStatus = CVMetalTextureCacheCreateTextureFromImage(
+            kCFAllocatorDefault, cache, imageBuffer, nil, .r8Unorm, lumaWidth, lumaHeight, 0, &lumaCV)
+        let chromaStatus = CVMetalTextureCacheCreateTextureFromImage(
+            kCFAllocatorDefault, cache, imageBuffer, nil, .rg8Unorm, chromaWidth, chromaHeight, 1, &chromaCV)
+
+        guard lumaStatus == kCVReturnSuccess, chromaStatus == kCVReturnSuccess,
+              let lumaCV, let chromaCV,
+              let luma = CVMetalTextureGetTexture(lumaCV),
+              let chroma = CVMetalTextureGetTexture(chromaCV) else {
+            logger.error("🖥️ MetalRenderer: Failed to create NV12 plane textures: \(lumaStatus)/\(chromaStatus)")
+            return nil
+        }
+
+        return DecodedFrame(
+            texture: luma,
+            chromaTexture: chroma,
+            cvTextures: [lumaCV, chromaCV],
+            pixelBuffer: imageBuffer,
+            isNV12: true,
+            width: width,
+            height: height
+        )
+    }
+
+    /// Wrap a packed BGRA (or RGBA) image buffer as a single Metal texture.
+    private func makeBGRAFrame(_ imageBuffer: CVImageBuffer, width: Int, height: Int, cache: CVMetalTextureCache, pixelFormat: OSType) -> DecodedFrame? {
+        let mtlPixelFormat: MTLPixelFormat = pixelFormat == kCVPixelFormatType_32RGBA ? .rgba8Unorm : .bgra8Unorm
+        var cvTexture: CVMetalTexture?
+        let status = CVMetalTextureCacheCreateTextureFromImage(
+            kCFAllocatorDefault, cache, imageBuffer, nil, mtlPixelFormat, width, height, 0, &cvTexture)
+
+        guard status == kCVReturnSuccess, let cvTex = cvTexture,
+              let mtlTexture = CVMetalTextureGetTexture(cvTex) else {
+            logger.error("🖥️ MetalRenderer: Failed to create Metal texture: \(status)")
+            return nil
+        }
+
+        return DecodedFrame(
+            texture: mtlTexture,
+            chromaTexture: nil,
+            cvTextures: [cvTex],
+            pixelBuffer: imageBuffer,
+            isNV12: false,
+            width: width,
+            height: height
+        )
+    }
+
+    /// Convert an NV12 frame to a BGRA texture via the YUV->RGB pipeline so it can
+    /// patch the BGRA canvas. The dest is exactly source-sized, so a full-screen
+    /// quad fills it 1:1. Committed on the same queue as the canvas blit, so the
+    /// render completes before the blit reads it. Main thread only.
+    private func renderNV12ToBGRA(_ frame: DecodedFrame) -> MTLTexture? {
+        guard frame.isNV12,
+              let chroma = frame.chromaTexture,
+              let nv12Pipeline = nv12PipelineState,
+              let identityVertices, let texCoords else {
+            return nil
+        }
+
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm, width: frame.width, height: frame.height, mipmapped: false)
+        desc.usage = [.shaderRead, .renderTarget]
+        desc.storageMode = .private
+        guard let dest = device.makeTexture(descriptor: desc),
+              let commandBuffer = commandQueue.makeCommandBuffer() else {
+            return nil
+        }
+
+        let passDescriptor = MTLRenderPassDescriptor()
+        passDescriptor.colorAttachments[0].texture = dest
+        passDescriptor.colorAttachments[0].loadAction = .dontCare
+        passDescriptor.colorAttachments[0].storeAction = .store
+        guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: passDescriptor) else { return nil }
+
+        encoder.setRenderPipelineState(nv12Pipeline)
+        encoder.setVertexBuffer(identityVertices, offset: 0, index: 0)
+        encoder.setVertexBuffer(texCoords, offset: 0, index: 1)
+        encoder.setFragmentTexture(frame.texture, index: 0)
+        encoder.setFragmentTexture(chroma, index: 1)
+        encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        encoder.endEncoding()
+
+        let retain = frame
+        commandBuffer.addCompletedHandler { _ in _ = retain }
+        commandBuffer.commit()
+        return dest
     }
 
     // MARK: - Region-aware tiles (main thread)
@@ -520,7 +656,16 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         sourceWidth = width
         sourceHeight = height
         if let seed = seedFrom, seed.width == width, seed.height == height {
-            blitIntoCanvas(seed.texture, atX: 0, y: 0, retain: seed)
+            // The canvas is BGRA; an NV12 seed must be converted first, otherwise
+            // the blit copies an r8 luma plane into a bgra8 target (incompatible
+            // bytes-per-pixel).
+            if seed.isNV12 {
+                if let bgra = renderNV12ToBGRA(seed) {
+                    blitIntoCanvas(bgra, atX: 0, y: 0, retain: bgra)
+                }
+            } else {
+                blitIntoCanvas(seed.texture, atX: 0, y: 0, retain: seed)
+            }
         }
     }
 

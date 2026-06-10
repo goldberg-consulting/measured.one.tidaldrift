@@ -40,6 +40,13 @@ class VideoEncoder {
     private var currentBitrateMbps: Int = 50
     private var currentFps: Int = 60
     private var currentQuality: Float = 0.8
+
+    /// When non-nil, Fast LAN is active and keyframe DataRateLimits are bounded
+    /// to this many bytes per 0.1s window so a keyframe cannot exceed the
+    /// receiver's fragment cap. Nil means resilient mode (the 1.5x/0.1s formula).
+    /// Guarded by sessionLock (read in setup, updateLiveParameters, and
+    /// dataRateLimits, all of which hold it).
+    private var keyframeCeilingBytes: Int?
     
     deinit {
         // SAFETY: The VTCompressionSession callback holds an unretained pointer to
@@ -127,7 +134,7 @@ class VideoEncoder {
         // Do NOT set PrioritizeEncodingSpeedOverQuality — we want the best visual
         // quality the encoder can produce within real-time constraints.
         
-        let limitStatus = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: Self.dataRateLimits(bitrateMbps: bitrateMbps))
+        let limitStatus = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: dataRateLimits(bitrateMbps: bitrateMbps))
         if limitStatus != noErr {
             logger.warning("DataRateLimits rejected (\(limitStatus)); keyframe bursts are unbounded on this encoder config")
         }
@@ -206,7 +213,7 @@ class VideoEncoder {
             let avgBitRate = bps * 1_000_000
             let s1 = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: avgBitRate as CFNumber)
             
-            let s2 = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: Self.dataRateLimits(bitrateMbps: bps))
+            let s2 = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: dataRateLimits(bitrateMbps: bps))
             
             if s1 == noErr && s2 == noErr {
                 logger.info("Live update: bitrate → \(bps) Mbps")
@@ -262,11 +269,35 @@ class VideoEncoder {
     /// alternating [bytes, seconds] CFNumbers and accepts fractional seconds;
     /// callers check the VTSessionSetProperty status since support varies by
     /// codec and OS version.
-    private static func dataRateLimits(bitrateMbps: Int) -> CFArray {
+    private func dataRateLimits(bitrateMbps: Int) -> CFArray {
+        if let ceiling = keyframeCeilingBytes {
+            // Fast LAN: bound the keyframe burst to the receiver's fragment cap.
+            // A keyframe is emitted within one frame interval (< 0.1s), so this
+            // caps the keyframe size directly. The implied rate (ceiling / 0.1s)
+            // sits far above the average bitrate, leaving P-frames unaffected.
+            return [NSNumber(value: ceiling), NSNumber(value: 0.1)] as CFArray
+        }
         let bytesPerSecond = (bitrateMbps * 1_000_000) / 8
         let windowSeconds = 0.1
         let burstBytes = Int(Double(bytesPerSecond) * 1.5 * windowSeconds)
         return [NSNumber(value: burstBytes), NSNumber(value: windowSeconds)] as CFArray
+    }
+
+    /// Set the Fast LAN keyframe byte ceiling (nil means resilient mode).
+    /// Re-applies DataRateLimits live so an auto-selected switch, or a jumbo
+    /// on/off change that moves the ceiling, takes effect without recreating the
+    /// session. setup and updateLiveParameters read the same stored ceiling, so
+    /// the limits stay consistent across a later resolution reconfigure.
+    func setFastLAN(keyframeCeilingBytes: Int?) {
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+        guard keyframeCeilingBytes != self.keyframeCeilingBytes else { return }
+        self.keyframeCeilingBytes = keyframeCeilingBytes
+        guard let session = session else { return }
+        let status = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: dataRateLimits(bitrateMbps: currentBitrateMbps))
+        if status != noErr {
+            logger.warning("Live DataRateLimits update failed: \(status)")
+        }
     }
     
     func invalidate() {

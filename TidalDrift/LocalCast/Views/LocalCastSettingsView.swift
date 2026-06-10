@@ -15,6 +15,7 @@ struct LocalCastSettingsView: View {
     @AppStorage("localCastFEC") var forwardErrorCorrection = false
     @AppStorage("localCastLatencyMode") var latencyMode: LocalCastConfiguration.LatencyMode = .low
     @AppStorage("localCastCaptureCursor") var captureCursor = false
+    @AppStorage("localCastTransportProfile") var transportProfile: LocalCastConfiguration.TransportProfile = .auto
     
     @State private var hostPassword = ""
     @State private var isRestartingStream = false
@@ -150,6 +151,13 @@ struct LocalCastSettingsView: View {
                     }
                     .help("Client-side jitter buffer policy. Low Latency (default) reduces buffering for snappier cursor/control; Smooth adds more cushion for uneven Wi-Fi. Applies to the next viewer connection.")
 
+                    Picker("Transport profile", selection: $transportProfile) {
+                        ForEach(LocalCastConfiguration.TransportProfile.allCases, id: \.self) { profile in
+                            Text(profile.displayName).tag(profile)
+                        }
+                    }
+                    .help("Auto picks Fast LAN on a clean wired link (low RTT, no loss) and Resilient on Wi-Fi. Fast LAN drops pacing, widens the reassembly window, loosens the keyframe cap, and raises bitrate. Forcing Fast LAN also uses jumbo datagrams (needs a 9000 MTU). Applies live.")
+
                     Toggle("Show remote cursor in stream", isOn: $captureCursor)
                         .help("Composites the host's cursor into the video. Off (default), your local cursor is the pointer, removing the network round trip from pointer motion. Turn on for view-only sessions. Applies live on macOS 14+, otherwise next session.")
 
@@ -266,6 +274,7 @@ struct LocalCastSettingsView: View {
         .onChange(of: forwardErrorCorrection) { _ in service.applyLiveResilienceSettingsFromDefaults() }
         .onChange(of: regionAware) { _ in service.applyLiveResilienceSettingsFromDefaults() }
         .onChange(of: captureCursor) { _ in service.applyLiveResilienceSettingsFromDefaults() }
+        .onChange(of: transportProfile) { _ in service.applyLiveResilienceSettingsFromDefaults() }
         // Codec and resolution need a fresh capture/encoder session, but the user
         // shouldn't have to find and click a button. Re-apply them automatically
         // (debounced) so changing them while hosting "just works".
