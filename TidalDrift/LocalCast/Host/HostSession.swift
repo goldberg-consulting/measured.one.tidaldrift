@@ -441,22 +441,30 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
 
         logger.info("Applying live quality: \(bitrate)Mbps, \(fps)fps, q=\(quality), kfi=\(kfi)s")
 
-        // Update encoder properties in-place (no session teardown)
-        encoder.updateLiveParameters(
-            bitrateMbps: bitrate,
-            fps: fps,
-            quality: quality,
-            keyframeIntervalSeconds: kfi
-        )
+        // Apply encoder property changes on the same serial queue the adaptive
+        // controller uses, never on the caller's (often main) thread. A
+        // VTSessionSetProperty can block for the duration of an in-flight
+        // encode; doing that on the main thread froze the UI, and doing it
+        // concurrently from several threads wedged the encoder service.
+        adaptiveQueue.async { [weak self] in
+            guard let self else { return }
 
-        // Emit a fresh keyframe so the viewer resyncs immediately after the
-        // parameter change instead of waiting for the next scheduled keyframe.
-        encoder.forceKeyFrame()
+            self.encoder.updateLiveParameters(
+                bitrateMbps: bitrate,
+                fps: fps,
+                quality: quality,
+                keyframeIntervalSeconds: kfi
+            )
 
-        guard withCaptureState({ captureActive }) else { return }
+            // Emit a fresh keyframe so the viewer resyncs immediately after the
+            // parameter change instead of waiting for the next scheduled keyframe.
+            self.encoder.forceKeyFrame()
 
-        Task {
-            await captureManager.updateFrameRate(fps)
+            guard self.withCaptureState({ self.captureActive }) else { return }
+
+            Task {
+                await self.captureManager.updateFrameRate(fps)
+            }
         }
     }
 

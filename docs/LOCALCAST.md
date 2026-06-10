@@ -241,6 +241,28 @@ Jellyfin-ffmpeg builds), but Apple Silicon has no hardware AV1 *encoder* exposed
 to VideoToolbox, and software AV1 is too slow for interactive Mac-to-Mac. HEVC
 remains the target codec; AV1 is a deferred research spike, not a dependency.
 
+### Fix 7: encoder XPC deadlock under concurrent access (1.6.40)
+
+A `sample` of a hung host showed five threads blocked in
+`xpc_connection_send_message_with_reply_sync` against the VideoToolbox encoder
+service: the main thread in `updateStreamingQuality` →
+`VTCompressionSessionSetProperty`, the adaptive queue in `applyAdaptiveBitrate`
+→ `VTSessionSetProperty`, the capture queue in `VTCompressionSessionEncodeFrame`,
+plus VT's own compression and callback queues. `VTCompressionSession` is not
+safe for concurrent use; simultaneous property-set + encode wedges the encoder
+service, which then blocks every caller forever (UI beachball, and encoder
+instability that outlives the stream). Two fixes:
+
+- `VideoEncoder` serializes every session call (create, encode, property
+  update, invalidate) behind a recursive lock.
+- `HostSession.updateStreamingQuality` applies encoder changes on the adaptive
+  serial queue, never on the caller's (main) thread, so the UI can't block on
+  an in-flight encode even briefly.
+
+Also in 1.6.40: the in-stream chevron now opens the tabbed Stream Controls
+popup directly (no expanded-toolbar submenu step), and the optional stats
+readout floats top-right independent of any toolbar.
+
 ### Fix 6: low-latency rate control + frictionless settings (1.6.38)
 
 - **Low-latency rate controller.** `VideoEncoder` now passes

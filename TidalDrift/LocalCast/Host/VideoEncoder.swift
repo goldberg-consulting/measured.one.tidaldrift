@@ -13,7 +13,19 @@ class VideoEncoder {
     
     private var session: VTCompressionSession?
     private let callbackQueue = DispatchQueue(label: "com.tidaldrift.localcast.encoder.callback", qos: .userInteractive)
-    
+
+    /// Serializes every VTCompressionSession call (create, encode, property
+    /// updates, invalidate). VideoToolbox sessions are not safe for concurrent
+    /// use: per-frame `encode` (capture queue), live tuning (UI), and adaptive
+    /// bitrate (adaptive queue) all hit the same session, and concurrent
+    /// VTSessionSetProperty + VTCompressionSessionEncodeFrame wedge the
+    /// encoder's XPC service. Every caller then blocks forever in
+    /// xpc_connection_send_message_with_reply_sync (observed as a main-thread
+    /// hang and system-wide encoder instability that persists after the stream
+    /// disconnects). Recursive because `encode` re-enters `setup` when the
+    /// incoming frame size changes.
+    private let sessionLock = NSRecursiveLock()
+
     // Flag to force next frame as keyframe
     private var forceNextKeyFrame = false
     private let keyframeLock = NSLock()
@@ -39,6 +51,9 @@ class VideoEncoder {
     }
     
     func setup(width: Int, height: Int, codec: LocalCastConfiguration.Codec, bitrateMbps: Int, fps: Int, quality: Float = 0.8) {
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+
         // Tear down any existing session first
         if let old = session {
             VTCompressionSessionInvalidate(old)
@@ -126,7 +141,10 @@ class VideoEncoder {
     
     func encode(_ sampleBuffer: CMSampleBuffer) {
         guard let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        
+
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+
         // Auto-reconfigure if the incoming frame resolution doesn't match the
         // encoder session. This happens when ScreenCaptureManager starts capture
         // at a different size than the encoder's initial placeholder (e.g. the
@@ -176,6 +194,9 @@ class VideoEncoder {
     /// Returns true if all properties were set successfully.
     @discardableResult
     func updateLiveParameters(bitrateMbps: Int? = nil, fps: Int? = nil, quality: Float? = nil, keyframeIntervalSeconds: Double? = nil) -> Bool {
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+
         guard let session = session else {
             logger.warning("updateLiveParameters: no active session")
             return false
@@ -240,6 +261,9 @@ class VideoEncoder {
     }
     
     func invalidate() {
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+
         if let session = session {
             VTCompressionSessionInvalidate(session)
             self.session = nil
