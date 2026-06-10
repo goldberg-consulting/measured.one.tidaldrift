@@ -127,13 +127,10 @@ class VideoEncoder {
         // Do NOT set PrioritizeEncodingSpeedOverQuality — we want the best visual
         // quality the encoder can produce within real-time constraints.
         
-        // Relaxed data rate limit: allow bursts up to 3x average bitrate within
-        // a 1-second window. On a LAN, burst spikes are acceptable and this lets
-        // keyframes retain much higher quality instead of being aggressively quantized.
-        let bytesPerSecond = (bitrateMbps * 1_000_000) / 8
-        let burstLimit = bytesPerSecond * 3  // 3x average for keyframe headroom
-        let dataRateLimit: [Int] = [burstLimit, 1]  // [bytes, seconds]
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: dataRateLimit as CFArray)
+        let limitStatus = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: Self.dataRateLimits(bitrateMbps: bitrateMbps))
+        if limitStatus != noErr {
+            logger.warning("DataRateLimits rejected (\(limitStatus)); keyframe bursts are unbounded on this encoder config")
+        }
         
         VTCompressionSessionPrepareToEncodeFrames(session)
         logger.info("Video encoder setup complete: \(width)x\(height), \(bitrateMbps)Mbps, \(fps)fps, quality=\(quality), profile=\(codec == .hevc ? "HEVC Main" : "H.264 High")")
@@ -209,11 +206,7 @@ class VideoEncoder {
             let avgBitRate = bps * 1_000_000
             let s1 = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: avgBitRate as CFNumber)
             
-            // Also update the burst data rate limit (3x average in a 1-second window)
-            let bytesPerSecond = avgBitRate / 8
-            let burstLimit = bytesPerSecond * 3
-            let dataRateLimit: [Int] = [burstLimit, 1]
-            let s2 = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: dataRateLimit as CFArray)
+            let s2 = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: Self.dataRateLimits(bitrateMbps: bps))
             
             if s1 == noErr && s2 == noErr {
                 logger.info("Live update: bitrate → \(bps) Mbps")
@@ -258,6 +251,22 @@ class VideoEncoder {
         }
         
         return allOk
+    }
+    
+    /// DataRateLimits pair bounding bursts to ~1.5x the average bitrate over a
+    /// 100ms window, so a keyframe is small enough to serialize onto the wire
+    /// within a frame interval. With no retransmit, a multi-MB keyframe spends
+    /// 100ms+ in flight and a single lost fragment discards the whole frame;
+    /// keeping keyframes near the per-window budget trades a softer IDR for a
+    /// stream that survives the uplink. VideoToolbox reads the array as
+    /// alternating [bytes, seconds] CFNumbers and accepts fractional seconds;
+    /// callers check the VTSessionSetProperty status since support varies by
+    /// codec and OS version.
+    private static func dataRateLimits(bitrateMbps: Int) -> CFArray {
+        let bytesPerSecond = (bitrateMbps * 1_000_000) / 8
+        let windowSeconds = 0.1
+        let burstBytes = Int(Double(bytesPerSecond) * 1.5 * windowSeconds)
+        return [NSNumber(value: burstBytes), NSNumber(value: windowSeconds)] as CFArray
     }
     
     func invalidate() {

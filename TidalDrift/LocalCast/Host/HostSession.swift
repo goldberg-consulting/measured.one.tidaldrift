@@ -117,6 +117,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     private static let adaptiveRecoveryQuiet: TimeInterval = 2.5
 
     private func noteClientTelemetry(_ telemetry: LocalCastClientTelemetry) {
+        transport.notePacingTelemetry(droppedPerSec: telemetry.droppedPerSec)
         guard configuration.adaptiveQuality else { return }
         let now = Date()
         guard now >= adaptiveGraceUntil else { return }
@@ -708,6 +709,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         clientEndpoint = endpoint
         clientConnection = connection
         isLoopbackConnection = Self.isLocalEndpoint(endpoint)
+        transport.pacingBypassed = isLoopbackConnection
         lastClientPacketAt = Date()
         if isNewClient {
             hasSentFirstVideoPacket = false

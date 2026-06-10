@@ -125,8 +125,50 @@ class UDPTransport {
     // the uplink's instantaneous capacity and largely removes that loss.
     private let pacingFragmentThreshold = 12   // frames at/below this go out unpaced
     private let pacingBatchSize = 16           // fragments per paced burst
-    private let pacingGapMicros = 700          // gap between bursts (~256 Mbps ceiling)
+    private let pacingGapBaseMicros = 700      // base gap between bursts (~256 Mbps ceiling)
     private let paceQueue = DispatchQueue(label: "com.tidaldrift.localcast.sendpace", qos: .userInteractive)
+
+    // Adaptive pacing. The client reports drops once per second; drops mean
+    // the uplink is shedding our bursts, so widen the inter-burst gap (slower,
+    // safer sends). A sustained run of clean ticks narrows the gap back toward
+    // the base. Loopback connections skip pacing entirely (no uplink to
+    // overrun, and the gaps only add latency).
+    private var _pacingBypassed = false        // guarded by pacingLock
+    private var pacingGapScale = 1.0           // guarded by pacingLock
+    private var pacingCleanTicks = 0           // guarded by pacingLock
+    private let pacingLock = NSLock()
+
+    /// Written on the transport queue (client changes), read on the encoder
+    /// callback queue in sendFragmented.
+    var pacingBypassed: Bool {
+        get { pacingLock.lock(); defer { pacingLock.unlock() }; return _pacingBypassed }
+        set { pacingLock.lock(); _pacingBypassed = newValue; pacingLock.unlock() }
+    }
+    private static let pacingMaxScale = 4.0
+    private static let pacingIncreaseStep = 0.5
+    private static let pacingDecreaseStep = 0.25
+    private static let pacingCleanTicksNeeded = 3
+
+    /// Feed one per-second client telemetry tick into the pacing controller.
+    func notePacingTelemetry(droppedPerSec: Int) {
+        pacingLock.lock()
+        defer { pacingLock.unlock() }
+        if droppedPerSec > 0 {
+            pacingCleanTicks = 0
+            pacingGapScale = min(Self.pacingMaxScale, pacingGapScale + Self.pacingIncreaseStep)
+        } else {
+            pacingCleanTicks += 1
+            if pacingCleanTicks >= Self.pacingCleanTicksNeeded, pacingGapScale > 1.0 {
+                pacingGapScale = max(1.0, pacingGapScale - Self.pacingDecreaseStep)
+            }
+        }
+    }
+
+    private var currentPacingGapMicros: Int {
+        pacingLock.lock()
+        defer { pacingLock.unlock() }
+        return Int(Double(pacingGapBaseMicros) * pacingGapScale)
+    }
 
     // Forward error correction. When enabled (host/sender side), each block of
     // `fecBlockSize` video data fragments gets two parity fragments:
@@ -369,7 +411,7 @@ class UDPTransport {
 
         // Small frames go out immediately; pacing them would only add latency
         // and they are too small to overrun the uplink.
-        if totalFragments <= pacingFragmentThreshold {
+        if pacingBypassed || totalFragments <= pacingFragmentThreshold {
             for fragment in sendList {
                 connection.send(content: fragment, completion: .contentProcessed { [weak self] error in
                     if let error = error {
@@ -427,7 +469,7 @@ class UDPTransport {
     private func paceFragments(_ fragments: [Data], on connection: NWConnection, frameId: UInt32) {
         let total = fragments.count
         let batchSize = pacingBatchSize
-        let gap = DispatchTimeInterval.microseconds(pacingGapMicros)
+        let gap = DispatchTimeInterval.microseconds(currentPacingGapMicros)
         
         func drain(from start: Int) {
             let end = min(start + batchSize, total)

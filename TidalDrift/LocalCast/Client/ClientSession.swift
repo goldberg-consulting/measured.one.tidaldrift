@@ -39,6 +39,14 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
 
     private let transport = UDPTransport()
     private let decoder = VideoDecoder()
+
+    /// Serial queue for decode and tile application. The transport delegate
+    /// fires on the single UDP receive queue; a synchronous decode of a large
+    /// keyframe there stalls datagram intake long enough for the next frames'
+    /// fragments to back up and get reaped as incomplete (counted as drops).
+    /// Serial so frame and tile ordering is preserved.
+    private let decodeQueue = DispatchQueue(label: "com.tidaldrift.localcast.decode", qos: .userInteractive)
+
     var renderer: MetalRenderer?
     weak var delegate: ClientSessionDelegate?
 
@@ -375,7 +383,11 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
 
         transport.stopListening()
         transport.sessionKey = nil
-        decoder.invalidate()
+        // Invalidate on the decode queue so it serializes behind any in-flight
+        // decode instead of tearing down the session mid-frame.
+        decodeQueue.async { [weak self] in
+            self?.decoder.invalidate()
+        }
         isConnected = false
         connectionPhase = .disconnected
         connectionStatus = "Disconnected"
@@ -758,35 +770,44 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
 
         switch packet.type {
         case .videoFrame:
-            frameCount += 1
-            receivedMediaBytes += packet.payload.count
-            if frameCount == 1 || frameCount % 60 == 0 {
-                lcDebug("📦 ClientSession: Received video frame #\(frameCount), size: \(packet.payload.count) bytes")
-            }
-            decoder.decode(packet.payload)
+            let payload = packet.payload
+            decodeQueue.async { [weak self] in
+                guard let self else { return }
+                self.frameCount += 1
+                self.receivedMediaBytes += payload.count
+                if self.frameCount == 1 || self.frameCount % 60 == 0 {
+                    lcDebug("📦 ClientSession: Received video frame #\(self.frameCount), size: \(payload.count) bytes")
+                }
+                self.decoder.decode(payload)
 
-            // Update connected state on first frame
-            if !isConnected {
-                DispatchQueue.main.async { [weak self] in
-                    self?.isConnected = true
-                    self?.connectionPhase = .streaming
-                    self?.connectionStatus = "Streaming"
-                    self?.logger.info("LocalCast: First video frame received - connected!")
+                // Update connected state on first frame
+                if !self.isConnected {
+                    DispatchQueue.main.async { [weak self] in
+                        self?.isConnected = true
+                        self?.connectionPhase = .streaming
+                        self?.connectionStatus = "Streaming"
+                        self?.logger.info("LocalCast: First video frame received - connected!")
+                    }
                 }
             }
 
         case .tileUpdate:
-            // Region-aware: a changed screen region. Decode and patch the canvas.
-            if let tile = TileCodec.decode(packet.payload) {
-                tileUpdateCount += 1
-                receivedMediaBytes += packet.payload.count
-                renderer?.applyTile(x: tile.x, y: tile.y, width: tile.width, height: tile.height, bgra: tile.bgra)
-                if !isConnected {
-                    DispatchQueue.main.async { [weak self] in
-                        guard let self, !self.isConnected else { return }
-                        self.isConnected = true
-                        self.connectionPhase = .streaming
-                        self.connectionStatus = "Streaming"
+            // Region-aware: a changed screen region. Decode and patch the canvas
+            // on the decode queue so tiles stay ordered relative to full frames.
+            let payload = packet.payload
+            decodeQueue.async { [weak self] in
+                guard let self else { return }
+                if let tile = TileCodec.decode(payload) {
+                    self.tileUpdateCount += 1
+                    self.receivedMediaBytes += payload.count
+                    self.renderer?.applyTile(x: tile.x, y: tile.y, width: tile.width, height: tile.height, bgra: tile.bgra)
+                    if !self.isConnected {
+                        DispatchQueue.main.async { [weak self] in
+                            guard let self, !self.isConnected else { return }
+                            self.isConnected = true
+                            self.connectionPhase = .streaming
+                            self.connectionStatus = "Streaming"
+                        }
                     }
                 }
             }
@@ -870,7 +891,9 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         do {
             let response = try JSONDecoder().decode(StreamResponse.self, from: payload)
             if response.success {
-                decoder.invalidate()
+                decodeQueue.async { [weak self] in
+                    self?.decoder.invalidate()
+                }
                 requestKeyFrame()
             }
             DispatchQueue.main.async { [weak self] in
