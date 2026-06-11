@@ -27,6 +27,7 @@ extension ClientSessionDelegate {
         case authenticating = "Authenticating..."
         case waitingForVideo = "Connected — waiting for video..."
         case streaming = "Streaming"
+        case reconnecting = "Reconnecting..."
         case noRoute = "Cannot reach host — check that both Macs are on the same network"
         case firewallBlocked = "No response from host — check Firewall settings on the host Mac (System Settings → Network → Firewall)"
         case videoTimeout = "Connected but no video — host may not have Screen Recording permission"
@@ -74,7 +75,6 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
     private let device: DiscoveredDevice
     private var hostEndpoint: NWEndpoint?
     private var heartbeatTimer: Timer?
-    private var lastHeartbeatResponse: Date?
     private var lastHeartbeatSent: Date?
     private var lastRTTms: Double = 0
     private var frameCount: Int = 0
@@ -86,6 +86,48 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
     private var diagnosticTimer: Timer?
     private var heartbeatsSent: Int = 0
     private var heartbeatsReceived: Int = 0
+
+    /// Two-stage desync watchdog. Once video is live the diagnostic timer
+    /// self-invalidates, so a host that stops feeding a connected viewer would
+    /// otherwise freeze the picture silently. The watchdog rides the existing
+    /// 1s heartbeat tick (see sendHeartbeat) and only arms after the stream has
+    /// been live at least once (hasBeenConnected).
+    ///
+    /// Stage 1 (non-destructive): a short stall just surfaces "Reconnecting..."
+    /// and nudges a keyframe while keeping the session key, so an ordinary blip
+    /// recovers with no outage. Stage 2 (destructive): only a longer stall on a
+    /// keyed session clears the key and re-drives the auth handshake, for the
+    /// true host-restart case.
+    private var hasBeenConnected = false
+    private var reauthInProgress = false
+    private var lastReauthAttempt: Date = .distantPast
+    private var reauthCycles = 0
+    private var recoveryAbandoned = false
+
+    /// Liveness clock for the watchdog. Written on the UDP receive and decode
+    /// queues, read by the watchdog on the heartbeat timer thread, so both are
+    /// guarded by mediaClockLock: the destructive stage-2 decision depends on
+    /// these timestamps and must never see a torn or stale read.
+    private let mediaClockLock = NSLock()
+    private var lastHeartbeatResponse: Date?
+    private var lastMediaReceivedAt: Date?
+
+    /// No pong AND no media (video/tiles) for this long surfaces the
+    /// non-destructive stage 1. Heartbeats tick every 1s, so this is a small
+    /// margin over a single dropped datagram.
+    private static let stage1StallThreshold: TimeInterval = 3.0
+
+    /// Continued silence past this escalates to the destructive stage-2 re-auth
+    /// (keyed sessions only).
+    private static let stage2StallThreshold: TimeInterval = 6.0
+
+    /// Floor between authRequest re-drives so a persistent stall cannot storm
+    /// the host.
+    private static let reauthMinInterval: TimeInterval = 3.0
+
+    /// Give up (surface .disconnected) after this many re-auth cycles rather
+    /// than looping "Reconnecting..." forever against a dead host.
+    private static let maxReauthCycles = 10
 
     // App list surface for the viewer's app picker. The auth-handshake race
     // that previously produced misleading "firewall blocked / auth required"
@@ -341,9 +383,19 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         logger.info("🔐 ✅ Authenticated — encryption enabled")
 
         DispatchQueue.main.async { [weak self] in
-            self?.isAuthenticating = false
-            self?.authError = nil
-            self?.connectionStatus = "Authenticated"
+            guard let self else { return }
+            self.isAuthenticating = false
+            self.authError = nil
+            // authSuccess is the ONLY thing that ends a stage-2 re-auth. Clear
+            // the recovery state and leave the reconnecting surface; the next
+            // media frame restores "Streaming".
+            self.clearRecoveryState()
+            if self.connectionPhase == .reconnecting {
+                self.connectionPhase = .waitingForVideo
+                self.connectionStatus = ConnectionPhase.waitingForVideo.rawValue
+            } else {
+                self.connectionStatus = "Authenticated"
+            }
         }
 
         // Start the normal post-auth flow
@@ -367,6 +419,8 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         heartbeatTimer = nil
         diagnosticTimer?.invalidate()
         diagnosticTimer = nil
+        // Tearing down: no recovery cycle should be left pending.
+        clearRecoveryState()
 
         // Tell the host we are leaving so it can re-arm auth immediately
         // instead of waiting out the idle timeout. Encrypted under the
@@ -680,6 +734,121 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         sendHeartbeat()
     }
 
+    private func recordHeartbeatResponse(_ date: Date) {
+        mediaClockLock.lock()
+        lastHeartbeatResponse = date
+        mediaClockLock.unlock()
+    }
+
+    private func recordMediaReceived(_ date: Date) {
+        mediaClockLock.lock()
+        lastMediaReceivedAt = date
+        mediaClockLock.unlock()
+    }
+
+    /// Snapshot both liveness timestamps under the lock so the watchdog decides
+    /// on a consistent pair.
+    private func mediaClockSnapshot() -> (pong: Date?, media: Date?) {
+        mediaClockLock.lock()
+        defer { mediaClockLock.unlock() }
+        return (lastHeartbeatResponse, lastMediaReceivedAt)
+    }
+
+    /// Driven by the 1s heartbeat tick (runs on the main runloop, matching the
+    /// file's existing timer concurrency style). Arms only after the stream has
+    /// gone live at least once; the diagnostic timer owns the pre-connect window.
+    private func checkHeartbeatWatchdog() {
+        guard hasBeenConnected, !recoveryAbandoned else { return }
+
+        let now = Date()
+
+        // A destructive re-auth, once started, is driven to completion: keep
+        // re-sending authRequest until authSuccess actually lands. A resumed
+        // plaintext pong from a restarted host still in .waitingForAuth must NOT
+        // stop this, because that host sends no video until the handshake
+        // finishes. Only handleAuthSuccess clears reauthInProgress.
+        if reauthInProgress {
+            driveReauth(now: now)
+            return
+        }
+
+        let (lastPong, lastMedia) = mediaClockSnapshot()
+        let pongAge = lastPong.map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude
+        let mediaAge = lastMedia.map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude
+
+        // Stage 1 keys off media staleness: a stalled picture is the symptom to
+        // recover, whether the host went quiet entirely or is still answering
+        // heartbeats while its encoder/capture stalled. Pong-only loss while
+        // video is still painting keeps mediaAge low, so it never fires here.
+        guard mediaAge >= Self.stage1StallThreshold else { return }
+
+        // Stage 1: non-destructive. Surface the reconnecting state and ask for a
+        // fresh keyframe, but keep the key so a transient blip heals with no
+        // outage.
+        enterReconnectingState()
+        requestKeyFrame()
+
+        // Stage 2: escalate to destructive re-auth only after sustained total
+        // silence (both pongs and media), and only for keyed sessions. Requiring
+        // pong silence too means a live, still-keyed host is never hit with a
+        // plaintext re-auth it would reject. No-auth sessions stay in stage 1.
+        let usingAuth = !(password?.isEmpty ?? true)
+        guard usingAuth, min(pongAge, mediaAge) >= Self.stage2StallThreshold else { return }
+        reauthInProgress = true
+        driveReauth(now: now)
+    }
+
+    /// Surface "Reconnecting..." and drop isConnected so the normal connect
+    /// handlers re-engage. Writes are guarded so we only publish on transition.
+    private func enterReconnectingState() {
+        if connectionPhase != .reconnecting {
+            connectionPhase = .reconnecting
+            connectionStatus = ConnectionPhase.reconnecting.rawValue
+            logger.warning("⚠️ Stream stalled, entering reconnecting state")
+        }
+        if isConnected {
+            isConnected = false
+        }
+    }
+
+    /// Re-send authRequest at most once per reauthMinInterval. Clears the stale
+    /// key first so the restarted host's plaintext authChallenge is accepted,
+    /// then reuses the existing handshake (no crypto duplicated). Bounded by
+    /// maxReauthCycles so a dead host eventually surfaces as disconnected.
+    private func driveReauth(now: Date) {
+        guard now.timeIntervalSince(lastReauthAttempt) >= Self.reauthMinInterval else { return }
+        lastReauthAttempt = now
+        reauthCycles += 1
+
+        if reauthCycles > Self.maxReauthCycles {
+            recoveryAbandoned = true
+            reauthInProgress = false
+            isConnected = false
+            connectionPhase = .disconnected
+            connectionStatus = ConnectionPhase.disconnected.rawValue
+            logger.error("🔐 Recovery failed after \(Self.maxReauthCycles) re-auth cycles, giving up")
+            heartbeatTimer?.invalidate()
+            heartbeatTimer = nil
+            diagnosticTimer?.invalidate()
+            diagnosticTimer = nil
+            delegate?.clientSession(self, didDisconnectWithReason: "Lost connection to host")
+            return
+        }
+
+        transport.sessionKey = nil
+        isAuthenticating = true
+        sendAuthRequest()
+        logger.info("🔐 Re-driving auth handshake after stall (cycle \(self.reauthCycles))")
+    }
+
+    /// Clear all recovery state once the stream is healthy again. Main only.
+    private func clearRecoveryState() {
+        reauthInProgress = false
+        reauthCycles = 0
+        recoveryAbandoned = false
+        lastReauthAttempt = .distantPast
+    }
+
     private func sendHeartbeat() {
         guard let endpoint = hostEndpoint else { return }
         heartbeatsSent += 1
@@ -692,6 +861,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         )
         transport.send(packet: heartbeat, to: endpoint)
         publishStatsIfDue()
+        checkHeartbeatWatchdog()
     }
 
     /// Aggregate the last window's counters into the published stats. Driven by
@@ -774,19 +944,24 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             decodeQueue.async { [weak self] in
                 guard let self else { return }
                 self.frameCount += 1
+                self.recordMediaReceived(Date())
                 self.receivedMediaBytes += payload.count
                 if self.frameCount == 1 || self.frameCount % 60 == 0 {
                     lcDebug("📦 ClientSession: Received video frame #\(self.frameCount), size: \(payload.count) bytes")
                 }
                 self.decoder.decode(payload)
 
-                // Update connected state on first frame
+                // Update connected state on first frame (also when media resumes
+                // after a stall, since the watchdog cleared isConnected).
                 if !self.isConnected {
                     DispatchQueue.main.async { [weak self] in
-                        self?.isConnected = true
-                        self?.connectionPhase = .streaming
-                        self?.connectionStatus = "Streaming"
-                        self?.logger.info("LocalCast: First video frame received - connected!")
+                        guard let self else { return }
+                        self.isConnected = true
+                        self.hasBeenConnected = true
+                        self.clearRecoveryState()
+                        self.connectionPhase = .streaming
+                        self.connectionStatus = "Streaming"
+                        self.logger.info("LocalCast: First video frame received - connected!")
                     }
                 }
             }
@@ -799,12 +974,15 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
                 guard let self else { return }
                 if let tile = TileCodec.decode(payload) {
                     self.tileUpdateCount += 1
+                    self.recordMediaReceived(Date())
                     self.receivedMediaBytes += payload.count
                     self.renderer?.applyTile(x: tile.x, y: tile.y, width: tile.width, height: tile.height, bgra: tile.bgra)
                     if !self.isConnected {
                         DispatchQueue.main.async { [weak self] in
                             guard let self, !self.isConnected else { return }
                             self.isConnected = true
+                            self.hasBeenConnected = true
+                            self.clearRecoveryState()
                             self.connectionPhase = .streaming
                             self.connectionStatus = "Streaming"
                         }
@@ -814,7 +992,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
 
         case .heartbeat:
             // Pong received - record round-trip latency for the HUD.
-            lastHeartbeatResponse = Date()
+            recordHeartbeatResponse(Date())
             if let sent = lastHeartbeatSent {
                 lastRTTms = Date().timeIntervalSince(sent) * 1000
             }
@@ -822,10 +1000,17 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             if !isConnected {
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
-                    if self.connectionPhase == .connecting || self.connectionPhase == .firewallBlocked {
+                    // While a stage-2 re-auth is underway, keep showing
+                    // "Reconnecting...": a bare plaintext pong from a restarted
+                    // host that is still in .waitingForAuth is not progress and
+                    // must not be mistaken for it.
+                    guard !self.reauthInProgress else { return }
+                    if self.connectionPhase == .connecting
+                        || self.connectionPhase == .firewallBlocked
+                        || self.connectionPhase == .reconnecting {
                         self.connectionPhase = .waitingForVideo
                         self.connectionStatus = ConnectionPhase.waitingForVideo.rawValue
-                        self.logger.info("✅ Heartbeat response received — UDP path is open, waiting for video")
+                        self.logger.info("✅ Heartbeat response received, UDP path is open, waiting for video")
                     }
                 }
             }

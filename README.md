@@ -4,7 +4,7 @@ A menu-bar Mac utility for discovering, connecting to, and streaming between Mac
 
 TidalDrift replaces the manual workflow of opening System Settings, toggling sharing services, remembering IP addresses, and launching Screen Sharing.app. It lives in your menu bar, discovers every Mac on your LAN via Bonjour, and provides one-click access to screen sharing (VNC), file sharing (SMB), SSH, and its own low-latency streaming engine, LocalCast.
 
-> **Development status:** LocalCast (app-window streaming) is **not yet fully implemented**. Full-desktop VNC streaming, network discovery, file transfer, clipboard sync, and all other features are functional. The custom LocalCast pipeline (ScreenCaptureKit capture, VideoToolbox encoding, Metal rendering, UDP transport) is architecturally complete and documented below, but app-window streaming has known limitations and is under active development. See [TidalDrift/LocalCast/README.md](TidalDrift/LocalCast/README.md) for details.
+> **Development status:** The custom LocalCast pipeline (ScreenCaptureKit capture, VideoToolbox HEVC/H.264 encoding, NV12 end to end, Metal rendering, UDP transport with FEC and adaptive bitrate) is functional: capture, encode, transport, decode, and render run end to end, and a two-stage viewer watchdog recovers from a host settings restart instead of freezing. Remaining limitations are honest ones: the client-driven in-viewer app picker is currently dormant (host-initiated sharing via the menu-bar picker is the active path), the password key derivation is not yet a brute-force-resistant hash, and on a lossy uplink UDP's lack of retransmit can still break frames. Full-desktop VNC streaming, network discovery, file transfer, clipboard sync, and all other features are functional. See [TidalDrift/LocalCast/README.md](TidalDrift/LocalCast/README.md) for details.
 
 ## Features
 
@@ -14,11 +14,12 @@ TidalDrift replaces the manual workflow of opening System Settings, toggling sha
 - One-click LocalCast, VNC, SMB, and SSH connections from any device row
 - Drag files onto the Dock icon to send to multiple devices at once
 
-**LocalCast: Low-Latency Screen Streaming** *(not yet fully implemented)*
-- Custom streaming engine: ScreenCaptureKit capture, VideoToolbox H.264/HEVC encoding, Metal rendering, raw UDP transport
+**LocalCast: Low-Latency Screen Streaming**
+- Custom streaming engine: ScreenCaptureKit capture, VideoToolbox HEVC/H.264 encoding, NV12 end to end, Metal rendering, raw UDP transport
 - Sub-frame latency on gigabit LAN
-- Stream full display or a single app window
-- End-to-end AES-256-GCM encryption with HKDF-SHA256 key derivation
+- Stream full display or a single app/window
+- Auto/Resilient/Fast LAN transport profiles, adaptive bitrate, forward error correction, and an adaptive jitter buffer
+- AES-256-GCM session encryption with per-packet authentication once keyed (pairing key via HKDF-SHA256; password never sent over the wire)
 - Retina-quality with adaptive resolution (720p to 4K)
 - Remote mouse and keyboard input with configurable rate limiting
 - Live quality tuning slider synced between client and host

@@ -218,6 +218,15 @@ class LocalCastService: ObservableObject {
         }
         
         let session = HostSession(configuration: configuration, password: hostPassword)
+        // When the client picks a window/app, keep our restart target in sync so
+        // a later resolution/codec restart keeps streaming the same target.
+        session.onClientRetarget = { [weak self] newTarget, name in
+            Task { @MainActor in
+                guard let self else { return }
+                self.currentHostTarget = newTarget
+                self.shareTargetName = name
+            }
+        }
         try await session.start(target: target)
 
         advertiseLocalCast(port: LocalCastConfiguration.hostPort, authEnabled: hostPassword != nil)

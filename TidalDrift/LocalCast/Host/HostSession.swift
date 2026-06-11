@@ -8,7 +8,7 @@ import ScreenCaptureKit
 /// Capture target for hosting.
 /// In the TidalCast architecture, full-desktop sharing uses VNC (Tier 1);
 /// this enum drives Tier 2 (app/window streaming via ScreenCaptureKit).
-enum HostCaptureTarget {
+enum HostCaptureTarget: Sendable {
     case fullDisplay
     case window(CGWindowID, title: String)
     case app(pid_t, name: String)
@@ -53,6 +53,13 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
 
     /// Current capture target
     private(set) var captureTarget: HostCaptureTarget = .fullDisplay
+
+    /// Invoked when the client picks a new window/app to stream so the owning
+    /// service can keep its restart target in sync. Without this, a later
+    /// settings restart (resolution/codec) reverts to the host-side default
+    /// instead of the client-chosen target. This class is not main-actor
+    /// isolated, so the service hops to the main actor inside the closure.
+    var onClientRetarget: ((HostCaptureTarget, String) -> Void)?
 
     /// PID of the application being streamed (for window resize via Accessibility)
     private var targetPID: pid_t?
@@ -1335,6 +1342,11 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
                 lcDebug("🎬 HostSession: Existing capture stopped")
             }
 
+            // Match the capture pixel format (NV12 vs BGRA) to the current
+            // region-aware setting in case it was toggled around a stream
+            // switch; init and beginCaptureForClient set this, this path did not.
+            captureManager.regionAwareCapture = configuration.regionAware
+
             // Start the requested capture
             lcDebug("🎬 HostSession: Starting new capture...")
             switch request.type {
@@ -1366,6 +1378,19 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
 
             updateInputBounds()
             withCaptureState { captureActive = true }
+
+            // Keep the owning service's restart target in sync so a later
+            // settings restart keeps streaming this client-chosen window/app.
+            let retargetName: String
+            switch captureTarget {
+            case .fullDisplay:
+                retargetName = "Entire Desktop"
+            case .window(_, let title):
+                retargetName = title
+            case .app(_, let name):
+                retargetName = name
+            }
+            onClientRetarget?(captureTarget, retargetName)
 
             // Force a keyframe so the client decoder can sync to the new stream.
             // The encoder was already primed with forceKeyFrame() before capture started,
@@ -1402,6 +1427,9 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
                 captureTarget = .fullDisplay
                 updateInputBounds()
                 isRunning = true
+                // The start path cleared captureActive; restore it here so
+                // suspendCaptureForIdleClient is not left a permanent no-op.
+                withCaptureState { captureActive = true }
                 encoder.forceKeyFrame()
                 lcDebug("🔄 HostSession: ✅ Recovered to full display")
             } catch {
