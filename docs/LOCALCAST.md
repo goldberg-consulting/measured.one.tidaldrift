@@ -12,8 +12,8 @@ fixes landed in 1.6.x, and where latency actually comes from.
 | Capture (host) | ScreenCaptureKit | IOSurface-backed frames from the window server; no CPU readback |
 | Encode (host) | VideoToolbox `VTCompressionSession` (H.264/HEVC) | Apple-silicon **hardware** encoder; `RealTime = true`, `MaxFrameDelayCount = 0` |
 | Transport | UDP (`NWListener`/`NWConnection`), app-level fragmentation | ~1400-byte fragments; AES-256-GCM when auth is on |
-| Decode (client) | VideoToolbox `VTDecompressionSession` | **hardware** decoder; output is Metal-compatible |
-| Render (client) | `CVMetalTextureCache` + `MTKView` | **zero-copy** `CVPixelBuffer` → `MTLTexture`; draw-on-demand |
+| Decode (client) | VideoToolbox `VTDecompressionSession` | **hardware** decoder; output is NV12 (full range), Metal-compatible |
+| Render (client) | `CVMetalTextureCache` + `MTKView` | **zero-copy** `CVPixelBuffer` → `MTLTexture`; NV12 two-plane YUV (full-range BT.709) or BGRA pipeline per frame; display-linked with an adaptive jitter buffer (not draw-on-demand) |
 
 The whole chain is hardware-accelerated, which is why TidalDrift sits near
 **0% CPU** while streaming. The GPU/codec is not the bottleneck.
