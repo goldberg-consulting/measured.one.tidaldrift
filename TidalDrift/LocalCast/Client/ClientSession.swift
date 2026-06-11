@@ -88,14 +88,17 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
     private var heartbeatsReceived: Int = 0
 
     /// Two-stage desync watchdog. Once video is live the diagnostic timer
-    /// self-invalidates, so a host that stops feeding a connected viewer would
-    /// otherwise freeze the picture silently. The watchdog rides the existing
-    /// 1s heartbeat tick (see sendHeartbeat) and only arms after the stream has
-    /// been live at least once (hasBeenConnected).
+    /// self-invalidates, so a host that goes away (crash, restart, network
+    /// loss) would otherwise leave the viewer frozen with no recovery. The
+    /// watchdog rides the existing 1s heartbeat tick (see sendHeartbeat) and
+    /// only arms after the stream has been live at least once (hasBeenConnected).
     ///
-    /// Stage 1 (non-destructive): a short stall just surfaces "Reconnecting..."
-    /// and nudges a keyframe while keeping the session key, so an ordinary blip
-    /// recovers with no outage. Stage 2 (destructive): only a longer stall on a
+    /// It fires only on TOTAL silence: both heartbeat pongs and media must be
+    /// stale. A static or low-motion screen sends no new frames for long
+    /// stretches but keeps answering heartbeats, so it is never treated as a
+    /// stall. Stage 1 (non-destructive): surfaces "Reconnecting..." and nudges
+    /// a keyframe while keeping the session key, so an ordinary blip recovers
+    /// with no outage. Stage 2 (destructive): only a longer total silence on a
     /// keyed session clears the key and re-drives the auth handshake, for the
     /// true host-restart case.
     private var hasBeenConnected = false
@@ -776,11 +779,13 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         let pongAge = lastPong.map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude
         let mediaAge = lastMedia.map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude
 
-        // Stage 1 keys off media staleness: a stalled picture is the symptom to
-        // recover, whether the host went quiet entirely or is still answering
-        // heartbeats while its encoder/capture stalled. Pong-only loss while
-        // video is still painting keeps mediaAge low, so it never fires here.
-        guard mediaAge >= Self.stage1StallThreshold else { return }
+        // Fire only on total silence: both pongs and media stale. A static or
+        // low-motion screen produces no new frames for long stretches, but pongs
+        // keep arriving every second, so it is never mistaken for a stall.
+        // Pong-only loss while video still paints (and the reverse) also stays
+        // quiet, since the fresher of the two keeps silence low.
+        let silence = min(pongAge, mediaAge)
+        guard silence >= Self.stage1StallThreshold else { return }
 
         // Stage 1: non-destructive. Surface the reconnecting state and ask for a
         // fresh keyframe, but keep the key so a transient blip heals with no
@@ -788,12 +793,12 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         enterReconnectingState()
         requestKeyFrame()
 
-        // Stage 2: escalate to destructive re-auth only after sustained total
-        // silence (both pongs and media), and only for keyed sessions. Requiring
-        // pong silence too means a live, still-keyed host is never hit with a
-        // plaintext re-auth it would reject. No-auth sessions stay in stage 1.
+        // Stage 2: escalate to destructive re-auth only after longer total
+        // silence, and only for keyed sessions. Requiring pong silence too means
+        // a live, still-keyed host is never hit with a plaintext re-auth it would
+        // reject. No-auth sessions stay in stage 1.
         let usingAuth = !(password?.isEmpty ?? true)
-        guard usingAuth, min(pongAge, mediaAge) >= Self.stage2StallThreshold else { return }
+        guard usingAuth, silence >= Self.stage2StallThreshold else { return }
         reauthInProgress = true
         driveReauth(now: now)
     }
