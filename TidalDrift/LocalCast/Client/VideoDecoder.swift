@@ -170,6 +170,18 @@ class VideoDecoder {
                 return
             }
             logger.info("🎬 ✅ Received H.264 SPS (\(nalUnit.count) bytes)")
+            // A different SPS means the host changed resolution/params mid-session
+            // (e.g. the capacity ladder reduced capture size) with no client-driven
+            // stream switch. tryCreateSession early-returns while formatDescription
+            // is non-nil, so without tearing down here the new, smaller keyframe is
+            // decoded against the stale (e.g. 4K) session and fails silently. Rebuild
+            // from the new parameter sets. invalidate() clears formatDescription, the
+            // session, and stored SPS/PPS so tryCreateSession rebuilds once the new
+            // PPS arrives in this same keyframe.
+            if let existing = sps, existing != nalUnit {
+                logger.info("🎬 H.264 SPS changed -- rebuilding decode session")
+                invalidate()
+            }
             sps = nalUnit
             isHEVC = false
             tryCreateSession()
@@ -233,6 +245,18 @@ class VideoDecoder {
 
         case 33:  // SPS
             lcDebug("🎬 VideoDecoder: ✅ Received HEVC SPS (\(nalUnit.count) bytes)")
+            // A different SPS means the host changed resolution/params mid-session
+            // (e.g. the capacity ladder reduced capture size). Rebuild the decode
+            // session from the new parameter sets, otherwise the new keyframe is
+            // decoded against the stale session and fails silently. The matching
+            // VPS for this keyframe arrived just before this SPS; preserve it across
+            // invalidate() (which clears VPS) so the rebuild keeps the correct VPS.
+            if let existing = sps, existing != nalUnit {
+                lcDebug("🎬 VideoDecoder: HEVC SPS changed -- rebuilding decode session")
+                let freshVPS = vps
+                invalidate()
+                vps = freshVPS
+            }
             sps = nalUnit
             isHEVC = true
             tryCreateSession()
