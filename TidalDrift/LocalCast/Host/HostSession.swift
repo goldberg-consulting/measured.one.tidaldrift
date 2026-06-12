@@ -237,6 +237,42 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     private static let adaptiveDecreaseCooldown: TimeInterval = 0.5
     private static let adaptiveRecoveryQuiet: TimeInterval = 2.5
 
+    // Ceiling for adaptive recovery. Once a transport-capacity reduction has cut
+    // the bitrate, recovery must not climb back above the cut level, or a
+    // restored full bitrate would re-inflate keyframes past the fragment cap and
+    // oscillate. Only ever lowered (during a capacity cut) and reset on a fresh
+    // session/client. Read and written on adaptiveQueue.
+    private var adaptiveCapacityCeiling: Double = 1.0
+
+    // MARK: - Transport capacity reduction (deterministic, runs even when adaptiveQuality is off)
+    //
+    // When the transport reports a droppable frame that exceeds the receiver's
+    // fragment cap, the host steps encode load down until keyframes fit: first
+    // the bitrate (a couple of multiplicative cuts via the adaptive machinery),
+    // then the capture resolution (3840 -> 2560 -> 1920 -> 1280). This is a
+    // correctness path: without it a 4K ultra keyframe over a non-jumbo link is
+    // dropped at reassembly and the client shows "no video". It therefore
+    // engages regardless of configuration.adaptiveQuality. It only steps down
+    // and never auto-restores resolution, so it cannot flap. `capacityBitrateCuts`
+    // is mutated on adaptiveQueue; `_capacityDimensionCap` and
+    // `_capacityRestartInFlight` are guarded by capacityLock because they are
+    // also touched off adaptiveQueue (the capture-setup path and the restart Task
+    // respectively).
+    private var capacityBitrateCuts = 0          // adaptiveQueue
+    private var _capacityRestartInFlight = false // guarded by capacityLock
+    private var _capacityDimensionCap = 0        // 0 = no host-imposed cap; guarded by capacityLock
+    private let capacityLock = NSLock()
+    private var capacityDimensionCap: Int {
+        get { capacityLock.lock(); defer { capacityLock.unlock() }; return _capacityDimensionCap }
+        set { capacityLock.lock(); _capacityDimensionCap = newValue; capacityLock.unlock() }
+    }
+    private var capacityRestartInFlight: Bool {
+        get { capacityLock.lock(); defer { capacityLock.unlock() }; return _capacityRestartInFlight }
+        set { capacityLock.lock(); _capacityRestartInFlight = newValue; capacityLock.unlock() }
+    }
+    private static let capacityMaxBitrateCuts = 2
+    private static let capacityDimensionLadder = [2560, 1920, 1280]
+
     private func noteClientTelemetry(_ telemetry: LocalCastClientTelemetry) {
         updateAutoTransportProfile(telemetry)
         transport.notePacingTelemetry(droppedPerSec: telemetry.droppedPerSec)
@@ -470,8 +506,10 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         let nativeWidth = mode?.pixelWidth ?? CGDisplayPixelsWide(displayID)
         let nativeHeight = mode?.pixelHeight ?? CGDisplayPixelsHigh(displayID)
 
-        // Cap resolution based on quality preset (ultra=3840, high=2560, etc.)
-        let maxDimension = configuration.maxCaptureDimension
+        // Cap resolution based on quality preset (ultra=3840, high=2560, etc.),
+        // further reduced by any transport-capacity cap so keyframes stay
+        // deliverable over a non-jumbo link.
+        let maxDimension = effectiveMaxCaptureDimension
         let scale: Double
         if nativeWidth > maxDimension || nativeHeight > maxDimension {
             scale = Double(maxDimension) / Double(max(nativeWidth, nativeHeight))
@@ -529,7 +567,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         try await captureManager.startWindowCapture(
             windowID: windowID,
             frameRate: configuration.targetFrameRate,
-            maxDimension: configuration.maxCaptureDimension
+            maxDimension: effectiveMaxCaptureDimension
         )
     }
 
@@ -552,7 +590,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         try await captureManager.startAppCapture(
             processID: processID,
             frameRate: configuration.targetFrameRate,
-            maxDimension: configuration.maxCaptureDimension
+            maxDimension: effectiveMaxCaptureDimension
         )
     }
 
@@ -835,6 +873,12 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
 
     // MARK: - UDPTransportDelegate
 
+    /// The transport dropped a video frame that exceeded the receiver's fragment
+    /// cap. Step encode load down so keyframes become deliverable.
+    func udpTransportFrameExceededCapacity(_ transport: UDPTransport, fragments: Int, limit: Int) {
+        handleTransportOverCapacity(fragments: fragments, limit: limit)
+    }
+
     /// Make `endpoint` the single active viewer (newest-wins takeover). An older
     /// viewer stops receiving video once a new one connects or authenticates, so
     /// a fresh connection always works even if a previous session is still
@@ -908,11 +952,12 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         timer.schedule(deadline: .now() + Self.adaptiveRecoveryQuiet)
         timer.setEventHandler { [weak self] in
             guard let self else { return }
-            guard self.adaptiveScale < 1.0 else { return }
-            self.adaptiveScale = min(1.0, self.adaptiveScale + Self.adaptiveIncreaseStep)
+            let ceiling = self.adaptiveCapacityCeiling
+            guard self.adaptiveScale < ceiling else { return }
+            self.adaptiveScale = min(ceiling, self.adaptiveScale + Self.adaptiveIncreaseStep)
             self.applyAdaptiveBitrate()
             self.logger.info("📈 Adaptive bitrate up: scale=\(String(format: "%.2f", self.adaptiveScale))")
-            if self.adaptiveScale < 1.0 { self.scheduleAdaptiveRecovery() }
+            if self.adaptiveScale < ceiling { self.scheduleAdaptiveRecovery() }
         }
         timer.resume()
         adaptiveRecoveryTimer = timer
@@ -925,6 +970,87 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             self.adaptiveRecoveryTimer = nil
             self.adaptiveScale = 1.0
             self.lastAdaptiveDecrease = .distantPast
+            // Re-arm the full capacity ladder. This runs only on a genuinely new
+            // client (the isNewClient path) or on stop, never mid-session for the
+            // same client, so clearing the resolution cap here lets a fresh client
+            // on a capable/jumbo link re-probe at full resolution without
+            // penalizing it for a prior client's weak link. The ladder re-engages
+            // only if this client's link still cannot carry it. It stays
+            // non-flapping within a single client session because nothing resets
+            // these mid-stream. This is capture-only state; no keys are touched.
+            self.capacityBitrateCuts = 0
+            self.adaptiveCapacityCeiling = 1.0
+            self.capacityDimensionCap = 0
+        }
+    }
+
+    // MARK: - Transport capacity reduction
+
+    /// Handle the transport's "frame exceeded fragment cap" signal. Steps encode
+    /// load down (bitrate first, then resolution) on adaptiveQueue so it
+    /// serializes with the adaptive controller. Engages regardless of
+    /// configuration.adaptiveQuality: an undeliverable keyframe is a correctness
+    /// failure, not a quality preference.
+    private func handleTransportOverCapacity(fragments: Int, limit: Int) {
+        adaptiveQueue.async { [weak self] in
+            guard let self, self.isRunning else { return }
+
+            // Step 1: a couple of multiplicative bitrate cuts first (cheap, no
+            // capture restart). Reuse the adaptive scale + applyAdaptiveBitrate
+            // so the existing rate-control path drives the encoder, and lower the
+            // recovery ceiling so a later clean-link recovery cannot undo the cut
+            // and oscillate. Force a fresh keyframe so recovery does not wait for
+            // the next scheduled IDR.
+            if self.capacityBitrateCuts < Self.capacityMaxBitrateCuts {
+                self.capacityBitrateCuts += 1
+                self.adaptiveScale = max(Self.adaptiveMinScale, self.adaptiveScale * Self.adaptiveDecreaseFactor)
+                self.adaptiveCapacityCeiling = self.adaptiveScale
+                self.applyAdaptiveBitrate()
+                self.encoder.forceKeyFrame()
+                self.logger.warning("📉 Transport over capacity (\(fragments) frags > \(limit)): cut bitrate, scale=\(String(format: "%.2f", self.adaptiveScale)) [cut \(self.capacityBitrateCuts)/\(Self.capacityMaxBitrateCuts)]")
+                return
+            }
+
+            // Step 2: bitrate cuts exhausted and keyframes still don't fit.
+            // Reduce the capture/encode resolution, which deterministically
+            // shrinks the keyframe. Step the ladder once; never restore.
+            self.reduceCaptureResolutionForCapacity()
+        }
+    }
+
+    /// Capture longest-edge cap currently in effect: the configured preset value
+    /// further reduced by any transport-capacity cap imposed when keyframes were
+    /// too large to deliver. Read on the capture-setup path.
+    private var effectiveMaxCaptureDimension: Int {
+        let configured = configuration.maxCaptureDimension
+        let cap = capacityDimensionCap
+        return cap > 0 ? min(configured, cap) : configured
+    }
+
+    /// Step the capture resolution down one rung of the capacity ladder and
+    /// restart capture with the same target. Must be called on adaptiveQueue.
+    private func reduceCaptureResolutionForCapacity() {
+        if capacityRestartInFlight { return }
+
+        let current = effectiveMaxCaptureDimension
+        guard let next = Self.capacityDimensionLadder.first(where: { $0 < current }) else {
+            logger.warning("⚠️ Transport over capacity but capture is already at the minimum ladder dimension (\(current)); leaving as-is")
+            return
+        }
+
+        capacityDimensionCap = next
+        capacityRestartInFlight = true
+        // A fresh, smaller resolution gets a fresh bitrate budget: re-allow
+        // bitrate cuts so, if it still does not fit, step 1 runs again before
+        // dropping resolution further. The ceiling stays where the prior cuts
+        // left it, so the link does not bounce back to full bitrate.
+        capacityBitrateCuts = 0
+        logger.warning("📐 Transport over capacity: reducing capture dimension \(current) -> \(next) to shrink keyframes")
+
+        Task { [weak self] in
+            guard let self else { return }
+            await self.retarget(to: self.captureTarget)
+            self.capacityRestartInFlight = false
         }
     }
 

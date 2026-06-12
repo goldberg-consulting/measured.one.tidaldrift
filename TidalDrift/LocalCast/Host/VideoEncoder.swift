@@ -47,7 +47,15 @@ class VideoEncoder {
     /// Guarded by sessionLock (read in setup, updateLiveParameters, and
     /// dataRateLimits, all of which hold it).
     private var keyframeCeilingBytes: Int?
-    
+
+    /// A (width, height) that failed VTCompressionSessionCreate even after the
+    /// dimension fallback, so the encoder is running at a reduced size while
+    /// capture still delivers the larger frames. `encode()` checks this before
+    /// auto-reconfiguring so it does not tear down and rebuild the working
+    /// reduced-size session (with a forced keyframe) on every captured frame.
+    /// Guarded by sessionLock.
+    private var failedSetupDimension: (width: Int, height: Int)?
+
     deinit {
         // SAFETY: The VTCompressionSession callback holds an unretained pointer to
         // self (passUnretained). We MUST invalidate the session before deallocation
@@ -57,7 +65,7 @@ class VideoEncoder {
         }
     }
     
-    func setup(width: Int, height: Int, codec: LocalCastConfiguration.Codec, bitrateMbps: Int, fps: Int, quality: Float = 0.8) {
+    func setup(width: Int, height: Int, codec: LocalCastConfiguration.Codec, bitrateMbps: Int, fps: Int, quality: Float = 0.8, allowDimensionFallback: Bool = true) {
         sessionLock.lock()
         defer { sessionLock.unlock() }
 
@@ -105,13 +113,30 @@ class VideoEncoder {
             logger.error("Failed to create \(codec == .hevc ? "HEVC" : "H.264") compression session: \(status)")
             if codec == .hevc {
                 logger.warning("Falling back to H.264 encoder")
-                setup(width: width, height: height, codec: .h264, bitrateMbps: bitrateMbps, fps: fps, quality: quality)
+                setup(width: width, height: height, codec: .h264, bitrateMbps: bitrateMbps, fps: fps, quality: quality, allowDimensionFallback: allowDimensionFallback)
+            } else if allowDimensionFallback, width > 320, height > 240 {
+                // The H.264 attempt also failed at this dimension (e.g. the
+                // encoder cannot create a session at 4K). Retry once at half the
+                // dimension so the host still ends up with a working encoder.
+                let reducedWidth = max(2, width / 2) & ~1
+                let reducedHeight = max(2, height / 2) & ~1
+                logger.warning("H.264 session creation failed at \(width)x\(height); retrying once at reduced \(reducedWidth)x\(reducedHeight)")
+                setup(width: reducedWidth, height: reducedHeight, codec: .h264, bitrateMbps: bitrateMbps, fps: fps, quality: quality, allowDimensionFallback: false)
+                // Recorded after the reduced retry so its success path (below)
+                // does not immediately clear it: encode() reads this to avoid
+                // re-attempting the failing size on every captured frame.
+                failedSetupDimension = (width, height)
             }
             return
         }
 
         self.session = session
         currentCodec = codec
+        // A session was created at this size, so it is no longer a known-failing
+        // dimension; allow encode() to reconfigure to it again in the future.
+        if let failed = failedSetupDimension, failed.width == width, failed.height == height {
+            failedSetupDimension = nil
+        }
         
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: fps as CFNumber)
@@ -157,9 +182,17 @@ class VideoEncoder {
         let frameWidth = CVPixelBufferGetWidth(imageBuffer)
         let frameHeight = CVPixelBufferGetHeight(imageBuffer)
         if frameWidth != currentWidth || frameHeight != currentHeight {
-            logger.info("Frame \(frameWidth)x\(frameHeight) != encoder \(self.currentWidth)x\(self.currentHeight) -- reconfiguring")
-            setup(width: frameWidth, height: frameHeight, codec: currentCodec, bitrateMbps: currentBitrateMbps, fps: currentFps, quality: currentQuality)
-            forceKeyFrame()
+            if let failed = failedSetupDimension, failed.width == frameWidth, failed.height == frameHeight {
+                // This exact size already failed session creation, so the encoder
+                // is running at a reduced fallback size. Re-attempting setup for it
+                // every frame would tear down the working session and force a
+                // keyframe on each captured frame. Skip the reconfigure; the capture
+                // layer must reduce to this size for frames to flow.
+            } else {
+                logger.info("Frame \(frameWidth)x\(frameHeight) != encoder \(self.currentWidth)x\(self.currentHeight) -- reconfiguring")
+                setup(width: frameWidth, height: frameHeight, codec: currentCodec, bitrateMbps: currentBitrateMbps, fps: currentFps, quality: currentQuality)
+                forceKeyFrame()
+            }
         }
         
         guard let session = session else { return }

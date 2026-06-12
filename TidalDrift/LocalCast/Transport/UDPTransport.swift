@@ -28,11 +28,18 @@ protocol UDPTransportDelegate: AnyObject {
     /// newer frame superseded them (i.e. at least one fragment was lost). The
     /// receiver can use this to request recovery (e.g. a keyframe).
     func udpTransportDidLoseFrames(_ transport: UDPTransport)
+    /// Called when a droppable (video) frame would exceed the receiver's
+    /// fragment cap at the current payload size, so the sender dropped it
+    /// instead of emitting a frame that would be rejected wholesale at
+    /// reassembly. The host should reduce encode load (bitrate, then
+    /// resolution) so keyframes fit. The transport rate-limits this signal.
+    func udpTransportFrameExceededCapacity(_ transport: UDPTransport, fragments: Int, limit: Int)
 }
 
 extension UDPTransportDelegate {
     func udpTransport(_ transport: UDPTransport, clientDidConnect endpoint: NWEndpoint, connection: NWConnection) {}
     func udpTransportDidLoseFrames(_ transport: UDPTransport) {}
+    func udpTransportFrameExceededCapacity(_ transport: UDPTransport, fragments: Int, limit: Int) {}
 }
 
 // Fragment header for large packets
@@ -128,6 +135,15 @@ class UDPTransport {
     // At 1390 bytes/fragment, a 5 MB frame needs ~3,600 fragments.
     private let maxTotalFragments: UInt16 = 5000  // ~7 MB max per frame
     private let maxBufferedFrames = 120           // Allow more in-flight frames for high-throughput
+
+    // Over-capacity signal rate limiting. A droppable frame whose fragment
+    // count exceeds maxTotalFragments is rejected wholesale by the receiver, so
+    // the sender drops it and asks the host to reduce encode load. sendFragmented
+    // runs on the encoder callback queue, so guard the last-signal time so the
+    // host is notified at most a few times per second.
+    private var lastOverCapacitySignal = Date.distantPast
+    private let overCapacityLock = NSLock()
+    private static let overCapacityMinInterval: TimeInterval = 0.3
 
     // Paced fragment sending.
     // A keyframe is hundreds of fragments. Handing them all to the network
@@ -402,8 +418,23 @@ class UDPTransport {
         fragmentLock.unlock()
         
         let payloadSize = currentMaxPayload - FragmentHeader.size
-        let totalFragments = UInt16((data.count + payloadSize - 1) / payloadSize)
-        
+        let totalFragmentCount = (data.count + payloadSize - 1) / payloadSize
+
+        // A droppable (video) frame whose data-fragment count exceeds the
+        // receiver's cap is rejected at reassembly (the receiver guards against
+        // totalFragments > maxTotalFragments), so the decoder never gets it.
+        // Emitting it wastes the uplink and only adds congestion, and a keyframe
+        // that never arrives stalls the stream ("connected but no video"). Drop
+        // it here and signal the host to reduce encode load so the next keyframe
+        // fits. Computed from the current payload size, so the threshold is
+        // correct under both default and jumbo MTUs.
+        if droppable && totalFragmentCount > Int(maxTotalFragments) {
+            signalOverCapacity(fragments: totalFragmentCount, limit: Int(maxTotalFragments))
+            return
+        }
+
+        let totalFragments = UInt16(totalFragmentCount)
+
         var fragments: [Data] = []
         fragments.reserveCapacity(Int(totalFragments))
         for i in 0..<Int(totalFragments) {
@@ -481,6 +512,20 @@ class UDPTransport {
         
         // Large frames: drain in small bursts so the uplink isn't overrun.
         paceFragments(sendList, on: connection, frameId: frameId)
+    }
+
+    /// Notify the host that a video frame exceeded the receiver's fragment cap,
+    /// rate-limited so a run of oversized keyframes produces at most a few
+    /// signals per second. Runs on the encoder callback queue.
+    private func signalOverCapacity(fragments: Int, limit: Int) {
+        overCapacityLock.lock()
+        let now = Date()
+        let shouldSignal = now.timeIntervalSince(lastOverCapacitySignal) >= Self.overCapacityMinInterval
+        if shouldSignal { lastOverCapacitySignal = now }
+        overCapacityLock.unlock()
+        guard shouldSignal else { return }
+        logger.warning("⚠️ Dropped over-capacity video frame: \(fragments) fragments > limit \(limit). Signalling host to reduce encode load.")
+        delegate?.udpTransportFrameExceededCapacity(self, fragments: fragments, limit: limit)
     }
 
     /// Number of fragments recovered via FEC since the last call; resets the
