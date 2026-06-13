@@ -1,53 +1,148 @@
 import SwiftUI
 
+/// The eight settings sections, in display order. Each case owns its title
+/// and SF Symbol so the tab bar and the content switch stay in sync.
+enum SettingsTab: String, CaseIterable, Identifiable {
+    case general
+    case metalStreaming
+    case network
+    case permissions
+    case security
+    case maintenance
+    case tests
+    case about
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .general: return "General"
+        case .metalStreaming: return "Metal Streaming"
+        case .network: return "Network"
+        case .permissions: return "Permissions"
+        case .security: return "Security"
+        case .maintenance: return "Maintenance"
+        case .tests: return "Tests"
+        case .about: return "About"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .general: return "gear"
+        case .metalStreaming: return "bolt.fill"
+        case .network: return "network"
+        case .permissions: return "hand.raised"
+        case .security: return "lock.shield"
+        case .maintenance: return "wrench.and.screwdriver"
+        case .tests: return "testtube.2"
+        case .about: return "info.circle"
+        }
+    }
+}
+
+/// Window-hosted settings container. We render our own top tab bar instead of
+/// relying on `TabView` + `.tabItem`. On macOS 26 (Tahoe) the legacy
+/// `.tabItem` API hosted inside an `NSWindow` no longer draws the classic
+/// segmented top tab bar; it falls back to a non-tab presentation (and on
+/// narrower windows collapsed extra tabs into a ">>" overflow). An explicit
+/// bar of buttons cannot regress with SwiftUI default-style changes and shows
+/// all eight sections at once.
 struct SettingsView: View {
     @EnvironmentObject var appState: AppState
-    
+
+    /// Remembered across openings of the Settings window.
+    @AppStorage("settingsSelectedTab") private var storedTab: String = SettingsTab.general.rawValue
+
+    private var selection: Binding<SettingsTab> {
+        Binding(
+            get: { SettingsTab(rawValue: storedTab) ?? .general },
+            set: { storedTab = $0.rawValue }
+        )
+    }
+
     var body: some View {
-        TabView {
-            GeneralSettingsView()
-                .tabItem {
-                    Label("General", systemImage: "gear")
-                }
-            
-            LocalCastSettingsView()
-                .tabItem {
-                    Label("Metal Streaming", systemImage: "bolt.fill")
-                }
-            
-            NetworkSettingsView()
-                .tabItem {
-                    Label("Network", systemImage: "network")
-                }
-            
-            PermissionDiagnosticView()
-                .tabItem {
-                    Label("Permissions", systemImage: "hand.raised")
-                }
-            
-            SecuritySettingsView()
-                .tabItem {
-                    Label("Security", systemImage: "lock.shield")
-                }
-            
-            MaintenanceSettingsView()
-                .tabItem {
-                    Label("Maintenance", systemImage: "wrench.and.screwdriver")
-                }
-            
-            TestSuiteView()
-                .tabItem {
-                    Label("Tests", systemImage: "testtube.2")
-                }
-            
-            AboutView()
-                .tabItem {
-                    Label("About", systemImage: "info.circle")
-                }
+        VStack(spacing: 0) {
+            SettingsTabBar(selection: selection)
+            Divider()
+            content
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        // Wide enough that all tabs (General … About) fit on the tab bar instead
-        // of collapsing into a ">>" overflow that hid Network/Security.
-        .frame(width: 820, height: 560)
+        .frame(minWidth: 720, idealWidth: 760, maxWidth: .infinity,
+               minHeight: 480, idealHeight: 560, maxHeight: .infinity)
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        switch selection.wrappedValue {
+        case .general: GeneralSettingsView()
+        case .metalStreaming: LocalCastSettingsView()
+        case .network: NetworkSettingsView()
+        case .permissions: PermissionDiagnosticView()
+        case .security: SecuritySettingsView()
+        case .maintenance: MaintenanceSettingsView()
+        case .tests: TestSuiteView()
+        case .about: AboutView()
+        }
+    }
+}
+
+/// Horizontal row of tab buttons across the top of the Settings window.
+struct SettingsTabBar: View {
+    @Binding var selection: SettingsTab
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(SettingsTab.allCases) { tab in
+                SettingsTabButton(
+                    tab: tab,
+                    isSelected: selection == tab
+                ) {
+                    selection = tab
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity)
+        .background(.bar)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Settings sections")
+    }
+}
+
+/// A single tab: SF Symbol above its title, with a selected highlight. Plain
+/// button styling keeps it keyboard- and VoiceOver-reachable.
+struct SettingsTabButton: View {
+    let tab: SettingsTab
+    let isSelected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 4) {
+                Image(systemName: tab.systemImage)
+                    .font(.system(size: 18))
+                    .frame(height: 22)
+                Text(tab.title)
+                    .font(.caption)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 6)
+            .padding(.horizontal, 4)
+            .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+            .background {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(isSelected ? Color.accentColor.opacity(0.15) : Color.clear)
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .help(tab.title)
+        .accessibilityLabel(tab.title)
+        .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
     }
 }
 

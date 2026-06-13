@@ -240,6 +240,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         )
         window.title = "Settings"
         window.contentView = hostingView
+        window.contentMinSize = NSSize(width: 720, height: 480)
         window.center()
         window.isReleasedWhenClosed = false
         window.level = .floating
