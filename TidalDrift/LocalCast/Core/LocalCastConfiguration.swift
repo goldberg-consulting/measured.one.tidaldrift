@@ -106,9 +106,11 @@ struct LocalCastConfiguration: Codable {
 
     /// Bitrate ceiling for the Fast LAN transport profile. A wired 10GbE link is
     /// not bandwidth constrained, so target well above the Wi-Fi tuned preset to
-    /// keep the image sharp. Never lower than the preset's own bitrate.
+    /// keep the image sharp. Never lower than the preset's own bitrate. 250 Mbps
+    /// HEVC at 5K/60 is visually near-lossless for desktop content; the hardware
+    /// encoder and the (now off-callback-thread) transport both sustain it.
     var fastLANBitrateMbps: Int {
-        max(bitrateMbps, 150)
+        max(bitrateMbps, 250)
     }
     
     /// Maximum capture dimension (longest edge). A user override (if set) wins;
@@ -233,8 +235,9 @@ class StreamingTuning: ObservableObject {
     /// Allowed FPS choices for the stepper/picker.
     static let fpsOptions: [Int] = [15, 24, 30, 48, 60, 90, 120]
     
-    /// Allowed bitrate choices (Mbps) for the stepper/picker.
-    static let bitrateOptions: [Int] = [8, 15, 30, 50, 75, 100, 150]
+    /// Allowed bitrate choices (Mbps) for the stepper/picker. 200-400 are for
+    /// wired multi-gig links (Fast LAN); Wi-Fi cannot sustain them.
+    static let bitrateOptions: [Int] = [8, 15, 30, 50, 75, 100, 150, 200, 300, 400]
     
     /// Allowed max-dimension choices for the picker.
     static let dimensionOptions: [Int] = [1280, 1920, 2560, 3840]

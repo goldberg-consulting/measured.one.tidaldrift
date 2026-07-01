@@ -241,6 +241,38 @@ Jellyfin-ffmpeg builds), but Apple Silicon has no hardware AV1 *encoder* exposed
 to VideoToolbox, and software AV1 is too slow for interactive Mac-to-Mac. HEVC
 remains the target codec; AV1 is a deferred research spike, not a dependency.
 
+### Fix 9: mid-stream freeze recovery + wired-link headroom (1.6.48)
+
+Freeze diagnosis from a live session (host logs showed `Stream stopped with
+error` / `Capture failure` mid-stream): when SCStream dies (display
+reconfiguration, shared window closed, WindowServer hiccup), the host only
+logged it. The UDP listener and pongs stayed alive, so the client's reconnect
+watchdog correctly never fired, and the viewer froze forever. Fixes:
+
+- **Capture auto-restart.** On `didFailWithError` the host stops the dead
+  stream, waits ~0.8 s, restarts capture for the current target, and forces a
+  keyframe. Bounded to 5 attempts (reset on success) so a revoked permission
+  cannot restart-loop.
+- **Display sleep prevention.** The streaming activity now includes
+  `idleDisplaySleepDisabled`: remote viewing generates no local HID input, so
+  the host's display slept mid-session and ScreenCaptureKit suspended
+  delivery, another forever-freeze with live pongs.
+- **Send-queue race fixes.** The 1.6.47 send queue read the session key inside
+  the async block; the auth flow installs/clears the key right after enqueuing
+  a packet, so a handshake packet could be encrypted before the peer had the
+  key (failed auth) or the disconnect bye could go out plaintext (dropped, so
+  the host held the stale session for the 10 s idle timeout). The key is now
+  snapshotted at enqueue, and `stopListening` drains the send queue before
+  cancelling connections.
+- **Idle media heartbeat.** The idle skip now lets one frame per second
+  through, keeping the client's media clock and stats alive and bounding any
+  stall from a mis-flagged idle frame to about a second.
+
+Wired multi-gig (10GbE) headroom: Fast LAN's bitrate target raised from 150 to
+250 Mbps, and the manual bitrate picker gains 200/300/400 Mbps options (wired
+only; Wi-Fi cannot sustain them). HEVC at 250 Mbps / 5K / 60 fps is visually
+near-lossless for desktop content.
+
 ### Fix 8: high-res heat reduction + lid-closed wake (1.6.47)
 
 A codebase-wide CPU audit at 5120x1440 / 100-150 Mbps found the heat coming

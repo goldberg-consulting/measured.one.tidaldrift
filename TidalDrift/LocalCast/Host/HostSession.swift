@@ -90,6 +90,26 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     private var captureActive = false
     private let captureStateLock = NSLock()
 
+    /// Bounded retries for mid-session SCStream failures, so a persistently
+    /// failing capture (e.g. permission revoked) cannot restart-loop forever.
+    /// Reset whenever capture starts successfully.
+    private var captureRestartAttempts = 0
+    private let captureRestartLock = NSLock()
+    private static let maxCaptureRestartAttempts = 5
+
+    /// Sync wrapper so async contexts don't take the lock directly (Swift 6).
+    private func resetCaptureRestartAttempts() {
+        captureRestartLock.lock()
+        captureRestartAttempts = 0
+        captureRestartLock.unlock()
+    }
+
+    /// Last time a frame was handed to the encoder. Only touched on the
+    /// capture queue. Drives the idle media heartbeat (one frame per second on
+    /// a static screen).
+    private var lastEncodedFrameAt = Date.distantPast
+    private static let idleHeartbeatInterval: TimeInterval = 1.0
+
     // MARK: - Sleep prevention while streaming
     //
     // Without an activity assertion the host can idle-sleep mid-stream (the
@@ -103,8 +123,13 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         streamActivityLock.lock()
         defer { streamActivityLock.unlock() }
         guard streamActivity == nil else { return }
+        // idleDisplaySleepDisabled matters as much as system sleep: when the
+        // host's display sleeps, ScreenCaptureKit suspends frame delivery and
+        // the viewer freezes even though the machine is awake and pongs keep
+        // flowing (so no reconnect fires). Remote viewing generates no local
+        // HID activity, so the display idle timer runs out mid-session.
         streamActivity = ProcessInfo.processInfo.beginActivity(
-            options: [.idleSystemSleepDisabled, .suddenTerminationDisabled],
+            options: [.idleSystemSleepDisabled, .idleDisplaySleepDisabled, .suddenTerminationDisabled],
             reason: "LocalCast streaming to a connected viewer"
         )
         logger.info("🔋 Sleep prevention ON (viewer connected, capture active)")
@@ -491,6 +516,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
                     try await startAppCapture(processID: processID)
                 }
                 updateInputBounds()
+                resetCaptureRestartAttempts()
                 logger.info("✅ Capture started for connected client")
             } catch {
                 logger.error("❌ Failed to start capture for client: \(error.localizedDescription)")
@@ -737,12 +763,16 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         // static screen, the dominant heat source at high resolution. The
         // client re-presents its last frame, so nothing needs to flow. Still
         // encode when a forced keyframe is pending (new viewer or recovery
-        // request) so a static screen can seed a fresh connection.
+        // request), and let one frame per second through as a media heartbeat:
+        // it keeps the client's media clock and stats alive and bounds any
+        // stall from a mis-flagged frame to about a second.
         if let change = manager.lastFrameChange, change.isIdle,
-           !encoder.hasPendingForceKeyFrame {
+           !encoder.hasPendingForceKeyFrame,
+           Date().timeIntervalSince(lastEncodedFrameAt) < Self.idleHeartbeatInterval {
             return
         }
 
+        lastEncodedFrameAt = Date()
         encoder.encode(sampleBuffer)
     }
 
@@ -873,7 +903,39 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     }
 
     func screenCaptureManager(_ manager: ScreenCaptureManager, didFailWithError error: Error) {
-        logger.error("Capture failure: \(error.localizedDescription)")
+        // SCStream can die mid-session (display reconfiguration, shared window
+        // closed, WindowServer hiccup). Logging alone left the viewer frozen
+        // forever: the UDP listener and pongs stay alive, so the client's
+        // reconnect watchdog correctly never fires, and no frames ever flow
+        // again. Restart capture for the current target instead.
+        logger.error("Capture failure: \(error.localizedDescription) — attempting capture restart")
+
+        let wasActive = withCaptureState { () -> Bool in
+            let had = captureActive
+            captureActive = false
+            return had
+        }
+        guard wasActive, clientConnection != nil || clientEndpoint != nil else { return }
+
+        captureRestartLock.lock()
+        captureRestartAttempts += 1
+        let attempt = captureRestartAttempts
+        captureRestartLock.unlock()
+        guard attempt <= Self.maxCaptureRestartAttempts else {
+            logger.error("Capture restart attempt \(attempt) exceeds limit; giving up until re-target or reconnect")
+            return
+        }
+
+        Task { [weak self] in
+            guard let self else { return }
+            await self.captureManager.stopCapture()
+            // Brief backoff so a display reconfiguration can settle first.
+            try? await Task.sleep(nanoseconds: 800_000_000)
+            guard self.clientConnection != nil || self.clientEndpoint != nil else { return }
+            self.logger.info("🔄 Restarting capture after failure (attempt \(attempt))")
+            self.beginCaptureForClient()
+            self.encoder.forceKeyFrame()
+        }
     }
 
     // MARK: - VideoEncoderDelegate

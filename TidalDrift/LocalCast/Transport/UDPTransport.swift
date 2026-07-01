@@ -340,6 +340,11 @@ class UDPTransport {
     }
     
     func stopListening() {
+        // Drain queued sends before cancelling connections so a just-enqueued
+        // control packet (e.g. the disconnect bye) still reaches the wire.
+        // Cheap: the queue only ever holds a few frames' worth of work.
+        sendQueue.sync {}
+
         listener?.cancel()
         listener = nil
         
@@ -367,12 +372,20 @@ class UDPTransport {
     /// return path and was a major heat source at high bitrate. The queue is
     /// serial, so packet ordering is preserved across all callers.
     func send(packet: LocalCastPacket, on connection: NWConnection, forcePlaintext: Bool = false) {
+        // Snapshot the session key at enqueue time, not inside the async block.
+        // The auth flow installs or clears the key immediately after handing a
+        // packet to send (authChallenge goes out plaintext, then the key goes
+        // live; disconnect sends the encrypted bye, then clears the key).
+        // Reading the key later raced those transitions and could encrypt a
+        // handshake packet the peer cannot decrypt yet, or send a post-auth
+        // packet in plaintext, which the peer rightly drops.
+        let keyAtEnqueue = forcePlaintext ? nil : sessionKey
         sendQueue.async { [weak self] in
-            self?.performSend(packet: packet, on: connection, forcePlaintext: forcePlaintext)
+            self?.performSend(packet: packet, on: connection, key: keyAtEnqueue)
         }
     }
 
-    private func performSend(packet: LocalCastPacket, on connection: NWConnection, forcePlaintext: Bool) {
+    private func performSend(packet: LocalCastPacket, on connection: NWConnection, key: SymmetricKey?) {
         let raw = packet.serialize()
         statsLock.lock()
         _sendCount += 1
@@ -381,7 +394,7 @@ class UDPTransport {
 
         // Encrypt or wrap with plaintext flag
         let data: Data
-        if let key = sessionKey, !forcePlaintext {
+        if let key {
             guard let encrypted = SessionCrypto.encrypt(raw, using: key) else {
                 logger.error("Failed to encrypt packet of type \(packet.type.rawValue)")
                 return
