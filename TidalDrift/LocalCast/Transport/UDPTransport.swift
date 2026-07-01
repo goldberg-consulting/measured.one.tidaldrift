@@ -51,17 +51,21 @@ private struct FragmentHeader {
     let totalFragments: UInt16
     let payloadLength: UInt16
     
-    func serialize() -> Data {
-        var data = Data(capacity: FragmentHeader.size)
-        var fid = frameId.bigEndian
-        var fidx = fragmentIndex.bigEndian
-        var ftotal = totalFragments.bigEndian
-        var plen = payloadLength.bigEndian
-        data.append(Data(bytes: &fid, count: 4))
-        data.append(Data(bytes: &fidx, count: 2))
-        data.append(Data(bytes: &ftotal, count: 2))
-        data.append(Data(bytes: &plen, count: 2))
-        return data
+    /// Append the 10 header bytes (big-endian) directly into `data`. Byte
+    /// appends avoid the four tiny `Data(bytes:)` heap objects the old
+    /// `serialize()` created; at ~10k fragments/sec those temporaries alone
+    /// were ~40k allocations/sec on the send path.
+    func append(into data: inout Data) {
+        data.append(UInt8(truncatingIfNeeded: frameId >> 24))
+        data.append(UInt8(truncatingIfNeeded: frameId >> 16))
+        data.append(UInt8(truncatingIfNeeded: frameId >> 8))
+        data.append(UInt8(truncatingIfNeeded: frameId))
+        data.append(UInt8(truncatingIfNeeded: fragmentIndex >> 8))
+        data.append(UInt8(truncatingIfNeeded: fragmentIndex))
+        data.append(UInt8(truncatingIfNeeded: totalFragments >> 8))
+        data.append(UInt8(truncatingIfNeeded: totalFragments))
+        data.append(UInt8(truncatingIfNeeded: payloadLength >> 8))
+        data.append(UInt8(truncatingIfNeeded: payloadLength))
     }
     
     static func deserialize(_ data: Data) -> FragmentHeader? {
@@ -138,9 +142,8 @@ class UDPTransport {
 
     // Over-capacity signal rate limiting. A droppable frame whose fragment
     // count exceeds maxTotalFragments is rejected wholesale by the receiver, so
-    // the sender drops it and asks the host to reduce encode load. sendFragmented
-    // runs on the encoder callback queue, so guard the last-signal time so the
-    // host is notified at most a few times per second.
+    // the sender drops it and asks the host to reduce encode load. Guard the
+    // last-signal time so the host is notified at most a few times per second.
     private var lastOverCapacitySignal = Date.distantPast
     private let overCapacityLock = NSLock()
     private static let overCapacityMinInterval: TimeInterval = 0.3
@@ -156,6 +159,12 @@ class UDPTransport {
     private let pacingBatchSize = 16           // fragments per paced burst
     private let pacingGapBaseMicros = 700      // base gap between bursts (~256 Mbps ceiling)
     private let paceQueue = DispatchQueue(label: "com.tidaldrift.localcast.sendpace", qos: .userInteractive)
+
+    /// Serial queue for the entire outgoing pipeline (serialize, encrypt,
+    /// fragment, hand to Network.framework). Keeps this work off callers'
+    /// threads, most importantly the VideoToolbox output callback, which must
+    /// return promptly for the hardware encoder to keep flowing.
+    private let sendQueue = DispatchQueue(label: "com.tidaldrift.localcast.send", qos: .userInteractive)
 
     // Adaptive pacing. The client reports drops once per second; drops mean
     // the uplink is shedding our bursts, so widen the inter-burst gap (slower,
@@ -350,7 +359,20 @@ class UDPTransport {
     /// `forcePlaintext` bypasses session-key encryption; use it only for handshake
     /// retransmits, where the peer may not have installed the key yet and a keyed
     /// peer will simply drop the duplicate.
+    ///
+    /// The whole serialize/encrypt/fragment/send pipeline runs on `sendQueue`,
+    /// never on the caller's thread. Video frames arrive here from the
+    /// VideoToolbox output callback; doing thousands of Data allocations and
+    /// synchronous `NWConnection.send` calls there blocked the encoder's XPC
+    /// return path and was a major heat source at high bitrate. The queue is
+    /// serial, so packet ordering is preserved across all callers.
     func send(packet: LocalCastPacket, on connection: NWConnection, forcePlaintext: Bool = false) {
+        sendQueue.async { [weak self] in
+            self?.performSend(packet: packet, on: connection, forcePlaintext: forcePlaintext)
+        }
+    }
+
+    private func performSend(packet: LocalCastPacket, on connection: NWConnection, forcePlaintext: Bool) {
         let raw = packet.serialize()
         statsLock.lock()
         _sendCount += 1
@@ -388,9 +410,9 @@ class UDPTransport {
             sendFragmented(data: data, on: connection, droppable: packet.type == .videoFrame)
         } else {
             // Small packet, send directly with a "no fragment" header
-            var noFragmentData = Data()
+            var noFragmentData = Data(capacity: FragmentHeader.size + data.count)
             let header = FragmentHeader(frameId: 0, fragmentIndex: 0, totalFragments: 1, payloadLength: UInt16(data.count))
-            noFragmentData.append(header.serialize())
+            header.append(into: &noFragmentData)
             noFragmentData.append(data)
             
             let packetType = packet.type // Capture for closure
@@ -449,8 +471,8 @@ class UDPTransport {
                 payloadLength: UInt16(fragmentPayload.count)
             )
             
-            var fragmentData = Data()
-            fragmentData.append(header.serialize())
+            var fragmentData = Data(capacity: FragmentHeader.size + fragmentPayload.count)
+            header.append(into: &fragmentData)
             fragmentData.append(fragmentPayload)
             fragments.append(fragmentData)
         }
@@ -475,8 +497,8 @@ class UDPTransport {
                     totalFragments: totalFragments,
                     payloadLength: UInt16(parity.p.count)
                 )
-                var pData = Data()
-                pData.append(pHeader.serialize())
+                var pData = Data(capacity: FragmentHeader.size + parity.p.count)
+                pHeader.append(into: &pData)
                 pData.append(parity.p)
                 sendList.append(pData)
 
@@ -486,8 +508,8 @@ class UDPTransport {
                     totalFragments: totalFragments,
                     payloadLength: UInt16(parity.q.count)
                 )
-                var qData = Data()
-                qData.append(qHeader.serialize())
+                var qData = Data(capacity: FragmentHeader.size + parity.q.count)
+                qHeader.append(into: &qData)
                 qData.append(parity.q)
                 sendList.append(qData)
 
@@ -516,7 +538,7 @@ class UDPTransport {
 
     /// Notify the host that a video frame exceeded the receiver's fragment cap,
     /// rate-limited so a run of oversized keyframes produces at most a few
-    /// signals per second. Runs on the encoder callback queue.
+    /// signals per second. Runs on the send queue.
     private func signalOverCapacity(fragments: Int, limit: Int) {
         overCapacityLock.lock()
         let now = Date()

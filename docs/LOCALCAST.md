@@ -241,6 +241,48 @@ Jellyfin-ffmpeg builds), but Apple Silicon has no hardware AV1 *encoder* exposed
 to VideoToolbox, and software AV1 is too slow for interactive Mac-to-Mac. HEVC
 remains the target codec; AV1 is a deferred research spike, not a dependency.
 
+### Fix 8: high-res heat reduction + lid-closed wake (1.6.47)
+
+A codebase-wide CPU audit at 5120x1440 / 100-150 Mbps found the heat coming
+from four places; all are addressed:
+
+- **Idle frames were encoded at full rate (host).** ScreenCaptureKit delivers
+  frames at the configured fps even when nothing changed; the default path
+  encoded and sent every one. Idle frames (`SCFrameStatus != .complete`) are
+  now skipped unless a forced keyframe is pending, so a static screen costs
+  near zero encode/send work.
+- **The transport ran on the VideoToolbox callback thread (host).** Packet
+  serialize, AES-GCM, fragmentation (hundreds of `Data` allocs per frame), and
+  in Fast LAN the entire ~10k packets/sec synchronous send loop all executed on
+  the VT output callback. Everything now runs on a dedicated serial send queue;
+  the fragment header is also written byte-wise (was 4 tiny heap `Data`s per
+  fragment, ~40k allocs/sec).
+- **The viewer re-presented the same frame at display rate (client).** The
+  MTKView ran a full GPU render + present at 60-120 Hz even when the stream was
+  static, occluded, or disconnected. Draw ticks now skip the GPU pass unless a
+  new frame was dequeued, the canvas changed, or the drawable resized; the view
+  fully pauses on disconnect, miniaturize, and window occlusion.
+- **Hot-path release logging** (per-keyframe `logger.info`, dirty-rect stats)
+  downgraded to `.debug`.
+
+Lid-closed / sleeping host fixes (why Apple Screen Sharing could wake a Mac
+but Metal Streaming could not):
+
+- **Wake on Demand knock.** A sleeping Mac's Bonjour records are kept alive by
+  the network's sleep proxy, so it looks "online" and the old wake path bailed
+  out; and LocalCast's UDP port never triggers the proxy (only TCP to a
+  registered service like Screen Sharing's 5900 does). Before any LocalCast
+  connect, the client now always knocks TCP 5900 (short timeout, no stored MAC
+  needed), which is exactly how Apple Screen Sharing wakes the host. WOL magic
+  packets remain as a fallback when a MAC is known.
+- **Host recovery after wake.** Sleep kills the UDP listener and orphans the
+  dns-sd ad while `isHosting` stayed true. `LocalCastService` now observes
+  `NSWorkspace.didWakeNotification` and restarts hosting + advertisement.
+- **Sleep prevention while streaming.** The host holds a
+  `ProcessInfo.beginActivity(.idleSystemSleepDisabled)` assertion while a
+  viewer is connected and capture is active (released on idle/disconnect/stop),
+  so the host cannot idle-sleep mid-stream.
+
 ### Fix 7: encoder XPC deadlock under concurrent access (1.6.40)
 
 A `sample` of a hung host showed five threads blocked in

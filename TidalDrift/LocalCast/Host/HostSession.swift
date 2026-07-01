@@ -90,6 +90,35 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     private var captureActive = false
     private let captureStateLock = NSLock()
 
+    // MARK: - Sleep prevention while streaming
+    //
+    // Without an activity assertion the host can idle-sleep mid-stream (the
+    // viewer sees a freeze, then "host can't be reached"), and a clamshell
+    // host drops the session the moment the display sleeps. Held only while
+    // capture is active for a connected viewer, never while merely hosting.
+    private var streamActivity: NSObjectProtocol?
+    private let streamActivityLock = NSLock()
+
+    private func beginStreamActivity() {
+        streamActivityLock.lock()
+        defer { streamActivityLock.unlock() }
+        guard streamActivity == nil else { return }
+        streamActivity = ProcessInfo.processInfo.beginActivity(
+            options: [.idleSystemSleepDisabled, .suddenTerminationDisabled],
+            reason: "LocalCast streaming to a connected viewer"
+        )
+        logger.info("🔋 Sleep prevention ON (viewer connected, capture active)")
+    }
+
+    private func endStreamActivity() {
+        streamActivityLock.lock()
+        defer { streamActivityLock.unlock() }
+        guard let activity = streamActivity else { return }
+        ProcessInfo.processInfo.endActivity(activity)
+        streamActivity = nil
+        logger.info("🔋 Sleep prevention OFF")
+    }
+
     /// Apply host-side runtime settings that do not require rebuilding the
     /// capture or encoder session. Codec/resolution still require a restart.
     func updateRuntimeConfiguration(_ newConfig: LocalCastConfiguration) {
@@ -443,6 +472,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             return false
         }
         if alreadyActive { return }
+        beginStreamActivity()
 
         Task {
             do {
@@ -465,6 +495,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             } catch {
                 logger.error("❌ Failed to start capture for client: \(error.localizedDescription)")
                 withCaptureState { captureActive = false }
+                endStreamActivity()
             }
         }
     }
@@ -477,6 +508,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             return true
         }
         guard wasActive else { return }
+        endStreamActivity()
 
         Task {
             await captureManager.stopCapture()
@@ -643,6 +675,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         guard isRunning else { return }
 
         withCaptureState { captureActive = false }
+        endStreamActivity()
         resetAdaptiveBitrate()
 
         await captureManager.stopCapture()
@@ -695,6 +728,18 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         if configuration.regionAware,
            let change = manager.lastFrameChange,
            handleRegionAware(sampleBuffer, change: change) {
+            return
+        }
+
+        // Idle skip: ScreenCaptureKit delivers frames at the configured rate
+        // even when nothing on screen changed (status != .complete). Encoding
+        // those burns a full hardware encode + packetize + send per frame on a
+        // static screen, the dominant heat source at high resolution. The
+        // client re-presents its last frame, so nothing needs to flow. Still
+        // encode when a forced keyframe is pending (new viewer or recovery
+        // request) so a static screen can seed a fresh connection.
+        if let change = manager.lastFrameChange, change.isIdle,
+           !encoder.hasPendingForceKeyFrame {
             return
         }
 

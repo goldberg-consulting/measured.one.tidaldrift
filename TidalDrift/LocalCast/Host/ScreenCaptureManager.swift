@@ -426,7 +426,7 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
         if !idle && coverage > 0 && coverage < 0.25 { statSmall += 1 }
         if statFrames >= 120 {
             let avg = statCoverageSum / Double(statFrames)
-            logger.info("📐 Dirty-rect stats over \(self.statFrames) frames: avg coverage \(String(format: "%.1f", avg * 100))%, idle \(self.statIdle), small(<25%) \(self.statSmall)")
+            logger.debug("📐 Dirty-rect stats over \(self.statFrames) frames: avg coverage \(String(format: "%.1f", avg * 100))%, idle \(self.statIdle), small(<25%) \(self.statSmall)")
             statFrames = 0
             statCoverageSum = 0
             statIdle = 0
