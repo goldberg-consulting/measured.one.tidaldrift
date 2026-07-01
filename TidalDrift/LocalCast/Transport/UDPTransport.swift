@@ -532,9 +532,18 @@ class UDPTransport {
         }
 
         // Small frames go out immediately; pacing them would only add latency
-        // and they are too small to overrun the uplink. Fast LAN and loopback
-        // skip pacing entirely.
-        if pacingBypassed || fastLANEnabled || totalFragments <= pacingFragmentThreshold {
+        // and they are too small to overrun the link. Loopback always skips
+        // pacing. Fast LAN skips it for ordinary frames but micro-paces very
+        // large ones (keyframes): blasting a multi-MB keyframe as thousands of
+        // back-to-back datagrams sheds fragments in the NIC/switch buffers
+        // even on a clean 10GbE path, and one lost fragment makes the whole
+        // keyframe undecodable (observed as a blank viewer window with endless
+        // keyframe retries at high bitrate).
+        let fastLAN = fastLANEnabled
+        let smallEnoughToBlast = fastLAN
+            ? sendList.count <= Self.fastLANPacedThreshold
+            : totalFragments <= pacingFragmentThreshold
+        if pacingBypassed || smallEnoughToBlast {
             for fragment in sendList {
                 connection.send(content: fragment, completion: .contentProcessed { [weak self] error in
                     if let error = error {
@@ -544,10 +553,30 @@ class UDPTransport {
             }
             return
         }
-        
-        // Large frames: drain in small bursts so the uplink isn't overrun.
-        paceFragments(sendList, on: connection, frameId: frameId)
+
+        if fastLAN {
+            // ~90 KB per burst / 250 µs gap ≈ 3 Gbps instantaneous ceiling,
+            // fast enough that a 2 MB keyframe drains in ~6 ms but bounded so
+            // buffers are never overrun. Batch size derives from the payload
+            // size so jumbo frames get the same byte budget.
+            let batch = max(8, Self.fastLANBatchBytes / currentMaxPayload)
+            paceFragments(sendList, on: connection, frameId: frameId,
+                          batchSize: batch, gapMicros: Self.fastLANGapMicros)
+            return
+        }
+
+        // Resilient profile: drain in small bursts so the uplink isn't overrun.
+        paceFragments(sendList, on: connection, frameId: frameId,
+                      batchSize: pacingBatchSize, gapMicros: currentPacingGapMicros)
     }
+
+    /// Fast LAN micro-pacing constants. Frames at or below the threshold are
+    /// sent unpaced (lowest latency); larger frames drain in byte-budgeted
+    /// bursts. 256 fragments ≈ 350 KB at the default payload size, comfortably
+    /// above any P-frame at 150-400 Mbps, so only keyframes are paced.
+    private static let fastLANPacedThreshold = 256
+    private static let fastLANGapMicros = 250
+    private static let fastLANBatchBytes = 90_000
 
     /// Notify the host that a video frame exceeded the receiver's fragment cap,
     /// rate-limited so a run of oversized keyframes produces at most a few
@@ -599,14 +628,15 @@ class UDPTransport {
         return (Data(pParity), Data(qParity))
     }
     
-    /// Drain a frame's fragments in small bursts separated by a short gap,
-    /// keeping the instantaneous send rate under the uplink's capacity so the
-    /// burst isn't partially dropped. Runs on `paceQueue` off the encoder's
-    /// callback queue.
-    private func paceFragments(_ fragments: [Data], on connection: NWConnection, frameId: UInt32) {
+    /// Drain a frame's fragments in bursts separated by a short gap, keeping
+    /// the instantaneous send rate under the link's capacity so the burst
+    /// isn't partially dropped. Burst size and gap come from the caller so the
+    /// resilient (Wi-Fi) and Fast LAN profiles can pace at very different
+    /// rates. Runs on `paceQueue` off the send queue.
+    private func paceFragments(_ fragments: [Data], on connection: NWConnection, frameId: UInt32,
+                               batchSize: Int, gapMicros: Int) {
         let total = fragments.count
-        let batchSize = pacingBatchSize
-        let gap = DispatchTimeInterval.microseconds(currentPacingGapMicros)
+        let gap = DispatchTimeInterval.microseconds(gapMicros)
         
         func drain(from start: Int) {
             let end = min(start + batchSize, total)
