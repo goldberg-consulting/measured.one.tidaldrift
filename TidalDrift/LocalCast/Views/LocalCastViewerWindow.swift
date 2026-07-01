@@ -361,6 +361,23 @@ extension LocalCastViewerWindowController: NSWindowDelegate {
         guard let window = self.window, !window.inLiveResize else { return }
         sendViewerSize()
     }
+
+    /// Pause the Metal display link while the viewer cannot be seen
+    /// (miniaturized, fully covered, or on another Space). Rendering an
+    /// invisible window burned GPU/CPU at the display refresh rate.
+    func windowDidChangeOcclusionState(_ notification: Notification) {
+        guard let window = self.window else { return }
+        let visible = window.occlusionState.contains(.visible)
+        clientSession.renderer?.setPaused(!visible, reason: .notVisible)
+    }
+
+    func windowDidMiniaturize(_ notification: Notification) {
+        clientSession.renderer?.setPaused(true, reason: .notVisible)
+    }
+
+    func windowDidDeminiaturize(_ notification: Notification) {
+        clientSession.renderer?.setPaused(false, reason: .notVisible)
+    }
 }
 
 struct LocalCastContentView: View {

@@ -211,7 +211,7 @@ class VideoEncoder {
         var frameProperties: CFDictionary? = nil
         if shouldForceKeyFrame {
             frameProperties = [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary
-            logger.info("🔑 Encoding forced keyframe NOW")
+            logger.debug("🔑 Encoding forced keyframe NOW")
         }
         
         var flags: VTEncodeInfoFlags = []
@@ -347,7 +347,16 @@ class VideoEncoder {
         keyframeLock.lock()
         forceNextKeyFrame = true
         keyframeLock.unlock()
-        logger.info("🔑 Keyframe requested - will encode next frame as keyframe")
+        logger.debug("🔑 Keyframe requested - will encode next frame as keyframe")
+    }
+
+    /// True while a forced keyframe is queued but not yet encoded. Lets the
+    /// host's idle-frame skip still deliver the keyframe a new viewer is
+    /// waiting for even when the screen content is static.
+    var hasPendingForceKeyFrame: Bool {
+        keyframeLock.lock()
+        defer { keyframeLock.unlock() }
+        return forceNextKeyFrame
     }
     
     private let compressionCallback: VTCompressionOutputCallback = { (outputCallbackRefCon, sourceFrameRefCon, status, infoFlags, sampleBuffer) in
@@ -374,11 +383,11 @@ class VideoEncoder {
         
         // 3. For keyframes, prepend parameter sets (SPS/PPS) with Annex B start codes
         if isKeyFrame {
-            encoder.logger.info("🔑 Encoding KEYFRAME")
+            encoder.logger.debug("🔑 Encoding KEYFRAME")
             if let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer) {
                 if let parameterSets = encoder.extractParameterSets(from: formatDescription) {
                     packetData.append(parameterSets)
-                    encoder.logger.info("🔑 Prepending SPS/PPS (\(parameterSets.count) bytes) to keyframe")
+                    encoder.logger.debug("🔑 Prepending SPS/PPS (\(parameterSets.count) bytes) to keyframe")
                 }
             }
         }
@@ -389,7 +398,7 @@ class VideoEncoder {
         packetData.append(annexBData)
         
         if isKeyFrame {
-            encoder.logger.info("🔑 Sending keyframe packet: \(packetData.count) bytes (SPS/PPS + frame)")
+            encoder.logger.debug("🔑 Sending keyframe packet: \(packetData.count) bytes (SPS/PPS + frame)")
         }
         
         encoder.delegate?.videoEncoder(encoder, didOutput: packetData, isKeyFrame: isKeyFrame, timestamp: timestamp)

@@ -110,6 +110,27 @@ class LocalCastService: ObservableObject {
                     self.applyTuningToHostSession()
                 }
             }
+
+        observeWake()
+    }
+
+    /// Restart hosting after system wake. Sleep kills the UDP listener and
+    /// orphans the dns-sd registration while `isHosting` stays true, so a
+    /// woken host looked like it was hosting but could not accept a viewer.
+    /// This is what made lid-closed (Wake on Demand) connections fail even
+    /// after the Mac itself woke: the client's knock woke the machine, but
+    /// TidalDrift never came back up on port 5904. The peer-discovery service
+    /// already re-advertises on wake; this does the same for LocalCast.
+    private func observeWake() {
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.isHosting else { return }
+                self.logger.info("⏰ Woke from sleep — restarting LocalCast hosting and advertisement")
+                await self.restartHostingToApplySettings()
+            }
+        }
     }
     
     /// Push current tuning values to the active host session.

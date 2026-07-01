@@ -445,6 +445,9 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         decodeQueue.async { [weak self] in
             self?.decoder.invalidate()
         }
+        // Stop the display link; without this the viewer kept a 60-120 Hz draw
+        // loop alive presenting the frozen last frame after disconnect.
+        renderer?.setPaused(true, reason: .disconnected)
         isConnected = false
         connectionPhase = .disconnected
         connectionStatus = "Disconnected"

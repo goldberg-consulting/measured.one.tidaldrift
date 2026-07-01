@@ -134,9 +134,17 @@ class WakeOnLANService {
     }
 
     func prepareForConnection(to device: DiscoveredDevice, service: DiscoveredDevice.ServiceType, timeout: TimeInterval = 30) async {
-        guard shouldAutoWakeBeforeConnect,
-              !device.isOnline,
-              device.storedMACAddress != nil else {
+        guard shouldAutoWakeBeforeConnect else { return }
+
+        // `isOnline` is lastSeen age, and a sleeping Mac's Bonjour records are
+        // kept alive by the network's sleep proxy, so sleeping hosts routinely
+        // look online here. Always knock the screen-sharing port first: on an
+        // awake host the TCP connect resolves in milliseconds and costs
+        // nothing; on a sleeping host the knock is exactly what prompts the
+        // sleep proxy to wake it (Apple Screen Sharing wakes Macs this way).
+        // Only the slow wake-and-poll path stays gated on looking offline.
+        if device.isOnline {
+            await triggerWakeOnDemand(to: device, timeout: 1.5)
             return
         }
 
@@ -146,7 +154,71 @@ class WakeOnLANService {
             Task { @MainActor in WakeProgressTracker.shared.end(token) }
         }
 
-        _ = await wakeAndWait(device: device, service: service, timeout: timeout)
+        // Replicate Apple Screen Sharing: a TCP knock on the screen-sharing port
+        // prompts the network's Bonjour sleep proxy to wake the host. This works
+        // even with no stored MAC, which is the common case for a Mac that has
+        // been asleep (its ARP entry has aged out, so we never learned the MAC).
+        await triggerWakeOnDemand(to: device)
+
+        // When we do know the MAC, also send a WOL magic packet as a fallback for
+        // networks without a sleep proxy.
+        if let macAddress = device.storedMACAddress {
+            _ = await wakeBroadly(macAddress: macAddress)
+        }
+
+        // Poll until the host is reachable for the requested service.
+        let startTime = Date()
+        while Date().timeIntervalSince(startTime) < timeout {
+            if await isDeviceReachableAfterWake(device, service: service) {
+                return
+            }
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+        }
+    }
+
+    // MARK: - Wake on Demand (Bonjour sleep proxy)
+
+    /// TCP port for the macOS Screen Sharing / RFB service. A network's Bonjour
+    /// sleep proxy wakes a sleeping host when it sees an inbound connection to
+    /// this port, which is how Apple Screen Sharing wakes a sleeping Mac.
+    private static let screenSharingPort: UInt16 = 5900
+
+    private let wakeOnDemandQueue = DispatchQueue(label: "com.tidaldrift.wakeOnDemand")
+
+    /// Trigger a Bonjour Wake on Demand by briefly opening a TCP connection to
+    /// the host's screen-sharing port. The act of attempting the connection is
+    /// what prompts the network sleep proxy to wake the host; the connection
+    /// does not need to fully succeed and no stored MAC address is required.
+    /// The connection is always cancelled once it becomes ready, fails, or the
+    /// timeout elapses, so it never blocks the connect flow.
+    private func triggerWakeOnDemand(to device: DiscoveredDevice, port: UInt16 = WakeOnLANService.screenSharingPort, timeout: TimeInterval = 3) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            guard let nwPort = NWEndpoint.Port(rawValue: port) else {
+                continuation.resume()
+                return
+            }
+
+            let connection = NWConnection(host: NWEndpoint.Host(device.ipAddress), port: nwPort, using: .tcp)
+            let didResume = AtomicFlag()
+
+            let finish: @Sendable () -> Void = {
+                guard didResume.compareAndSwap(expected: false, desired: true) else { return }
+                connection.cancel()
+                continuation.resume()
+            }
+
+            connection.stateUpdateHandler = { state in
+                switch state {
+                case .ready, .failed, .cancelled:
+                    finish()
+                default:
+                    break
+                }
+            }
+
+            connection.start(queue: wakeOnDemandQueue)
+            wakeOnDemandQueue.asyncAfter(deadline: .now() + timeout, execute: finish)
+        }
     }
 
     // MARK: - MAC Address Parsing
@@ -351,7 +423,10 @@ class WakeOnLANService {
         case .ssh:
             return await NetworkDiscoveryService.shared.scanIP(device.ipAddress, port: 22)
         case .localCast:
-            return await NetworkDiscoveryService.shared.scanIP(device.ipAddress, port: Int(LocalCastConfiguration.hostPort))
+            // LocalCast listens on UDP 5904, which a TCP scan can never confirm.
+            // Once the Mac is awake its LocalCast host resumes and screensharingd
+            // is reachable, so TCP 5900 is the reliable "host is awake" signal.
+            return await NetworkDiscoveryService.shared.scanIP(device.ipAddress, port: Int(WakeOnLANService.screenSharingPort))
         case .tidalDrop:
             return await NetworkDiscoveryService.shared.scanIP(device.ipAddress, port: 5902)
         }

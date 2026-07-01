@@ -82,6 +82,38 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     private var canvasMode = false
     private var canvasTexture: MTLTexture?
 
+    /// Set whenever the canvas contents change (tile blit, full-frame heal,
+    /// resize), cleared after the canvas is presented. Lets the draw loop skip
+    /// GPU passes on ticks where nothing changed. Main thread only, like all
+    /// canvas mutations.
+    private var canvasDirty = false
+
+    // MARK: - Pause control
+    //
+    // The MTKView display link runs continuously while streaming (the jitter
+    // buffer paces against it), but there is no reason to keep it firing when
+    // the session is disconnected or the window is not visible. Reasons are
+    // independent so occlusion and disconnect cannot stomp each other's state.
+    // Main thread only.
+    enum PauseReason: Hashable {
+        case disconnected
+        case notVisible
+    }
+    private var pauseReasons: Set<PauseReason> = []
+
+    /// Add or remove a pause reason; the view is paused while any reason holds.
+    func setPaused(_ paused: Bool, reason: PauseReason) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if paused {
+                self.pauseReasons.insert(reason)
+            } else {
+                self.pauseReasons.remove(reason)
+            }
+            self.mtkView.isPaused = !self.pauseReasons.isEmpty
+        }
+    }
+
     /// Current jitter-buffer depth (frames queued), for the stats HUD.
     var currentBufferDepth: Int {
         frameQueueLock.lock(); defer { frameQueueLock.unlock() }
@@ -399,6 +431,9 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         frameQueueLock.unlock()
 
         frameCount += 1
+        // A live frame means the stream is (back) up; clear any disconnect
+        // pause so the display link resumes presenting.
+        setPaused(false, reason: .disconnected)
         if !hasLoggedSuccess {
             logger.info("🖥️ MetalRenderer: First frame received! \(width)x\(height)")
             hasLoggedSuccess = true
@@ -433,21 +468,31 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     func draw(in view: MTKView) {
         guard pipelineState != nil else { return }
 
-        // Region-aware: present the persistent canvas every tick (always BGRA).
+        // A display tick only needs a GPU pass when there is something new: a
+        // freshly dequeued frame, a canvas update, or a drawable resize.
+        // Re-presenting the identical texture every tick ran a full render +
+        // present at up to 120 Hz on a static or disconnected stream, which was
+        // the client's dominant CPU/GPU heat source. The drawable retains its
+        // last contents between presents, so skipping is visually a no-op.
+        let sizeChanged = view.drawableSize != lastDrawableSize
+
+        // Region-aware: present the persistent canvas only when it changed.
         if canvasMode {
             guard let canvas = canvasTexture else { return }
+            if !canvasDirty && !sizeChanged { return }
+            canvasDirty = false
             presentTexture(canvas, chroma: nil, srcWidth: canvas.width, srcHeight: canvas.height, in: view, retain: nil)
             return
         }
 
         // Pacing: release one buffered frame per measured source interval, after
-        // priming to the adaptive target depth. Between releases (or on underrun)
-        // re-present the last frame so the display tick always has content.
+        // priming to the adaptive target depth.
         let now = CACurrentMediaTime()
         frameQueueLock.lock()
         if !primed, frameQueue.count >= targetDepth {
             primed = true
         }
+        var dequeuedNewFrame = false
         if primed {
             let interval = max(arrivalIntervalEWMA, 1.0 / 120.0)
             // Low latency: with at most one queued frame there is no backlog to
@@ -465,6 +510,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
                 } else {
                     lastPresentedFrame = frameQueue.removeFirst()
                     lastPresentTime = now
+                    dequeuedNewFrame = true
                 }
             }
         }
@@ -472,6 +518,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         frameQueueLock.unlock()
 
         guard let frame = frame else { return }
+        if !dequeuedNewFrame && !sizeChanged { return }
         presentTexture(frame.texture, chroma: frame.chromaTexture, srcWidth: frame.width, srcHeight: frame.height, in: view, retain: frame)
     }
 
@@ -695,5 +742,6 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         blit.endEncoding()
         if let retain { cb.addCompletedHandler { _ in _ = retain } }
         cb.commit()
+        canvasDirty = true
     }
 }
