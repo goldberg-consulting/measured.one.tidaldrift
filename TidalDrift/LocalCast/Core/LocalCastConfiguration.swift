@@ -106,11 +106,15 @@ struct LocalCastConfiguration: Codable {
 
     /// Bitrate ceiling for the Fast LAN transport profile. A wired 10GbE link is
     /// not bandwidth constrained, so target well above the Wi-Fi tuned preset to
-    /// keep the image sharp. Never lower than the preset's own bitrate. 250 Mbps
-    /// HEVC at 5K/60 is visually near-lossless for desktop content; the hardware
-    /// encoder and the (now off-callback-thread) transport both sustain it.
+    /// keep the image sharp. Never lower than the preset's own bitrate.
+    ///
+    /// 150 is the proven default: raising this to 250 made unpaced keyframe
+    /// bursts large enough that switch/NIC buffers shed fragments and the
+    /// viewer never got a decodable keyframe (blank window, endless keyframe
+    /// requests). Large frames are now micro-paced even in Fast LAN, so users
+    /// who want more can push 200-400 via the manual bitrate override.
     var fastLANBitrateMbps: Int {
-        max(bitrateMbps, 250)
+        max(bitrateMbps, 150)
     }
     
     /// Maximum capture dimension (longest edge). A user override (if set) wins;

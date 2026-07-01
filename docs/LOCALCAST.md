@@ -241,6 +241,24 @@ Jellyfin-ffmpeg builds), but Apple Silicon has no hardware AV1 *encoder* exposed
 to VideoToolbox, and software AV1 is too slow for interactive Mac-to-Mac. HEVC
 remains the target codec; AV1 is a deferred research spike, not a dependency.
 
+### Fix 10: blank viewer at 250 Mbps Fast LAN (1.6.49)
+
+1.6.48's Fast LAN bitrate raise (150 → 250 Mbps) regressed connect: the viewer
+window opened but stayed blank, with the host logging an endless keyframe
+retry loop (each keyframe request answered, no keyframe ever decoded). Root
+cause: Fast LAN sends unpaced, and at 250 Mbps the connect keyframe became a
+multi-thousand-datagram back-to-back blast that overran NIC/switch buffers
+even on a clean 10GbE path. One lost fragment makes the whole keyframe
+undecodable, and every retry blasted the same way.
+
+- Fast LAN target reverted to the proven 150 Mbps default (users can still
+  push 200-400 via the manual bitrate override).
+- Fast LAN now **micro-paces large frames**: frames over 256 fragments drain
+  in ~90 KB bursts with a 250 µs gap (~3 Gbps instantaneous ceiling, a 2 MB
+  keyframe drains in ~6 ms). Ordinary P-frames remain unpaced for lowest
+  latency. `paceFragments` takes batch/gap parameters so the resilient Wi-Fi
+  profile is unchanged.
+
 ### Fix 9: mid-stream freeze recovery + wired-link headroom (1.6.48)
 
 Freeze diagnosis from a live session (host logs showed `Stream stopped with
