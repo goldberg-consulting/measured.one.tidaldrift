@@ -193,9 +193,69 @@ struct TroubleshootingView: View {
             Text("Use this if connections aren't working. It restarts the Screen Sharing service and resets permission caches.")
                 .font(.caption)
                 .foregroundColor(.secondary)
+
+            Divider()
+
+            coreAudioRow
         }
         .padding()
         .background(RoundedRectangle(cornerRadius: 12).fill(Color.orange.opacity(0.1)))
+        .task {
+            await healthService.refreshCoreAudioUsage()
+        }
+    }
+
+    private var coreAudioRow: some View {
+        HStack(spacing: 16) {
+            Button {
+                Task {
+                    _ = await healthService.restartCoreAudio()
+                }
+            } label: {
+                HStack {
+                    if healthService.isRestartingCoreAudio {
+                        ProgressView()
+                            .scaleEffect(0.8)
+                    } else {
+                        Image(systemName: "speaker.wave.2.circle")
+                    }
+                    Text("Restart Core Audio")
+                }
+                .frame(minWidth: 180)
+            }
+            .buttonStyle(.bordered)
+            .disabled(healthService.isRestartingCoreAudio)
+            .help("Restarts coreaudiod (admin password required). Audio resumes automatically; use when coreaudiod CPU stays high during or after a screen sharing session.")
+
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    if let cpu = healthService.coreAudioCPUPercent {
+                        Circle()
+                            .fill(cpu > 20 ? Color.red : (cpu > 8 ? Color.orange : Color.green))
+                            .frame(width: 8, height: 8)
+                        Text("coreaudiod CPU: \(cpu, specifier: "%.1f")%")
+                            .font(.caption)
+                    } else {
+                        Text("coreaudiod CPU: —")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    Button {
+                        Task { await healthService.refreshCoreAudioUsage() }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Refresh coreaudiod CPU reading")
+                }
+
+                Text("macOS Screen Sharing forwards system audio through coreaudiod; a stale audio tap can pin it after a session. Restarting clears it. TidalDrift's Metal stream is video-only and never opens an audio tap.")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 
     private func statusDot(_ success: Bool, _ label: String) -> some View {
