@@ -99,6 +99,55 @@ class PermissionHealthService: ObservableObject {
         }.value
     }
 
+    // MARK: - Core Audio (coreaudiod spikes during screen sharing)
+
+    /// coreaudiod CPU as last sampled by `refreshCoreAudioUsage()`. Nil until
+    /// the first sample completes.
+    @Published var coreAudioCPUPercent: Double?
+    @Published var isRestartingCoreAudio = false
+
+    /// Sample coreaudiod's current CPU usage. macOS Screen Sharing forwards
+    /// system audio through coreaudiod (High Performance mode on macOS 14+),
+    /// and a tap left behind by a dead session can pin it long after the
+    /// session ends. This gives the Troubleshooting view a live readout.
+    func refreshCoreAudioUsage() async {
+        let usage: Double? = await Task.detached(priority: .utility) {
+            let result = ShellExecutor.execute(executable: "/bin/ps", arguments: ["-axo", "pcpu=,comm="])
+            guard result.exitCode == 0 else { return nil }
+            for line in result.output.split(separator: "\n") {
+                let fields = line.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
+                guard fields.count == 2,
+                      fields[1].hasSuffix("/coreaudiod") || fields[1] == "coreaudiod" else { continue }
+                return Double(fields[0])
+            }
+            return nil
+        }.value
+        coreAudioCPUPercent = usage
+    }
+
+    /// Restart coreaudiod via launchctl (prompts for admin password). The
+    /// daemon relaunches on demand, so system audio resumes within about a
+    /// second; any stale audio tap holding CPU is torn down with it. Never
+    /// invoked automatically: killing coreaudiod mid-call would interrupt
+    /// audio for every app, so this stays behind an explicit user action.
+    func restartCoreAudio() async -> Bool {
+        isRestartingCoreAudio = true
+        defer { isRestartingCoreAudio = false }
+
+        let success: Bool = await Task.detached(priority: .userInitiated) {
+            let result = ShellExecutor.execute("""
+                osascript -e 'do shell script "launchctl kickstart -k system/com.apple.audio.coreaudiod" with administrator privileges' 2>&1
+            """)
+            return result.exitCode == 0
+        }.value
+
+        // Give the daemon a moment to relaunch, then refresh the readout so
+        // the user sees the post-restart usage instead of the stale spike.
+        try? await Task.sleep(nanoseconds: 1_500_000_000)
+        await refreshCoreAudioUsage()
+        return success
+    }
+
     func resetLocalNetwork() -> Bool {
         Self.runTccReset(service: "LocalNetwork", bundle: Self.bundleIdentifier)
     }

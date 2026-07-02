@@ -93,7 +93,34 @@ class UDPTransport {
     
     var sessionKey: SymmetricKey? {
         get { sessionKeyLock.lock(); defer { sessionKeyLock.unlock() }; return _sessionKey }
-        set { sessionKeyLock.lock(); _sessionKey = newValue; sessionKeyLock.unlock() }
+        set {
+            sessionKeyLock.lock(); _sessionKey = newValue; sessionKeyLock.unlock()
+            // A key change means a new session epoch (fresh connect, stage-2
+            // re-auth after a host restart, or teardown). The peer's frame
+            // counter restarts at 1, so a surviving highestFrameId from the
+            // old session would make drop-to-newest discard every frame of
+            // the new one and the viewer would stay frozen after an
+            // otherwise successful re-auth.
+            resetReassemblyState()
+        }
+    }
+
+    /// Drop all partially reassembled frames and re-arm drop-to-newest for a
+    /// fresh sender epoch.
+    private func resetReassemblyState() {
+        fragmentLock.lock()
+        resetReassemblyStateLocked()
+        fragmentLock.unlock()
+    }
+
+    /// Must be called with `fragmentLock` held.
+    private func resetReassemblyStateLocked() {
+        fragmentBuffers.removeAll()
+        fragmentCounts.removeAll()
+        frameDroppable.removeAll()
+        parityBuffers.removeAll()
+        qParityBuffers.removeAll()
+        highestFrameId = 0
     }
     
     private var listener: NWListener?
@@ -133,6 +160,11 @@ class UDPTransport {
     /// LAN so a brief receiver stall during a burst does not manufacture a loss.
     /// Read only on the transport queue under fragmentLock.
     private var inFlightFrameWindow: UInt32 = UDPTransport.defaultInFlightFrameWindow
+
+    /// A droppable frameId this far below the newest cannot be a straggler
+    /// (those trail by at most the in-flight window); it means the sender
+    /// restarted and its counter reset. ~16s of frames at 60fps.
+    static let epochJumpThreshold: UInt32 = 1000
     
     // Safety limits for fragment reassembly
     // Quality-focused encoding at 4K can produce keyframes of 2-5 MB.
@@ -721,12 +753,33 @@ class UDPTransport {
             case .ready:
                 self?.receive(on: connection, endpointKey: endpointKey)
             case .failed(let error):
-                self?.logger.error("UDP outgoing connection failed: \(error.localizedDescription)")
+                // Evict the dead connection so the next send creates a fresh
+                // one. Leaving it cached sent every subsequent heartbeat, auth
+                // retry, and keyframe request into a black hole (with the
+                // receive loop dead too), which is what made reconnect
+                // attempts against a restarted host fail permanently.
+                self?.logger.error("UDP outgoing connection failed: \(error.localizedDescription) — evicting \(endpointKey)")
+                connection.cancel()
+                self?.removeOutgoingConnection(connection, endpointKey: endpointKey)
+            case .cancelled:
+                self?.removeOutgoingConnection(connection, endpointKey: endpointKey)
             default:
                 break
             }
         }
         connection.start(queue: queue)
+    }
+
+    /// Remove a specific outgoing connection. Identity-checked so a stale
+    /// handler firing after a replacement was cached cannot evict the healthy
+    /// replacement, and scoped to `connections` so a live incoming connection
+    /// from the same endpoint is untouched.
+    private func removeOutgoingConnection(_ connection: NWConnection, endpointKey: String) {
+        connectionsLock.lock()
+        if connections[endpointKey] === connection {
+            connections.removeValue(forKey: endpointKey)
+        }
+        connectionsLock.unlock()
     }
     
     private func receive(on connection: NWConnection, endpointKey: String) {
@@ -807,6 +860,20 @@ class UDPTransport {
         let droppable = (header.frameId & Self.droppableFrameFlag) != 0
         let realFrameId = header.frameId & ~Self.droppableFrameFlag
 
+        // Sender-restart (epoch) detection. A restarted host's frame counter
+        // begins again at 1. On keyed sessions the re-auth key change already
+        // resets reassembly, but keyless sessions get no such signal, and
+        // without this every frame of the new session would be rejected as
+        // ancient. A genuine straggler trails the newest frame by at most the
+        // in-flight window, so a frame this far behind can only be a new epoch.
+        if droppable,
+           highestFrameId > Self.epochJumpThreshold,
+           realFrameId + Self.epochJumpThreshold < highestFrameId {
+            logger.info("🔄 Frame counter jumped backward (\(realFrameId) << \(self.highestFrameId)) — sender restarted, adopting new epoch")
+            resetReassemblyStateLocked()
+            highestFrameId = realFrameId
+        }
+
         // Drop-to-newest: a droppable frame that fell behind the newest by more
         // than the in-flight window will never complete (its siblings were
         // pruned), so ignore a late fragment instead of resurrecting it.
@@ -880,21 +947,23 @@ class UDPTransport {
         let total = Int(fragmentCounts[realFrameId] ?? 0)
         
         if total > 0, received == total {
-            // Reassemble
-            var fullData = Data()
-            for i in 0..<UInt16(total) {
-                if let fragmentData = fragmentBuffers[realFrameId]?[i] {
-                    fullData.append(fragmentData)
-                }
-            }
-            
-            // Clean up
-            fragmentBuffers.removeValue(forKey: realFrameId)
+            // Take the fragments out under the lock, but do the multi-megabyte
+            // concatenation after releasing it. Growing an unreserved Data by
+            // repeated append while holding fragmentLock stalled every other
+            // incoming fragment for the duration of a keyframe reassembly.
+            let fragments = fragmentBuffers.removeValue(forKey: realFrameId) ?? [:]
             fragmentCounts.removeValue(forKey: realFrameId)
             frameDroppable.removeValue(forKey: realFrameId)
             parityBuffers.removeValue(forKey: realFrameId)
             qParityBuffers.removeValue(forKey: realFrameId)
             fragmentLock.unlock()
+
+            var fullData = Data(capacity: fragments.values.reduce(0) { $0 + $1.count })
+            for i in 0..<UInt16(total) {
+                if let fragmentData = fragments[i] {
+                    fullData.append(fragmentData)
+                }
+            }
             
             // Parse and deliver (decrypt if needed)
             if let (packet, wasAuthenticated) = decryptAndParse(fullData) {
@@ -1019,13 +1088,23 @@ class UDPTransport {
         return p
     }
 
-    private static func gfInv(_ a: UInt8) -> UInt8 {
-        guard a != 0 else { return 0 }
-        var result: UInt8 = 1
-        for _ in 0..<254 {
-            result = gfMul(result, a)
+    /// Precomputed GF(256) inverses. The naive a^254 computation cost 254
+    /// multiplications per recovered FEC block on the receive queue; this is
+    /// a 256-byte table built once.
+    private static let gfInverseTable: [UInt8] = {
+        var table = [UInt8](repeating: 0, count: 256)
+        for a in 1...255 {
+            var result: UInt8 = 1
+            for _ in 0..<254 {
+                result = gfMul(result, UInt8(a))
+            }
+            table[a] = result
         }
-        return result
+        return table
+    }()
+
+    private static func gfInv(_ a: UInt8) -> UInt8 {
+        gfInverseTable[Int(a)]
     }
 
     /// Strip the encryption/plaintext prefix and decrypt if needed, then parse.

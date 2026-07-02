@@ -89,6 +89,23 @@ class LocalCastService: ObservableObject {
     private var tuningSubscription: AnyCancellable?
     private var advertisementProcess: Process?
     private let serviceType = "_tidaldrift-cast._udp"
+
+    /// Watchdog state for the dns-sd advertisement. The registration lives
+    /// only as long as the helper process, and the TXT `ip=` (which client
+    /// discovery prefers over a hostname resolve) is baked in at launch. The
+    /// peer beacon (TidalDriftPeerService) already hardens against both
+    /// failure modes; the LocalCast ad previously had neither, so a dead
+    /// helper or a DHCP change silently made the host undiscoverable or
+    /// advertised a stale address while `isHosting` stayed true.
+    private var advertisementMonitor: Timer?
+    private var advertisedIP: String?
+    private var advertisedAuthEnabled = false
+
+    /// In-flight teardown from `stopHosting`. `startHosting` awaits it so a
+    /// quick stop-then-start cannot bind a second listener on port 5904 while
+    /// the old one is still closing (two live UDP listeners on one port
+    /// mis-deliver datagrams).
+    private var stopTask: Task<Void, Never>?
     
     /// Strong references to active viewer window controllers so they (and their
     /// input-capture event monitors) survive for the lifetime of the window.
@@ -196,6 +213,10 @@ class LocalCastService: ObservableObject {
     }
 
     private func startHosting(target: HostCaptureTarget) async throws {
+        // Let any in-flight stop release port 5904 before rebinding.
+        await stopTask?.value
+        stopTask = nil
+
         currentHostTarget = target
         let permissions = LocalCastPermissions()
 
@@ -335,7 +356,7 @@ class LocalCastService: ObservableObject {
 
         let session = self.hostSession
         self.hostSession = nil
-        Task {
+        stopTask = Task {
             await session?.stop()
         }
 
@@ -367,17 +388,54 @@ class LocalCastService: ObservableObject {
         do {
             try process.run()
             self.advertisementProcess = process
+            self.advertisedIP = ip
+            self.advertisedAuthEnabled = authEnabled
             logger.info("LocalCast advertised: \(displayName) on port \(port) [\(codec), \(self.configuration.targetFrameRate)fps, ip=\(ip)]")
         } catch {
             logger.error("Failed to start Bonjour advertisement: \(error.localizedDescription)")
         }
+
+        startAdvertisementMonitor()
+    }
+
+    /// Watchdog: relaunch the advertisement when the helper dies and
+    /// re-register it when the local IP changes out from under the TXT `ip=`.
+    private func startAdvertisementMonitor() {
+        advertisementMonitor?.invalidate()
+        advertisementMonitor = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.checkAdvertisementHealth()
+            }
+        }
+    }
+
+    private func checkAdvertisementHealth() {
+        guard isHosting else { return }
+
+        if let process = advertisementProcess, !process.isRunning {
+            logger.warning("LocalCast advertisement helper died (exit \(process.terminationStatus)) — relaunching")
+            advertiseLocalCast(port: LocalCastConfiguration.hostPort, authEnabled: advertisedAuthEnabled)
+            return
+        }
+        if advertisementProcess == nil {
+            logger.warning("LocalCast advertisement missing while hosting — relaunching")
+            advertiseLocalCast(port: LocalCastConfiguration.hostPort, authEnabled: advertisedAuthEnabled)
+            return
+        }
+        if let current = NetworkUtils.getLocalIPAddress(), current != advertisedIP {
+            logger.info("Local IP changed (\(self.advertisedIP ?? "nil") → \(current)) — re-advertising LocalCast")
+            advertiseLocalCast(port: LocalCastConfiguration.hostPort, authEnabled: advertisedAuthEnabled)
+        }
     }
 
     private func stopAdvertisement() {
+        advertisementMonitor?.invalidate()
+        advertisementMonitor = nil
         if let process = advertisementProcess, process.isRunning {
             process.terminate()
         }
         advertisementProcess = nil
+        advertisedIP = nil
     }
 
     // MARK: - Client Mode
