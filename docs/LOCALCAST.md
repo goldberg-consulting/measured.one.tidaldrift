@@ -241,6 +241,45 @@ Jellyfin-ffmpeg builds), but Apple Silicon has no hardware AV1 *encoder* exposed
 to VideoToolbox, and software AV1 is too slow for interactive Mac-to-Mac. HEVC
 remains the target codec; AV1 is a deferred research spike, not a dependency.
 
+### Fix 11: display-reconfig recovery, thermal throttle, faster connect/discovery (1.6.50)
+
+Symptom set from running Apple Screen Sharing and LocalCast together: the
+stream froze while both were active, and after the Apple session ended the
+host display mode reverted but the stream kept the stale resolution, so the
+viewer's normalized input mapped through the wrong aspect ratio and the
+cursor landed off-target. Root cause: nothing observed display
+reconfiguration. Apple Screen Sharing changes the host's display mode
+(dynamic resolution) on connect and disconnect; SCStream sometimes dies
+(already handled reactively) but can also keep delivering frames scaled for
+the old mode, which never trips `didFailWithError`.
+
+- **Proactive display-change rebuild (host).** `HostSession` observes
+  `NSApplication.didChangeScreenParametersNotification`, debounces 1 s (a
+  Screen Sharing connect fires several parameter changes back to back), then
+  retargets the live capture to the same target. That re-reads the display
+  mode / window bounds, rebuilds the encoder at the new size, refreshes
+  `InputInjector.captureBounds`, and forces keyframes. Known-recoverable, so
+  it also resets the capture-failure retry budget.
+- **Thermal throttle (host, `localCastThermalThrottle`, default on).** The
+  host observes `ProcessInfo.thermalState`: serious caps the stream at
+  30 fps and half bitrate; critical at 15 fps and quarter bitrate; caps lift
+  automatically when pressure clears. Applied on the adaptive queue through
+  the same `updateLiveParameters`/`updateFrameRate` path as user tuning, and
+  re-imposed after any capture rebuild. Toggle in Metal Streaming settings.
+- **Faster share initiation.** The pre-connect wake knock for hosts that
+  look online is now fire-and-forget (sending the SYN is what wakes the
+  host), removing up to 1.5 s from every VNC/LocalCast connect.
+  `ConnectionResolver`'s ipFirst strategy races the cached-IP probe against
+  the mDNS hostname lookup instead of running them serially, so a stale IP
+  costs the slower of the two rather than their sum.
+- **Faster discovery.** Blocking `dns-sd -L` forks and `getaddrinfo` calls
+  moved off the serial discovery queue onto a dedicated concurrent resolve
+  queue, so browse events and the publish debounce no longer wait up to 5 s
+  behind a single lookup (the main cause of peers appearing late and
+  intermittently). LocalCast resolves now use the advertised TXT `ip=`
+  directly when present, skipping the hostname walk entirely. Manual refresh
+  also clears the hostname-resolve cooldown so it re-resolves immediately.
+
 ### Fix 10: blank viewer at 250 Mbps Fast LAN (1.6.49)
 
 1.6.48's Fast LAN bitrate raise (150 → 250 Mbps) regressed connect: the viewer

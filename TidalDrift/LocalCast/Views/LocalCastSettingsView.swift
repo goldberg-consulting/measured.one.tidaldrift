@@ -16,6 +16,7 @@ struct LocalCastSettingsView: View {
     @AppStorage("localCastLatencyMode") var latencyMode: LocalCastConfiguration.LatencyMode = .low
     @AppStorage("localCastCaptureCursor") var captureCursor = false
     @AppStorage("localCastTransportProfile") var transportProfile: LocalCastConfiguration.TransportProfile = .auto
+    @AppStorage("localCastThermalThrottle") var thermalThrottle = true
     
     @State private var hostPassword = ""
     @State private var isRestartingStream = false
@@ -161,6 +162,9 @@ struct LocalCastSettingsView: View {
                     Toggle("Show remote cursor in stream", isOn: $captureCursor)
                         .help("Composites the host's cursor into the video. Off (default), your local cursor is the pointer, removing the network round trip from pointer motion. Turn on for view-only sessions. Applies live on macOS 14+, otherwise next session.")
 
+                    Toggle("Thermal throttling", isOn: $thermalThrottle)
+                        .help("When macOS reports thermal pressure, automatically lowers the stream's frame rate and bitrate (30 fps / half bitrate at serious, 15 fps / quarter bitrate at critical) so the host cools down, then restores quality. Host-side; applies live.")
+
                     Text("On lossy Wi-Fi these keep motion smooth and recover quickly. On a clean wired link they have little effect. Turn them off to force fixed-bitrate, play-everything behavior.")
                         .font(.caption)
                         .foregroundColor(.secondary)
@@ -275,6 +279,7 @@ struct LocalCastSettingsView: View {
         .onChange(of: regionAware) { _ in service.applyLiveResilienceSettingsFromDefaults() }
         .onChange(of: captureCursor) { _ in service.applyLiveResilienceSettingsFromDefaults() }
         .onChange(of: transportProfile) { _ in service.applyLiveResilienceSettingsFromDefaults() }
+        .onChange(of: thermalThrottle) { _ in service.applyLiveResilienceSettingsFromDefaults() }
         // Codec and resolution need a fresh capture/encoder session, but the user
         // shouldn't have to find and click a button. Re-apply them automatically
         // (debounced) so changing them while hosting "just works".
