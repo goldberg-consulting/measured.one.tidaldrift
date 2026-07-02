@@ -285,6 +285,13 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
         config.pixelFormat = regionAwareCapture ? kCVPixelFormatType_32BGRA : kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
         config.colorSpaceName = CGColorSpace.sRGB
         config.showsCursor = captureCursor
+        // LocalCast is video-only (LocalCastConfiguration.captureAudio is a
+        // future flag). Pin both audio knobs explicitly so an SCStream never
+        // registers a Core Audio tap on this host: coreaudiod taps created by
+        // screen capture are a known CPU-spike source, and relying on the OS
+        // default leaves us exposed if a macOS release changes it.
+        config.capturesAudio = false
+        config.excludesCurrentProcessAudio = true
         activeConfig = config
         
         logger.info("Creating SCStream for \(description)...")
@@ -361,12 +368,19 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func stopCapture() async {
+        // Detach the stream state first so it is cleared even when the stop
+        // call throws. Leaving `stream` set after a failed stop meant a later
+        // startStream retried the failing stop and then overwrote the field
+        // anyway, leaking a live SCStream that kept delivering stale frames.
+        let current = stream
+        stream = nil
+        activeConfig = nil
+        captureMode = nil
+        captureBounds = nil
+        guard let current else { return }
+
         do {
-            try await stream?.stopCapture()
-            stream = nil
-            activeConfig = nil
-            captureMode = nil
-            captureBounds = nil
+            try await current.stopCapture()
             logger.info("Stopped screen capture")
         } catch {
             logger.error("Failed to stop screen capture: \(error.localizedDescription)")

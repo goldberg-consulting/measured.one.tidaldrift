@@ -124,6 +124,12 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
     /// (keyed sessions only).
     private static let stage2StallThreshold: TimeInterval = 6.0
 
+    /// Media stale for this long while pongs stay fresh means the host's
+    /// pipeline died with its listener alive; nudge it with a keyframe request.
+    private static let mediaStallNudgeThreshold: TimeInterval = 5.0
+    private static let mediaStallNudgeInterval: TimeInterval = 3.0
+    private var lastMediaStallNudge: Date = .distantPast
+
     /// Floor between authRequest re-drives so a persistent stall cannot storm
     /// the host.
     private static let reauthMinInterval: TimeInterval = 3.0
@@ -150,6 +156,15 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
 
     /// Our 32-byte nonce used during the auth handshake.
     private var clientNonce: Data?
+
+    /// True once the host's authChallenge for the current nonce arrived; stops
+    /// the authRequest retransmit chain.
+    private var authChallengeReceived = false
+
+    /// True once authSuccess has been processed for the current handshake, so
+    /// the host's duplicate authSuccess resends do not restart the post-auth
+    /// flow.
+    private var postAuthFlowStarted = false
 
     /// Whether we're currently waiting for auth to complete.
     @Published var isAuthenticating = false
@@ -286,13 +301,22 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
 
     // MARK: - Auth Handshake (Client Side)
 
-    /// Step 1: generate clientNonce and send authRequest.
+    /// Step 1: generate clientNonce and send authRequest, with retransmits.
+    /// authRequest is a single UDP datagram; without retries one lost packet
+    /// left the client stuck in "Authenticating..." until the diagnostic timer
+    /// misdiagnosed it as a firewall problem. The same nonce is reused across
+    /// retries so a late first challenge still matches the stored nonce.
     private func sendAuthRequest() {
         guard let endpoint = hostEndpoint else { return }
 
         let nonce = SessionCrypto.generateNonce()
         self.clientNonce = nonce
+        authChallengeReceived = false
+        postAuthFlowStarted = false
+        transmitAuthRequest(nonce: nonce, to: endpoint, attempt: 1)
+    }
 
+    private func transmitAuthRequest(nonce: Data, to endpoint: NWEndpoint, attempt: Int) {
         let packet = LocalCastPacket(
             type: .authRequest,
             sequenceNumber: 0,
@@ -300,7 +324,16 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             payload: nonce
         )
         transport.send(packet: packet, to: endpoint)
-        logger.info("🔐 Sent authRequest with 32-byte nonce")
+        logger.info("🔐 Sent authRequest with 32-byte nonce (attempt \(attempt))")
+
+        guard attempt < 4 else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self,
+                  self.isAuthenticating,
+                  !self.authChallengeReceived,
+                  self.clientNonce == nonce else { return }
+            self.transmitAuthRequest(nonce: nonce, to: endpoint, attempt: attempt + 1)
+        }
     }
 
     /// Step 2: handle authChallenge from host.
@@ -313,6 +346,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             logger.warning("🔐 authChallenge received but no password or nonce stored")
             return
         }
+        authChallengeReceived = true
 
         // Extract hostNonce (first 32 bytes) and encrypted session key (rest)
         let hostNonce = payload.prefix(32)
@@ -382,6 +416,11 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             logger.warning("🔐 authSuccess received but no session key installed")
             return
         }
+
+        // The host resends authSuccess a couple of times (it is a single UDP
+        // datagram); only the first one should drive the post-auth flow.
+        guard !postAuthFlowStarted else { return }
+        postAuthFlowStarted = true
 
         logger.info("🔐 ✅ Authenticated — encryption enabled")
 
@@ -492,12 +531,13 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
 
         // Reliability: clicks and keystrokes must not be lost on a lossy UDP
         // link (a dropped click is very noticeable). Send these a few times; the
-        // host dedups by sequence number so they fire exactly once. Moves/drags
-        // are idempotent and high-rate, so a single send is fine (the next move
-        // corrects any loss).
+        // host dedups by sequence number so they fire exactly once. Moves, drags,
+        // and scrolls are idempotent and high-rate, so a single send is fine
+        // (the next event corrects any loss); tripling scroll tripled packet
+        // load during scrolling on the same link the video is fighting for.
         let copies: Int
         switch input {
-        case .mouseDown, .mouseUp, .keyDown, .keyUp, .scroll:
+        case .mouseDown, .mouseUp, .keyDown, .keyUp:
             copies = 3
         default:
             copies = 1
@@ -548,7 +588,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
     private static let lossKeyframeMinInterval: TimeInterval = 0.3
 
     func udpTransportDidLoseFrames(_ transport: UDPTransport) {
-        lostFrameCount += 1
+        noteLostFrame()
         guard lossRecoveryEnabled, isConnected else { return }
         let now = Date()
         guard now.timeIntervalSince(lastLossKeyframeRequest) >= Self.lossKeyframeMinInterval else { return }
@@ -746,10 +786,49 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         mediaClockLock.unlock()
     }
 
-    private func recordMediaReceived(_ date: Date) {
+    // MARK: - Stats window
+    //
+    // The counters below are incremented on the decode queue (frames, tiles,
+    // bytes) and the transport queue (losses), and read+reset by the 1s stats
+    // tick on the main runloop. They share `mediaClockLock` with the liveness
+    // timestamps so every stats window is a consistent snapshot; the dropped
+    // count feeds the host's pacing and transport-profile controllers, so a
+    // torn read could flap the Fast LAN decision.
+
+    /// Count a decoded-video payload; returns the running frame count for logging.
+    private func noteVideoFrame(bytes: Int) -> Int {
         mediaClockLock.lock()
-        lastMediaReceivedAt = date
+        defer { mediaClockLock.unlock() }
+        frameCount += 1
+        receivedMediaBytes += bytes
+        lastMediaReceivedAt = Date()
+        return frameCount
+    }
+
+    private func noteTileUpdate(bytes: Int) {
+        mediaClockLock.lock()
+        tileUpdateCount += 1
+        receivedMediaBytes += bytes
+        lastMediaReceivedAt = Date()
         mediaClockLock.unlock()
+    }
+
+    private func noteLostFrame() {
+        mediaClockLock.lock()
+        lostFrameCount += 1
+        mediaClockLock.unlock()
+    }
+
+    /// Snapshot and reset the current stats window atomically.
+    private func takeStatsWindow() -> (frames: Int, tiles: Int, bytes: Int, lost: Int) {
+        mediaClockLock.lock()
+        defer { mediaClockLock.unlock() }
+        let window = (frameCount, tileUpdateCount, receivedMediaBytes, lostFrameCount)
+        frameCount = 0
+        tileUpdateCount = 0
+        receivedMediaBytes = 0
+        lostFrameCount = 0
+        return window
     }
 
     /// Snapshot both liveness timestamps under the lock so the watchdog decides
@@ -781,6 +860,22 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         let (lastPong, lastMedia) = mediaClockSnapshot()
         let pongAge = lastPong.map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude
         let mediaAge = lastMedia.map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude
+
+        // Pipeline-dead detection: a healthy host emits at least one media
+        // frame per second (the idle heartbeat), so fresh pongs with stale
+        // media means the host's capture/encode pipeline died while its UDP
+        // listener stayed up (encoder wedged, capture restart budget
+        // exhausted). Total-silence logic below never fires for this case, so
+        // nudge the host with a keyframe request; it forces a full refresh
+        // and heals any recoverable pipeline stall. Rate-limited so a truly
+        // dead pipeline is poked, not stormed.
+        if mediaAge >= Self.mediaStallNudgeThreshold,
+           pongAge < Self.stage1StallThreshold,
+           now.timeIntervalSince(lastMediaStallNudge) >= Self.mediaStallNudgeInterval {
+            lastMediaStallNudge = now
+            logger.warning("⚠️ Media stalled \(Int(mediaAge))s with live pongs — requesting keyframe to restart host pipeline")
+            requestKeyFrame()
+        }
 
         // Fire only on total silence: both pongs and media stale. A static or
         // low-motion screen produces no new frames for long stretches, but pongs
@@ -879,15 +974,17 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         let now = Date()
         let elapsed = now.timeIntervalSince(lastStatsUpdate)
         guard elapsed >= 1.0 else { return }
+        lastStatsUpdate = now
 
-        let updates = frameCount + tileUpdateCount
-        let mbps = Double(receivedMediaBytes) * 8 / elapsed / 1_000_000
+        let window = takeStatsWindow()
+        let updates = window.frames + window.tiles
+        let mbps = Double(window.bytes) * 8 / elapsed / 1_000_000
         let mode: String
         if updates == 0 {
             mode = "—"
-        } else if tileUpdateCount > 0 && frameCount > 0 {
+        } else if window.tiles > 0 && window.frames > 0 {
             mode = "Mixed"
-        } else if tileUpdateCount > 0 {
+        } else if window.tiles > 0 {
             mode = "Region tiles"
         } else {
             mode = "Full-frame"
@@ -901,18 +998,12 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             resolution: remoteResolution ?? .zero,
             codec: decoder.codecName,
             mode: mode,
-            droppedPerSec: lostFrameCount,
+            droppedPerSec: window.lost,
             bufferDepth: bufferDepth,
             fecRecoveredPerSec: recovered
         )
 
         sendTelemetry(stats)
-
-        frameCount = 0
-        tileUpdateCount = 0
-        receivedMediaBytes = 0
-        lostFrameCount = 0
-        lastStatsUpdate = now
 
         DispatchQueue.main.async { [weak self] in self?.stats = stats }
     }
@@ -951,11 +1042,9 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             let payload = packet.payload
             decodeQueue.async { [weak self] in
                 guard let self else { return }
-                self.frameCount += 1
-                self.recordMediaReceived(Date())
-                self.receivedMediaBytes += payload.count
-                if self.frameCount == 1 || self.frameCount % 60 == 0 {
-                    lcDebug("📦 ClientSession: Received video frame #\(self.frameCount), size: \(payload.count) bytes")
+                let count = self.noteVideoFrame(bytes: payload.count)
+                if count == 1 || count % 60 == 0 {
+                    lcDebug("📦 ClientSession: Received video frame #\(count), size: \(payload.count) bytes")
                 }
                 self.decoder.decode(payload)
 
@@ -981,9 +1070,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             decodeQueue.async { [weak self] in
                 guard let self else { return }
                 if let tile = TileCodec.decode(payload) {
-                    self.tileUpdateCount += 1
-                    self.recordMediaReceived(Date())
-                    self.receivedMediaBytes += payload.count
+                    self.noteTileUpdate(bytes: payload.count)
                     self.renderer?.applyTile(x: tile.x, y: tile.y, width: tile.width, height: tile.height, bgra: tile.bgra)
                     if !self.isConnected {
                         DispatchQueue.main.async { [weak self] in
