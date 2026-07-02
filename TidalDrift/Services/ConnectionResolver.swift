@@ -98,22 +98,17 @@ actor ConnectionResolver {
         
         switch strategy {
         case .hostnameFirst:
-            // Strategy 1: Try mDNS hostname first (most reliable)
-            if let resolved = await tryHostnameResolution(device: device, timeout: timeout / 3) {
+            // Strategy 1: Try mDNS hostname first (most reliable). The old
+            // "fresh IP lookup" second step ran the identical getaddrinfo
+            // call again, burning a third of the timeout budget on a repeat.
+            if let resolved = await tryHostnameResolution(device: device, timeout: timeout / 2) {
                 logger.info("✅ Resolved via mDNS hostname: \(resolved.address)")
                 return resolved
             }
             failedAttempts.append("mDNS hostname")
             
-            // Strategy 2: Try fresh IP lookup via getaddrinfo
-            if let resolved = await tryFreshIPLookup(device: device, timeout: timeout / 3) {
-                logger.info("✅ Resolved via fresh IP lookup: \(resolved.address)")
-                return resolved
-            }
-            failedAttempts.append("Fresh IP lookup")
-            
-            // Strategy 3: Fall back to cached IP (verify connectivity)
-            if let resolved = await tryCachedIP(device: device, timeout: timeout / 3) {
+            // Strategy 2: Fall back to cached IP (verify connectivity)
+            if let resolved = await tryCachedIP(device: device, timeout: timeout / 2) {
                 logger.info("✅ Using verified cached IP: \(resolved.address)")
                 return resolved
             }
@@ -158,16 +153,17 @@ actor ConnectionResolver {
             
             let didResume = AtomicFlag()
             
+            // compareAndSwap is the only safe gate here: the state handler and
+            // the timeout run on different queues, and a read-then-write check
+            // lets both pass and resume the continuation twice (a crash).
             connection.stateUpdateHandler = { state in
                 switch state {
                 case .ready:
-                    guard !didResume.value else { return }
-                    didResume.value = true
+                    guard didResume.compareAndSwap(expected: false, desired: true) else { return }
                     connection.cancel()
                     continuation.resume(returning: true)
                 case .failed, .cancelled:
-                    guard !didResume.value else { return }
-                    didResume.value = true
+                    guard didResume.compareAndSwap(expected: false, desired: true) else { return }
                     continuation.resume(returning: false)
                 default:
                     break
@@ -178,8 +174,7 @@ actor ConnectionResolver {
             
             // Timeout
             DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
-                guard !didResume.value else { return }
-                didResume.value = true
+                guard didResume.compareAndSwap(expected: false, desired: true) else { return }
                 connection.cancel()
                 continuation.resume(returning: false)
             }
@@ -224,17 +219,6 @@ actor ConnectionResolver {
         return await resolveHostnameToIP(localHostname, port: device.port, timeout: timeout)
     }
     
-    /// Try fresh IP lookup via getaddrinfo (bypasses cache)
-    private func tryFreshIPLookup(device: DiscoveredDevice, timeout: TimeInterval) async -> ResolvedAddress? {
-        let hostname = cleanHostname(device.hostname)
-        guard !hostname.isEmpty else { return nil }
-        
-        let localHostname = hostname.hasSuffix(".local") ? hostname : "\(hostname).local"
-        logger.debug("🔍 Trying fresh IP lookup for: \(localHostname)")
-        
-        return await resolveHostnameToIP(localHostname, port: device.port, timeout: timeout)
-    }
-    
     /// Try using cached IP address after verifying connectivity
     private func tryCachedIP(device: DiscoveredDevice, timeout: TimeInterval) async -> ResolvedAddress? {
         let ip = device.ipAddress
@@ -263,31 +247,65 @@ actor ConnectionResolver {
         return nil
     }
     
-    /// Resolve hostname to IP using getaddrinfo
+    /// Dedicated queue for blocking getaddrinfo calls. Concurrent so one slow
+    /// mDNS lookup (which can block 5-30s for a gone host) cannot serialize
+    /// behind another, and off the Swift concurrency cooperative pool so a
+    /// blocked lookup never starves unrelated async work.
+    private static let getaddrinfoQueue = DispatchQueue(
+        label: "com.tidaldrift.resolver.getaddrinfo",
+        qos: .userInitiated,
+        attributes: .concurrent
+    )
+
+    /// Resolve hostname to IP using getaddrinfo, bounded by `timeout`.
+    ///
+    /// The timeout must be decided by whichever child finishes FIRST. The
+    /// previous implementation kept looping past the timeout sentinel and
+    /// awaited the lookup child anyway, so a blocked getaddrinfo held the
+    /// whole connect flow for its full duration (the "connect hangs forever"
+    /// symptom). When the timeout wins, the orphaned lookup finishes later on
+    /// its own queue and is discarded.
     private func resolveHostnameToIP(_ hostname: String, port: Int, timeout: TimeInterval) async -> ResolvedAddress? {
-        return await withTaskGroup(of: ResolvedAddress?.self) { group in
+        enum Outcome {
+            case resolved(ResolvedAddress?)
+            case timedOut
+        }
+        return await withTaskGroup(of: Outcome.self) { group in
             group.addTask {
-                return await self.performGetaddrinfo(hostname: hostname, port: port)
+                .resolved(await self.performGetaddrinfo(hostname: hostname, port: port))
             }
-            
             group.addTask {
                 try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                return nil // Timeout sentinel
+                return .timedOut
             }
-            
-            for await result in group {
-                if let resolved = result {
-                    group.cancelAll()
-                    return resolved
+
+            var resolved: ResolvedAddress?
+            if let first = await group.next() {
+                switch first {
+                case .resolved(let address):
+                    resolved = address
+                case .timedOut:
+                    self.logger.debug("⚠️ getaddrinfo timed out after \(timeout)s for \(hostname)")
+                    resolved = nil
                 }
             }
-            
-            return nil
+            group.cancelAll()
+            return resolved
         }
     }
     
-    /// Actual getaddrinfo call
+    /// Bridge the blocking getaddrinfo onto the dedicated queue.
     private func performGetaddrinfo(hostname: String, port: Int) async -> ResolvedAddress? {
+        let logger = self.logger
+        return await withCheckedContinuation { continuation in
+            Self.getaddrinfoQueue.async {
+                continuation.resume(returning: Self.blockingGetaddrinfo(hostname: hostname, port: port, logger: logger))
+            }
+        }
+    }
+
+    /// Actual getaddrinfo call. Blocking; must only run on `getaddrinfoQueue`.
+    private static func blockingGetaddrinfo(hostname: String, port: Int, logger: Logger) -> ResolvedAddress? {
         var hints = addrinfo()
         hints.ai_family = AF_INET // IPv4
         hints.ai_socktype = SOCK_STREAM

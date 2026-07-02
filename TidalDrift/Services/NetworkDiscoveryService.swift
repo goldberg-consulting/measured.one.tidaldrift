@@ -251,8 +251,13 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         pathMonitor?.start(queue: queue)
     }
 
+    /// True while Bonjour browsing should be running. Gates the failed-browser
+    /// restart path so an intentional stop is not resurrected.
+    private var isBrowsingActive = false
+
     func startBrowsing() {
         guard browsers.isEmpty else { return }
+        isBrowsingActive = true
 
         for serviceType in serviceTypes {
             // Skip UDP services in NWBrowser - use dns-sd instead.
@@ -261,20 +266,7 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
                 continue
             }
 
-            let params = NWParameters()
-            params.includePeerToPeer = true
-
-            let browser = NWBrowser(for: .bonjour(type: serviceType, domain: "local."), using: params)
-
-            browser.stateUpdateHandler = { [weak self] state in
-                self?.handleBrowserState(state, for: serviceType)
-            }
-            browser.browseResultsChangedHandler = { [weak self] results, changes in
-                self?.handleBrowseResults(results, changes: changes, serviceType: serviceType)
-            }
-
-            browser.start(queue: queue)
-            browsers.append(browser)
+            startBrowser(for: serviceType)
         }
 
         // The helper forks `dns-sd`; keep the Process.run off main, but keep
@@ -287,6 +279,42 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         }
 
         lastScanDate = Date()
+    }
+
+    /// Create and start one NWBrowser, wired so a failure recreates it. A
+    /// failed browser (mDNSResponder restart, interface churn on sleep/wake)
+    /// used to just log and stay dead in the `browsers` array, and the
+    /// `guard browsers.isEmpty` in startBrowsing blocked any later restart, so
+    /// discovery for that service type (including TidalDrift peers) was gone
+    /// until app relaunch.
+    private func startBrowser(for serviceType: String) {
+        let params = NWParameters()
+        params.includePeerToPeer = true
+
+        let browser = NWBrowser(for: .bonjour(type: serviceType, domain: "local."), using: params)
+
+        browser.stateUpdateHandler = { [weak self, weak browser] state in
+            guard let self else { return }
+            if case .failed(let error) = state {
+                self.logger.error("Browser failed for \(serviceType): \(error.localizedDescription) — recreating in 2s")
+                browser?.cancel()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self, weak browser] in
+                    guard let self, self.isBrowsingActive else { return }
+                    if let browser {
+                        self.browsers.removeAll { $0 === browser }
+                    }
+                    self.startBrowser(for: serviceType)
+                }
+            } else {
+                self.handleBrowserState(state, for: serviceType)
+            }
+        }
+        browser.browseResultsChangedHandler = { [weak self] results, changes in
+            self?.handleBrowseResults(results, changes: changes, serviceType: serviceType)
+        }
+
+        browser.start(queue: queue)
+        browsers.append(browser)
     }
 
     /// Restart Bonjour browsers after a network path change without wiping
@@ -317,6 +345,12 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
     /// Use dns-sd command for UDP service discovery (more reliable than NWBrowser/NetServiceBrowser for UDP)
     private var dnsSdBrowseProcess: Process?
 
+    /// True while an intentional stop is tearing down the LocalCast browse.
+    /// Terminating the process fires the pipe's EOF handler, which would
+    /// otherwise relaunch the browse 2s later and quietly resurrect discovery
+    /// (with a stray dns-sd child) after stopBrowsing/refreshScan.
+    private var localCastBrowseStopped = false
+
     /// Cooldown for LocalCast resolves; the dns-sd browse emits Add events
     /// on every interface change which would otherwise schedule a blocking
     /// `dns-sd -L` + `getaddrinfo` on the serial discovery queue forever.
@@ -337,6 +371,7 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
 
     private func startNetServiceBrowserForLocalCast() {
         guard dnsSdBrowseProcess == nil else { return }
+        localCastBrowseStopped = false
         logger.info("🌊 Starting dns-sd browse for _tidaldrift-cast._udp")
 
         // Use dns-sd -B to browse for services
@@ -379,10 +414,12 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
     private func handleLocalCastBrowseEOF() {
         queue.async { [weak self] in
             guard let self else { return }
+            guard !self.localCastBrowseStopped else { return }
             self.logger.warning("🌊 LocalCast browse exited (EOF); relaunching in 2s")
             self.dnsSdBrowseProcess = nil
             self.queue.asyncAfter(deadline: .now() + 2) { [weak self] in
-                self?.startNetServiceBrowserForLocalCast()
+                guard let self, !self.localCastBrowseStopped else { return }
+                self.startNetServiceBrowserForLocalCast()
             }
         }
     }
@@ -523,11 +560,13 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
     }
 
     private func stopServiceBrowsing() {
+        isBrowsingActive = false
         browsers.forEach { $0.cancel() }
         browsers.removeAll()
     }
 
     private func stopLocalCastBrowsing() {
+        localCastBrowseStopped = true
         if let process = dnsSdBrowseProcess, process.isRunning {
             process.terminate()
         }
@@ -614,16 +653,14 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         stopBrowsing()
     }
 
+    /// Non-failure browser states. `.failed` is intercepted in `startBrowser`,
+    /// which recreates the browser after a backoff.
     private func handleBrowserState(_ state: NWBrowser.State, for serviceType: String) {
         switch state {
         case .ready:
             if serviceType.contains("cast") {
                 logger.info("🌊 LocalCast browser READY for \(serviceType)")
             }
-        case .cancelled:
-            break
-        case .failed(let error):
-            logger.error("Browser failed for \(serviceType): \(error.localizedDescription)")
         default:
             break
         }
@@ -817,14 +854,9 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         deviceCacheLock.lock()
         var foundMatch = false
 
-        // Log all devices in cache for debugging
-        logger.info("🌊 LocalCast matching: Looking for '\(name)' (normalized: '\(normalizedName)')")
-        logger.info("🌊 LocalCast matching: Cache has \(self.deviceCache.count) devices:")
-        for (ip, device) in deviceCache {
-            let normalizedDeviceName = normalizeName(device.name)
-            let normalizedHostName = normalizeName(device.hostname)
-            logger.info("🌊   - '\(device.name)' (\(ip)) [normalized: '\(normalizedDeviceName)', host: '\(normalizedHostName)']")
-        }
+        // Debug-level only: this runs on every LocalCast resolve, and dumping
+        // the whole device cache at info level flooded the log during scans.
+        logger.debug("🌊 LocalCast matching: looking for '\(name)' (normalized: '\(normalizedName)') among \(self.deviceCache.count) devices")
 
         // Find device by name match
         for (ip, var device) in deviceCache {
@@ -1217,16 +1249,39 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         updatePublishedDevices()
     }
 
+    /// A Bonjour Remove is per-service, not per-device, and fires routinely on
+    /// interface transitions (Wi-Fi/Ethernet, sleep/wake). The old handling
+    /// deleted every device whose name merely CONTAINED the removed instance
+    /// name, so one flapping service ("_smb._tcp" toggling during sleep) wiped
+    /// whole devices including their TidalDrift-peer status, and a short name
+    /// ("Eli") took out every machine that embedded it. Now: exact normalized
+    /// name match, remove only the specific service, and drop the device only
+    /// when nothing remains and it is not a peer.
     private func handleDeviceRemoved(_ result: NWBrowser.Result) {
-        switch result.endpoint {
-        case .service(let name, _, _, _):
-            // Find and remove device by name match
-            deviceCacheLock.lock()
-            deviceCache = deviceCache.filter { !$0.value.name.lowercased().contains(name.lowercased()) }
-            deviceCacheLock.unlock()
+        guard case .service(let name, let type, _, _) = result.endpoint else { return }
+        guard let removedService = mapServiceType(type) else { return }
+
+        let normalizedRemoved = normalizeName(name)
+        var changed = false
+
+        deviceCacheLock.lock()
+        for (key, var device) in deviceCache {
+            let matches = normalizeName(device.name) == normalizedRemoved
+                || normalizeName(device.hostname) == normalizedRemoved
+            guard matches, device.services.contains(removedService) else { continue }
+
+            device.services.remove(removedService)
+            if device.services.isEmpty && !device.isTidalDriftPeer {
+                deviceCache.removeValue(forKey: key)
+            } else {
+                deviceCache[key] = device
+            }
+            changed = true
+        }
+        deviceCacheLock.unlock()
+
+        if changed {
             updatePublishedDevices()
-        default:
-            break
         }
     }
 
@@ -1256,8 +1311,18 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             self.deviceCacheLock.unlock()
 
             DispatchQueue.main.async { [weak self] in
-                self?.discoveredDevices = devices
-                self?.saveDevices()
+                guard let self else { return }
+                self.discoveredDevices = devices
+                // Persisting is a full JSON encode + UserDefaults write; doing
+                // it on every 0.2s publish tick during an active scan burned
+                // CPU for a cache that only needs to be roughly current.
+                // Explicit mutations (remove, clear, manual add) still save
+                // immediately at their call sites.
+                let now = Date()
+                if now.timeIntervalSince(self.lastPublishSave) >= Self.publishSaveInterval {
+                    self.lastPublishSave = now
+                    self.saveDevices()
+                }
             }
         }
         publishDebounceWorkItem = work
@@ -1265,6 +1330,10 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
 
         queue.asyncAfter(deadline: .now() + 0.2, execute: work)
     }
+
+    /// Last time the publish tick persisted the device cache. Main thread only.
+    private var lastPublishSave = Date.distantPast
+    private static let publishSaveInterval: TimeInterval = 10
 
     // MARK: - Multi-homed device coalescing
 
@@ -1484,16 +1553,18 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
 
             let didResume = AtomicFlag()
 
+            // compareAndSwap is the only safe gate here: the state handler
+            // (discovery queue) and the timeout (global queue) race, and a
+            // read-then-write check lets both pass and resume the continuation
+            // twice, which traps. scanSubnet runs hundreds of these per scan.
             connection.stateUpdateHandler = { [weak self] state in
                 switch state {
                 case .ready:
-                    guard !didResume.value else { return }
-                    didResume.value = true
+                    guard didResume.compareAndSwap(expected: false, desired: true) else { return }
                     self?.cleanupConnection(id: connectionId)
                     continuation.resume(returning: true)
                 case .failed:
-                    guard !didResume.value else { return }
-                    didResume.value = true
+                    guard didResume.compareAndSwap(expected: false, desired: true) else { return }
                     self?.cleanupConnection(id: connectionId)
                     continuation.resume(returning: false)
                 case .cancelled:
@@ -1503,8 +1574,7 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
                     self?.connectionsLock.unlock()
 
                     // Resume if not already done (timeout case)
-                    guard !didResume.value else { return }
-                    didResume.value = true
+                    guard didResume.compareAndSwap(expected: false, desired: true) else { return }
                     continuation.resume(returning: false)
                 default:
                     break
@@ -1515,8 +1585,7 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
 
             // 2 second timeout per IP
             DispatchQueue.global().asyncAfter(deadline: .now() + 2) { [weak self] in
-                guard !didResume.value else { return }
-                didResume.value = true
+                guard didResume.compareAndSwap(expected: false, desired: true) else { return }
                 self?.cleanupConnection(id: connectionId)
                 continuation.resume(returning: false)
             }
