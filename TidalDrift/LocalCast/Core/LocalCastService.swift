@@ -281,6 +281,7 @@ class LocalCastService: ObservableObject {
         configuration.regionAware = defaults.object(forKey: "localCastRegionAware") as? Bool ?? false
         configuration.forwardErrorCorrection = defaults.object(forKey: "localCastFEC") as? Bool ?? false
         configuration.captureCursor = defaults.object(forKey: "localCastCaptureCursor") as? Bool ?? false
+        configuration.thermalThrottle = defaults.object(forKey: "localCastThermalThrottle") as? Bool ?? true
         if let profileRaw = defaults.string(forKey: "localCastTransportProfile"),
            let profile = LocalCastConfiguration.TransportProfile(rawValue: profileRaw) {
             configuration.transportProfile = profile

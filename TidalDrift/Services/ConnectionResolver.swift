@@ -120,16 +120,16 @@ actor ConnectionResolver {
             failedAttempts.append("Cached IP")
             
         case .ipFirst:
-            // Try cached IP first for speed
-            if let resolved = await tryCachedIP(device: device, timeout: timeout / 3) {
+            // Race the cached-IP probe against the mDNS hostname lookup and
+            // take whichever lands first. On a healthy LAN the TCP probe of
+            // the cached IP wins in milliseconds; when the cached IP is stale
+            // the hostname lookup is already in flight instead of only
+            // starting after the probe times out, so the worst case is the
+            // slower of the two rather than their sum.
+            if let resolved = await raceCachedIPAndHostname(device: device, timeout: timeout) {
                 return resolved
             }
             failedAttempts.append("Cached IP")
-            
-            // Fall back to hostname resolution
-            if let resolved = await tryHostnameResolution(device: device, timeout: timeout * 2 / 3) {
-                return resolved
-            }
             failedAttempts.append("mDNS hostname")
             
         case .hostnameOnly:
@@ -187,7 +187,30 @@ actor ConnectionResolver {
     }
     
     // MARK: - Private Resolution Methods
-    
+
+    /// Run the cached-IP connectivity probe and the mDNS hostname resolution
+    /// concurrently, returning the first success. Nil when both fail.
+    private func raceCachedIPAndHostname(device: DiscoveredDevice, timeout: TimeInterval) async -> ResolvedAddress? {
+        await withTaskGroup(of: ResolvedAddress?.self) { group in
+            group.addTask {
+                await self.tryCachedIP(device: device, timeout: min(timeout, 2.0))
+            }
+            group.addTask {
+                await self.tryHostnameResolution(device: device, timeout: timeout)
+            }
+
+            var winner: ResolvedAddress?
+            for await result in group {
+                if let result {
+                    winner = result
+                    group.cancelAll()
+                    break
+                }
+            }
+            return winner
+        }
+    }
+
     /// Try to resolve via mDNS hostname (.local)
     private func tryHostnameResolution(device: DiscoveredDevice, timeout: TimeInterval) async -> ResolvedAddress? {
         // Build the .local hostname

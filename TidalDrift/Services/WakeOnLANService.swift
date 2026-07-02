@@ -142,9 +142,15 @@ class WakeOnLANService {
         // awake host the TCP connect resolves in milliseconds and costs
         // nothing; on a sleeping host the knock is exactly what prompts the
         // sleep proxy to wake it (Apple Screen Sharing wakes Macs this way).
-        // Only the slow wake-and-poll path stays gated on looking offline.
+        // The knock is fire-and-forget: sending the SYN is what wakes the host,
+        // so nothing is gained by holding the connect flow until the socket
+        // resolves. Awaiting it here cost up to 1.5s on every connect to a
+        // host that merely looked online. Only the slow wake-and-poll path
+        // stays gated on looking offline.
         if device.isOnline {
-            await triggerWakeOnDemand(to: device, timeout: 1.5)
+            Task.detached { [weak self] in
+                await self?.triggerWakeOnDemand(to: device, timeout: 1.5)
+            }
             return
         }
 

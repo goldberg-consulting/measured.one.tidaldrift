@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import CoreMedia
 import CryptoKit
 import OSLog
@@ -144,19 +145,140 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         logger.info("🔋 Sleep prevention OFF")
     }
 
+    // MARK: - Display reconfiguration
+    //
+    // Apple Screen Sharing (and display sleep/wake, resolution changes, monitor
+    // plug/unplug) changes the display mode under a live SCStream. SCStream
+    // sometimes dies (handled reactively in didFailWithError), but it can also
+    // keep delivering frames scaled for the *old* mode: the viewer freezes or
+    // shows a stretched image, and normalized input coordinates map through a
+    // stale aspect ratio so the cursor lands off-target. Observing the screen
+    // parameter change lets the host proactively rebuild capture at the new
+    // resolution and refresh the input bounds instead of waiting for a failure
+    // that may never come.
+    private var displayChangeObserver: NSObjectProtocol?
+    private var displayChangeRestartWorkItem: DispatchWorkItem?
+    private let displayChangeQueue = DispatchQueue(label: "com.tidaldrift.localcast.displaychange")
+    private static let displayChangeDebounce: TimeInterval = 1.0
+
+    private func observeDisplayChanges() {
+        displayChangeObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            self?.scheduleDisplayChangeRestart()
+        }
+    }
+
+    /// Debounced: Screen Sharing connect/disconnect fires several parameter
+    /// changes in quick succession (mode switch, color profile, safe-area), so
+    /// coalesce them into a single capture rebuild once the display settles.
+    private func scheduleDisplayChangeRestart() {
+        displayChangeQueue.async { [weak self] in
+            guard let self else { return }
+            self.displayChangeRestartWorkItem?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                guard let self, self.isRunning else { return }
+                guard self.withCaptureState({ self.captureActive }) else { return }
+                guard self.clientConnection != nil || self.clientEndpoint != nil else { return }
+                self.logger.info("🖥️ Display parameters changed — rebuilding capture at the new mode")
+                // A display reconfiguration is a known, recoverable cause;
+                // do not let it eat into the failure-restart budget.
+                self.resetCaptureRestartAttempts()
+                Task { [weak self] in
+                    guard let self else { return }
+                    await self.retarget(to: self.captureTarget)
+                }
+            }
+            self.displayChangeRestartWorkItem = work
+            self.displayChangeQueue.asyncAfter(deadline: .now() + Self.displayChangeDebounce, execute: work)
+        }
+    }
+
+    // MARK: - Thermal throttling
+    //
+    // Sustained high-resolution encode + packetize + send is the dominant heat
+    // source on the host. When macOS reports thermal pressure, step the frame
+    // rate and bitrate down so the machine cools instead of spiraling; restore
+    // automatically when pressure clears. Gated by configuration.thermalThrottle.
+    // `thermalFpsCap`/`thermalBitrateScale`/`lastRequestedFps` are confined to
+    // adaptiveQueue, the same queue every other encoder-parameter mutation uses.
+    private var thermalObserver: NSObjectProtocol?
+    private var thermalFpsCap = Int.max          // adaptiveQueue
+    private var thermalBitrateScale = 1.0        // adaptiveQueue
+    private var lastRequestedFps: Int            // adaptiveQueue
+
+    private func observeThermalState() {
+        thermalObserver = NotificationCenter.default.addObserver(
+            forName: ProcessInfo.thermalStateDidChangeNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            self?.refreshThermalPolicy()
+        }
+    }
+
+    /// Re-evaluate the thermal caps from the current system state (or lift them
+    /// entirely when throttling is disabled) and push the result to the encoder
+    /// and capture. Safe to call from any thread. `force` re-applies the current
+    /// caps even when unchanged; a capture restart resets the stream to the
+    /// configured fps, so the cap must be pushed again.
+    private func refreshThermalPolicy(force: Bool = false) {
+        let state = configuration.thermalThrottle ? ProcessInfo.processInfo.thermalState : .nominal
+        let cap: Int
+        let scale: Double
+        switch state {
+        case .serious:
+            cap = 30
+            scale = 0.5
+        case .critical:
+            cap = 15
+            scale = 0.25
+        default:
+            cap = .max
+            scale = 1.0
+        }
+
+        adaptiveQueue.async { [weak self] in
+            guard let self else { return }
+            let changed = cap != self.thermalFpsCap || scale != self.thermalBitrateScale
+            guard changed || (force && scale < 1.0) else { return }
+            self.thermalFpsCap = cap
+            self.thermalBitrateScale = scale
+            if changed {
+                if scale < 1.0 {
+                    self.logger.warning("🌡️ Thermal pressure (\(String(describing: state))): capping fps at \(cap), bitrate x\(String(format: "%.2f", scale))")
+                } else {
+                    self.logger.info("🌡️ Thermal pressure cleared: restoring configured fps/bitrate")
+                }
+            }
+            guard self.withCaptureState({ self.captureActive }) else { return }
+            self.applyAdaptiveBitrate()
+            let fps = min(self.lastRequestedFps, cap)
+            self.encoder.updateLiveParameters(fps: fps)
+            Task { await self.captureManager.updateFrameRate(fps) }
+        }
+    }
+
     /// Apply host-side runtime settings that do not require rebuilding the
     /// capture or encoder session. Codec/resolution still require a restart.
     func updateRuntimeConfiguration(_ newConfig: LocalCastConfiguration) {
         let regionAwareChanged = configuration.regionAware != newConfig.regionAware
         let profileChanged = configuration.transportProfile != newConfig.transportProfile
+        let thermalChanged = configuration.thermalThrottle != newConfig.thermalThrottle
         configuration.adaptiveQuality = newConfig.adaptiveQuality
         configuration.regionAware = newConfig.regionAware
         configuration.forwardErrorCorrection = newConfig.forwardErrorCorrection
         configuration.captureCursor = newConfig.captureCursor
         configuration.transportProfile = newConfig.transportProfile
+        configuration.thermalThrottle = newConfig.thermalThrottle
         transport.fecEnabled = newConfig.forwardErrorCorrection
         if profileChanged {
             applyConfiguredTransportProfile()
+        }
+        if thermalChanged {
+            refreshThermalPolicy()
         }
         Task {
             // Toggling region-aware changes the capture pixel format (BGRA tiles
@@ -409,6 +531,12 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     private var isLoopbackConnection = false
 
     deinit {
+        if let observer = displayChangeObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        if let observer = thermalObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
         transport.stopListening()
         encoder.invalidate()
         inputInjector.restoreApps()
@@ -416,6 +544,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
 
     init(configuration: LocalCastConfiguration, password: String? = nil) {
         self.configuration = configuration
+        self.lastRequestedFps = configuration.targetFrameRate
         captureManager.delegate = self
         captureManager.captureCursor = configuration.captureCursor
         captureManager.regionAwareCapture = configuration.regionAware
@@ -444,6 +573,9 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         // Fast LAN is in effect before the first frame; auto stays on the
         // resilient baseline until telemetry promotes it.
         applyConfiguredTransportProfile()
+
+        observeDisplayChanges()
+        observeThermalState()
     }
 
     /// Start hosting with full display capture (default)
@@ -517,6 +649,9 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
                 }
                 updateInputBounds()
                 resetCaptureRestartAttempts()
+                // A fresh capture/encoder starts at the configured fps/bitrate;
+                // re-impose any active thermal caps on the new session.
+                refreshThermalPolicy(force: true)
                 logger.info("✅ Capture started for connected client")
             } catch {
                 logger.error("❌ Failed to start capture for client: \(error.localizedDescription)")
@@ -678,9 +813,13 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         adaptiveQueue.async { [weak self] in
             guard let self else { return }
 
+            self.lastRequestedFps = fps
+            let cappedFps = min(fps, self.thermalFpsCap)
+            let cappedBitrate = max(Int(Double(bitrate) * self.thermalBitrateScale), 5)
+
             self.encoder.updateLiveParameters(
-                bitrateMbps: bitrate,
-                fps: fps,
+                bitrateMbps: cappedBitrate,
+                fps: cappedFps,
                 quality: quality,
                 keyframeIntervalSeconds: kfi
             )
@@ -692,7 +831,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             guard self.withCaptureState({ self.captureActive }) else { return }
 
             Task {
-                await self.captureManager.updateFrameRate(fps)
+                await self.captureManager.updateFrameRate(cappedFps)
             }
         }
     }
@@ -1047,7 +1186,10 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     private func applyAdaptiveBitrate() {
         let target = effectiveBitrateMbps
         let scaled = max(Int(Double(target) * adaptiveScale), Int(Double(target) * Self.adaptiveMinScale))
-        encoder.updateLiveParameters(bitrateMbps: scaled)
+        // Thermal pressure caps the result after loss adaptation so a hot host
+        // cools even on a clean link; floor at 5 Mbps so the stream stays usable.
+        let thermal = max(Int(Double(scaled) * thermalBitrateScale), 5)
+        encoder.updateLiveParameters(bitrateMbps: thermal)
     }
 
     /// After a quiet period (no loss signals), step the bitrate back up one
@@ -1395,76 +1537,8 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     //
     // Per-app / per-window enumeration and retargeting, used by the viewer's
     // app picker to switch the LocalCast stream from the full desktop to a
-    // single app or window (and back).
-
-    /// Enumerate apps that have at least one visible, titled, reasonably-sized
-    /// on-screen window. Shared by the client-driven app list and the host-side
-    /// share picker in the menu bar. Requires Screen Recording permission.
-    static func enumerateShareableApps() async throws -> [RemoteAppInfo] {
-        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-
-        // System/background bundle ID prefixes to exclude
-        let excludedBundlePrefixes = [
-            "com.apple.dock",
-            "com.apple.WindowManager",
-            "com.apple.controlcenter",
-            "com.apple.notificationcenterui",
-            "com.apple.Spotlight",
-            "com.apple.SystemUIServer",
-            "com.apple.loginwindow",
-            "com.apple.finder.SharedFileList",
-            "com.apple.universalcontrol",
-            "com.apple.AirPlayUIAgent",
-            "com.apple.accessibility",
-            "com.apple.TextInputMenuAgent",
-            "com.apple.TextInputSwitcher",
-            "com.apple.CoreLocationAgent",
-            "com.apple.ViewBridgeAuxiliary",
-            "com.apple.BKAgentService",
-            "com.apple.cloudd",
-            "com.apple.inputmethod",
-            "com.apple.ScreenTimeWidgetExtension"
-        ]
-
-        var appDict: [pid_t: (app: SCRunningApplication, windows: [SCWindow])] = [:]
-        for window in content.windows {
-            guard let app = window.owningApplication else { continue }
-            if app.bundleIdentifier == Bundle.main.bundleIdentifier { continue }
-            if excludedBundlePrefixes.contains(where: { app.bundleIdentifier.hasPrefix($0) }) { continue }
-            guard window.isOnScreen else { continue }
-            guard window.frame.width >= 100 && window.frame.height >= 50 else { continue }
-            guard let title = window.title, !title.isEmpty else { continue }
-
-            if appDict[app.processID] == nil {
-                appDict[app.processID] = (app: app, windows: [])
-            }
-            appDict[app.processID]?.windows.append(window)
-        }
-
-        var apps: [RemoteAppInfo] = []
-        for (pid, data) in appDict {
-            let windows = data.windows.map { window in
-                RemoteWindowInfo(
-                    windowID: window.windowID,
-                    title: window.title ?? "Untitled",
-                    width: Int(window.frame.width),
-                    height: Int(window.frame.height),
-                    isOnScreen: window.isOnScreen
-                )
-            }
-            guard !windows.isEmpty else { continue }
-            guard !data.app.applicationName.isEmpty else { continue }
-            apps.append(RemoteAppInfo(
-                processID: pid,
-                name: data.app.applicationName,
-                bundleIdentifier: data.app.bundleIdentifier,
-                windows: windows
-            ))
-        }
-
-        apps.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
-        return apps
-    }
+    // single app or window (and back). `enumerateShareableApps` lives in
+    // HostSession+AppEnumeration.swift.
 
     /// Gather available apps and send to client
     private func handleAppListRequest(replyTo endpoint: NWEndpoint) async {

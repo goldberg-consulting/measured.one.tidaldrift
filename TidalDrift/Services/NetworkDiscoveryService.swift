@@ -65,6 +65,13 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
     private var hasObservedInitialPath = false
     private let queue = DispatchQueue(label: "com.tidaldrift.discovery", qos: .userInitiated)
 
+    /// Dedicated queue for blocking `dns-sd` forks and getaddrinfo calls.
+    /// Concurrent so one slow lookup (up to 5s) cannot serialize behind
+    /// another, and separate from `queue` so browse handling and the publish
+    /// debounce never wait behind a resolve. The per-name cooldowns above each
+    /// call site keep this from forking unbounded processes.
+    private let resolveQueue = DispatchQueue(label: "com.tidaldrift.discovery.resolve", qos: .userInitiated, attributes: .concurrent)
+
     private var publishDebounceWorkItem: DispatchWorkItem?
     private let publishLock = NSLock()
 
@@ -430,7 +437,7 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
 
     /// Resolve a LocalCast service using dns-sd -L
     private func resolveLocalCastViaDnsSd(name: String) {
-        queue.async { [weak self] in
+        resolveQueue.async { [weak self] in
             guard let self = self else { return }
 
             let output = runDnsSdLookup(
@@ -443,6 +450,22 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             )
 
             self.logger.debug("dns-sd -L output for '\(name)': \(output)")
+
+            let authRequired: Bool? =
+                output.contains("auth=1") ? true :
+                (output.contains("auth=0") ? false : nil)
+
+            // Fast path: the LocalCast advertisement carries `ip=` in its TXT
+            // record, so the -L output usually contains the host's IP directly.
+            // Using it skips the getaddrinfo round trip (and its 60s cooldown),
+            // so the LocalCast badge appears as soon as the lookup returns.
+            if let advertisedIP = self.advertisedIPAddress(in: output) {
+                self.logger.info("🌊 dns-sd resolved '\(name)' via TXT ip= \(advertisedIP)")
+                DispatchQueue.main.async { [weak self] in
+                    self?.addLocalCastToDevice(ipAddress: advertisedIP, name: name, authRequired: authRequired)
+                }
+                return
+            }
 
             // Parse output for hostname - look for "can be reached at" or hostname.local.:port
             let lines = output.split(separator: "\n")
@@ -457,7 +480,7 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
                         hostname = hostname.replacingOccurrences(of: ".local.", with: "")
 
                         self.logger.info("🌊 dns-sd resolved '\(name)' to hostname: \(hostname)")
-                        self.resolveHostnameAndMarkLocalCast(hostname, originalName: name, authRequired: nil)
+                        self.resolveHostnameAndMarkLocalCast(hostname, originalName: name, authRequired: authRequired)
                     }
                 }
             }
@@ -526,6 +549,13 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         localCastResolveLock.lock()
         localCastResolveDebounce.removeAll()
         localCastResolveLock.unlock()
+
+        // Also reset the hostname cooldown so a manual refresh re-resolves
+        // LocalCast IPs immediately instead of serving a stale mapping for
+        // up to a minute.
+        hostnameResolveLock.lock()
+        hostnameResolveDebounce.removeAll()
+        hostnameResolveLock.unlock()
 
         deviceCacheLock.lock()
         // Preserve TidalDrift peer info before clearing cache
@@ -639,7 +669,7 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         markDeviceAsLocalCastHost(name: name, authRequired: nil)
 
         // Also resolve via dns-sd to get the IP directly
-        queue.async { [weak self] in
+        resolveQueue.async { [weak self] in
             guard let self = self else { return }
 
             // Service type/domain are constrained, but the service name is passed
@@ -657,6 +687,15 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             let authRequired: Bool? =
                 output.contains("auth=1") ? true :
                 (output.contains("auth=0") ? false : nil)
+
+            // Fast path: prefer the advertised TXT ip= over the hostname walk.
+            if let advertisedIP = self.advertisedIPAddress(in: output) {
+                self.logger.info("🌊 LocalCast resolved '\(name)' via TXT ip= \(advertisedIP)")
+                DispatchQueue.main.async { [weak self] in
+                    self?.addLocalCastToDevice(ipAddress: advertisedIP, name: name, authRequired: authRequired)
+                }
+                return
+            }
 
             // Parse output for host info - look for "can be reached at" or hostname
             let lines = output.split(separator: "\n")
@@ -864,8 +903,11 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
                 }
                 self?.cleanupConnection(id: connectionId)
             case .failed:
-                // Try fallback resolution via dns-sd
-                self?.resolveServiceViaDNSSD(name: name, type: type, domain: domain, serviceType: serviceType)
+                // Try fallback resolution via dns-sd. The fork blocks up to
+                // 2.5s, so hop off this callback queue (the browse queue).
+                self?.resolveQueue.async { [weak self] in
+                    self?.resolveServiceViaDNSSD(name: name, type: type, domain: domain, serviceType: serviceType)
+                }
                 self?.cleanupConnection(id: connectionId)
             case .cancelled:
                 // Remove from storage once fully cancelled
@@ -887,9 +929,9 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
 
             if let conn = conn, conn.state != .ready && conn.state != .cancelled {
                 // `resolveServiceViaDNSSD` forks `dns-sd` and blocks for up to
-                // 2.5s on a DispatchSemaphore. Run it on the discovery queue
-                // so the main runloop never parks here.
-                self.queue.async { [weak self] in
+                // 2.5s on a DispatchSemaphore. Run it on the resolve queue so
+                // neither the main runloop nor browse handling parks here.
+                self.resolveQueue.async { [weak self] in
                     self?.resolveServiceViaDNSSD(name: name, type: type, domain: domain, serviceType: serviceType)
                 }
                 self.cleanupConnection(id: connectionId)
