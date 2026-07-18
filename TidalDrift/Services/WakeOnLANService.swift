@@ -189,6 +189,22 @@ class WakeOnLANService {
     /// this port, which is how Apple Screen Sharing wakes a sleeping Mac.
     private static let screenSharingPort: UInt16 = 5900
 
+    /// Fire-and-forget wake prod for an in-flight connection that is getting no
+    /// answer: re-knock the sleep proxy (TCP 5900) and resend the WOL magic
+    /// packet when a MAC is known. Safe to call repeatedly; each knock is a
+    /// single SYN and the wake path on an already-awake host is a no-op.
+    /// Respects the same auto-wake setting as `prepareForConnection`.
+    func knock(device: DiscoveredDevice) {
+        guard shouldAutoWakeBeforeConnect else { return }
+        Task.detached { [weak self] in
+            guard let self else { return }
+            await self.triggerWakeOnDemand(to: device, timeout: 1.5)
+            if let macAddress = device.storedMACAddress {
+                _ = await self.wakeBroadly(macAddress: macAddress)
+            }
+        }
+    }
+
     private let wakeOnDemandQueue = DispatchQueue(label: "com.tidaldrift.wakeOnDemand")
 
     /// Trigger a Bonjour Wake on Demand by briefly opening a TCP connection to
@@ -502,31 +518,38 @@ class WakeOnLANService {
 // MARK: - DiscoveredDevice Extension
 
 extension DiscoveredDevice {
-    /// Store MAC address in UserDefaults
+    /// Store MAC address in UserDefaults. Reads walk every identity alias the
+    /// computer has been keyed by (plus the legacy per-IP key) and migrate a
+    /// hit to the canonical key, mirroring the credential lookup, so a stored
+    /// MAC survives IP rotation and late peer-ID discovery.
     var storedMACAddress: String? {
         get {
-            let identityKey = WakeOnLANService.macStorageKey(for: self)
-            if let mac = UserDefaults.standard.string(forKey: identityKey) {
+            let canonicalKey = WakeOnLANService.macStorageKey(for: self)
+            if let mac = UserDefaults.standard.string(forKey: canonicalKey) {
                 return mac
             }
 
-            let legacyKey = "mac_\(ipAddress)"
-            guard let legacy = UserDefaults.standard.string(forKey: legacyKey) else {
-                return nil
+            var fallbackKeys = credentialAliases.dropFirst().map { "mac_\($0)" }
+            fallbackKeys.append("mac_\(ipAddress)")
+            for key in fallbackKeys {
+                guard let mac = UserDefaults.standard.string(forKey: key) else { continue }
+                UserDefaults.standard.set(mac, forKey: canonicalKey)
+                UserDefaults.standard.removeObject(forKey: key)
+                return mac
             }
-            UserDefaults.standard.set(legacy, forKey: identityKey)
-            UserDefaults.standard.removeObject(forKey: legacyKey)
-            return legacy
+            return nil
         }
         set {
-            let identityKey = WakeOnLANService.macStorageKey(for: self)
-            let legacyKey = "mac_\(ipAddress)"
+            let canonicalKey = WakeOnLANService.macStorageKey(for: self)
+            var staleKeys = credentialAliases.dropFirst().map { "mac_\($0)" }
+            staleKeys.append("mac_\(ipAddress)")
             if let mac = newValue {
-                UserDefaults.standard.set(mac, forKey: identityKey)
-                UserDefaults.standard.removeObject(forKey: legacyKey)
+                UserDefaults.standard.set(mac, forKey: canonicalKey)
             } else {
-                UserDefaults.standard.removeObject(forKey: identityKey)
-                UserDefaults.standard.removeObject(forKey: legacyKey)
+                UserDefaults.standard.removeObject(forKey: canonicalKey)
+            }
+            for key in staleKeys {
+                UserDefaults.standard.removeObject(forKey: key)
             }
         }
     }

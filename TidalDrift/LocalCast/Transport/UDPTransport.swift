@@ -84,6 +84,34 @@ private struct FragmentHeader {
 class UDPTransport {
     private let logger = Logger(subsystem: "com.tidaldrift", category: "UDPTransport")
     weak var delegate: UDPTransportDelegate?
+
+    /// Fires when the listener dies underneath us (sleep tears the socket
+    /// down, network interface change). The owner should rebind; NWListener
+    /// cannot be restarted in place. Not called for deliberate stopListening.
+    var onListenerFailed: (() -> Void)?
+
+    /// NWListener exposes no public state getter, so the last state seen by
+    /// the update handler is tracked here (transport queue writes, any-thread
+    /// reads). Guarded by `listenerStateLock`.
+    private var _listenerState: NWListener.State = .setup
+    private let listenerStateLock = NSLock()
+
+    /// True when the host listener has terminally died (failed or cancelled
+    /// while still installed). `.setup`/`.waiting`/`.ready` all count as
+    /// alive so the watchdog cannot mistake a listener that is still binding
+    /// for a dead one and restart-loop. Used to catch listeners killed across
+    /// a sleep/DarkWake cycle whose failure callback was missed.
+    var isListenerDead: Bool {
+        guard listener != nil else { return false }
+        listenerStateLock.lock()
+        defer { listenerStateLock.unlock() }
+        switch _listenerState {
+        case .failed, .cancelled:
+            return true
+        default:
+            return false
+        }
+    }
     
     /// When set, all outgoing packets are encrypted and incoming packets are decrypted.
     /// Auth handshake packets travel in plaintext (prefix 0x00) before this is set.
@@ -324,15 +352,23 @@ class UDPTransport {
         
         let nwPort = port == 0 ? NWEndpoint.Port.any : NWEndpoint.Port(rawValue: port)!
         listener = try NWListener(using: params, on: nwPort)
+        listenerStateLock.lock()
+        _listenerState = .setup
+        listenerStateLock.unlock()
         
         listener?.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            self.listenerStateLock.lock()
+            self._listenerState = state
+            self.listenerStateLock.unlock()
             switch state {
             case .ready:
-                if let port = self?.listener?.port {
-                    self?.logger.info("UDP transport listening on port \(port.rawValue)")
+                if let port = self.listener?.port {
+                    self.logger.info("UDP transport listening on port \(port.rawValue)")
                 }
             case .failed(let error):
-                self?.logger.error("UDP listener failed: \(error.localizedDescription)")
+                self.logger.error("UDP listener failed: \(error.localizedDescription) — notifying owner to rebind")
+                self.onListenerFailed?()
             default:
                 break
             }

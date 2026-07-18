@@ -41,13 +41,24 @@ struct DiscoveredDevice: Identifiable, Codable, Hashable {
     }
 
     /// Stable device identity for credentials and Wake-on-LAN metadata.
+    ///
+    /// Priority: TidalDrift peer ID > user-assigned credential ref >
+    /// normalized hostname > this cache entry's UUID. The peer ID is a
+    /// persisted per-install UUID advertised in the Bonjour TXT record; it is
+    /// the only component that survives IP rotation, multi-NIC duplication,
+    /// and hostname renames together, so it wins whenever present. It used to
+    /// be gated on `isTrusted`, but nothing ever set that flag, so secrets
+    /// keyed off the hostname in practice; hostnames flap (unresolved at
+    /// rediscovery, Bonjour instance name vs real hostname, renames), which
+    /// is what kept unseating saved logins. mDNS hostnames are no more
+    /// authenticated than peer IDs, so the gate bought no security either.
     var identityKey: String {
-        if let credentialRef = Self.normalizedIdentityComponent(savedCredentialRef) {
-            return "manual:\(credentialRef)"
+        if let peerId = Self.normalizedIdentityComponent(peerId) {
+            return "peer:\(peerId)"
         }
 
-        if isTrusted, let peerId = Self.normalizedIdentityComponent(peerId) {
-            return "peer:\(peerId)"
+        if let credentialRef = Self.normalizedIdentityComponent(savedCredentialRef) {
+            return "manual:\(credentialRef)"
         }
 
         if let hostname = Self.normalizedHostname(hostname) {
@@ -57,13 +68,29 @@ struct DiscoveredDevice: Identifiable, Codable, Hashable {
         return "manual:\(id.uuidString.lowercased())"
     }
 
-    /// Stable key for discovery cache merges. Peer IDs arrive via Bonjour/UDP,
-    /// so they are not used for secrets until the device is trusted.
+    /// Stable key for discovery cache merges. Same as the secrets key now
+    /// that the peer ID leads both.
     var discoveryKey: String {
-        if let peerId = Self.normalizedIdentityComponent(peerId) {
-            return "peer:\(peerId)"
+        identityKey
+    }
+
+    /// Every key this computer's secrets may live under, canonical first.
+    /// Credential and Wake-on-LAN lookups walk these so a value saved under
+    /// an older identity (hostname before the peer ID was learned, a manual
+    /// ref, the legacy name_ip stableId) is still found and can be migrated
+    /// to the canonical key.
+    var credentialAliases: [String] {
+        var aliases = [identityKey]
+        if let credentialRef = Self.normalizedIdentityComponent(savedCredentialRef) {
+            aliases.append("manual:\(credentialRef)")
         }
-        return identityKey
+        if let hostname = Self.normalizedHostname(hostname) {
+            aliases.append("host:\(hostname)")
+        }
+        aliases.append("manual:\(id.uuidString.lowercased())")
+        aliases.append(stableId)
+        var seen = Set<String>()
+        return aliases.filter { seen.insert($0).inserted }
     }
     
     init(id: UUID = UUID(),

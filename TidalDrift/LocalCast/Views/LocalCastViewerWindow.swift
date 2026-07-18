@@ -228,9 +228,15 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
         guard viewSize.width > 0, viewSize.height > 0 else { return }
 
         // Scroll carries deltas, not a position; forward it regardless of where
-        // the cursor is (even over the letterbox bars).
+        // the cursor is (even over the letterbox bars). The precise flag rides
+        // along so the host injects pixels for trackpads and lines for a
+        // physical wheel; without it a wheel notch was injected as ~1 pixel.
         if event.type == .scrollWheel {
-            clientSession.sendInput(.scroll(deltaX: event.scrollingDeltaX, deltaY: event.scrollingDeltaY))
+            clientSession.sendInput(.scroll(
+                deltaX: event.scrollingDeltaX,
+                deltaY: event.scrollingDeltaY,
+                precise: event.hasPreciseScrollingDeltas
+            ))
             return
         }
 
@@ -384,7 +390,6 @@ struct LocalCastContentView: View {
     let mtkView: MTKView
     @ObservedObject var session: ClientSession
     @ObservedObject var tuning: StreamingTuning
-    @AppStorage("showLatencyOverlay") var showOverlay = false
     @State private var showControlsPanel = false
     @State private var controlsTab: LocalCastControlsPanel.Tab = .quality
     
@@ -424,22 +429,9 @@ struct LocalCastContentView: View {
                 Spacer()
             }
 
-            // Optional always-on stats readout, top-right, never intercepts input.
-            if showOverlay {
-                VStack {
-                    HStack {
-                        Spacer()
-                        LocalCastStatsOverlay(stats: session.stats)
-                            .frame(width: 170, alignment: .leading)
-                            .allowsHitTesting(false)
-                            .padding(.top, 28)
-                            .padding(.trailing, 8)
-                    }
-                    Spacer()
-                }
-            }
-            
             // Unified, tabbed controls panel (Quality / Apps / Info).
+            // Live stats moved out of the floating top-right readout and into
+            // the panel's Info tab; the video surface stays chrome-free.
             if showControlsPanel {
                 LocalCastControlsPanel(
                     session: session,
@@ -797,6 +789,10 @@ extension LocalCastContentView {
                     Image(systemName: "lock.shield")
                         .font(.system(size: 36))
                         .foregroundStyle(.yellow)
+                case .waking:
+                    Image(systemName: "moon.zzz")
+                        .font(.system(size: 36))
+                        .foregroundStyle(.teal)
                 case .waitingForVideo:
                     ProgressView()
                         .scaleEffect(1.5)

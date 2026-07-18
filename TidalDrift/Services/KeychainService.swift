@@ -90,19 +90,25 @@ class KeychainService {
         try copyCredential(for: deviceId, allowUI: true)
     }
 
+    /// Look up the device's credential under every identity it has ever been
+    /// keyed by (peer ID, manual ref, hostname, cache UUID, legacy name_ip).
+    /// A hit under a non-canonical alias is re-saved under the canonical key
+    /// so the next lookup is direct. This is what keeps a saved login seated
+    /// when the computer comes back with a new IP, a different NIC, or a
+    /// late-resolving hostname.
     func getCredential(for device: DiscoveredDevice) throws -> (username: String, password: String)? {
-        if let credentials = try copyCredential(for: device.identityKey, allowUI: true) {
+        let aliases = device.credentialAliases
+        guard let canonical = aliases.first else { return nil }
+
+        for alias in aliases {
+            guard let credentials = try copyCredential(for: alias, allowUI: true) else { continue }
+            if alias != canonical {
+                try saveCredential(for: canonical, username: credentials.username, password: credentials.password)
+                try? deleteCredential(for: alias)
+            }
             return credentials
         }
-
-        guard device.identityKey != device.stableId,
-              let legacy = try copyCredential(for: device.stableId, allowUI: true) else {
-            return nil
-        }
-
-        try saveCredential(for: device.identityKey, username: legacy.username, password: legacy.password)
-        try? deleteCredential(for: device.stableId)
-        return legacy
+        return nil
     }
 
     /// Reads a credential without ever triggering a biometric prompt or sheet.
@@ -118,12 +124,13 @@ class KeychainService {
         return credentials
     }
 
+    /// Alias-walking variant of `peekCredential`. Read-only: no migration,
+    /// so it stays safe to call from SwiftUI view bodies.
     func peekCredential(for device: DiscoveredDevice) -> (username: String, password: String)? {
-        if let credentials = peekCredential(for: device.identityKey) {
-            return credentials
-        }
-        if device.identityKey != device.stableId {
-            return peekCredential(for: device.stableId)
+        for alias in device.credentialAliases {
+            if let credentials = peekCredential(for: alias) {
+                return credentials
+            }
         }
         return nil
     }
@@ -192,9 +199,11 @@ class KeychainService {
     }
 
     func deleteCredential(for device: DiscoveredDevice) throws {
-        try deleteCredential(for: device.identityKey)
-        if device.identityKey != device.stableId {
-            try? deleteCredential(for: device.stableId)
+        let aliases = device.credentialAliases
+        guard let canonical = aliases.first else { return }
+        try deleteCredential(for: canonical)
+        for alias in aliases.dropFirst() {
+            try? deleteCredential(for: alias)
         }
     }
 
@@ -212,7 +221,7 @@ class KeychainService {
     }
 
     func hasCredential(for device: DiscoveredDevice) -> Bool {
-        hasCredential(for: device.identityKey) || hasCredential(for: device.stableId)
+        device.credentialAliases.contains { hasCredential(for: $0) }
     }
 
     func getAllSavedDeviceIds() throws -> [String] {

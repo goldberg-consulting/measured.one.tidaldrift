@@ -53,7 +53,6 @@ struct LocalCastConfiguration: Codable {
     var codec: Codec = .hevc
     var targetFrameRate: Int = 60
     var adaptiveQuality: Bool = false // Disable by default for "fastest pipe" on LAN
-    var showLatencyOverlay: Bool = false
     /// When false (default), the host omits its cursor from the capture and the
     /// pointer the viewer sees is the local macOS cursor, so pointer motion
     /// never round-trips the capture/encode/decode pipeline. Enable to

@@ -241,6 +241,84 @@ Jellyfin-ffmpeg builds), but Apple Silicon has no hardware AV1 *encoder* exposed
 to VideoToolbox, and software AV1 is too slow for interactive Mac-to-Mac. HEVC
 remains the target codec; AV1 is a deferred research spike, not a dependency.
 
+### Fix 12: lid-closed hosting, wheel scroll speed, stable credential identity (1.6.52)
+
+Lid-closed sessions failed at three independent layers; all are addressed.
+Diagnosis came from a live repro: the wake knock worked, the host authed the
+viewer, then capture failed repeatedly with "Display 1 not found in available
+displays" (unified log, subsystem com.tidaldrift).
+
+- **DarkWake-aware wake restart (host).** A sleep-proxy knock produces a
+  DarkWake, and `NSWorkspace.didWakeNotification` only fires on *full* wake,
+  so the listener-rebind never ran and the host sat unreachable through the
+  ~30 s DarkWake linger. `LocalCastService` now drives the restart from
+  `IORegisterForSystemPower` (`SystemPowerMonitor`), which reports every
+  power-on, dark or full. At each wake while hosting it also takes a
+  time-bounded `kIOPMAssertNetworkClientActive` assertion (3 min,
+  auto-release) so the machine survives past the linger long enough for the
+  viewer to connect. The 5 s advertisement watchdog additionally rebinds if
+  the UDP listener reports failed/cancelled, and the transport surfaces
+  listener death via `onListenerFailed` -> `HostSession.onTransportDied`.
+- **Full-wake promotion (host).** Inbound client packets (rate-limited to
+  one per 30 s) declare `IOPMAssertionDeclareUserActivity(kIOPMUserActiveRemote)`,
+  the same mechanism screensharingd uses; on an open-lid or external-display
+  host this promotes DarkWake to full wake and resets idle timers. While a
+  viewer is connected the session now holds `kIOPMAssertNetworkClientActive`
+  alongside the existing ProcessInfo activity, because the idle-sleep
+  assertion has no standing against the post-network-wake maintenance
+  re-sleep (it only blocks *idle* sleep).
+- **Virtual display for headless capture (host).** With the lid closed and
+  no external monitor the built-in panel leaves the display list entirely,
+  so there is nothing to capture. Full-display capture now resolves its
+  target from `SCShareableContent` (filtered to active, awake displays,
+  falling back from the main display) and, when nothing usable exists,
+  creates a software display via the private CGVirtualDisplay classes
+  (`VirtualDisplayController`), the same approach Jump Desktop and Splashtop
+  ship. Runtime-resolved ObjC so an API change degrades to the old failure,
+  never a crash; created on demand, retried once (macOS 14 betas transiently
+  rejected creation with zero physical displays), released on idle/stop.
+  Input for a non-main captured display maps through that display's global
+  Quartz bounds instead of assuming the main display.
+- **Capture revival on display arrival (host).** The display-change observer
+  now also starts capture when a display *appears* while an authenticated
+  viewer is waiting with capture down (lid opened, external or virtual
+  display came online), instead of waiting for the client's stall nudge.
+- **Honest connect status + persistent wake (client).** The viewer no longer
+  shows "check Firewall settings" after 6 s of silence; up to 25 s it shows
+  "waking the remote Mac...", re-knocks TCP 5900 every 2 s (the first knock
+  can be dropped, and UDP heartbeats to 5904 do not trigger the sleep
+  proxy), resends WOL when a MAC is stored, and re-drives the auth handshake
+  so authRequests lost while the host was still waking do not strand the
+  session in "Authenticating...".
+- **Wheel scrolling was ~20x too slow (input).** The client sent
+  `scrollingDeltaX/Y` without `hasPreciseScrollingDeltas`, and the host
+  injected everything as `.pixel` units. Trackpad deltas are pixels, but a
+  physical wheel's deltas are *lines*, so one notch moved ~1 px. The scroll
+  input now carries a `precise` flag and the host injects `.line` for wheel
+  events (old 17-byte payloads still read as pixels). Deltas round away
+  from zero so slow drifts are not truncated to no-ops.
+- **Saved logins unseated by rotating IPs / multi-NIC (identity).** Secrets
+  were keyed by hostname (`identityKey` gated peer IDs on an `isTrusted`
+  flag nothing ever set), and hostnames flap: unresolved at rediscovery,
+  Bonjour instance name vs real hostname, renames. The TidalDrift peer ID
+  (persisted per-install UUID from the Bonjour TXT) now leads the identity
+  key, and credential/WOL-MAC lookups walk every alias the computer has
+  ever been keyed by (peer ID, manual ref, hostname, cache UUID, legacy
+  name_ip), migrating hits to the canonical key. Saving, reading, deleting,
+  and has-credential checks all use the alias walk.
+- **Stats readout removed from the video surface.** The optional floating
+  top-right overlay (resolution/codec/mode/rate/bitrate/latency) and its
+  Settings toggle are gone; the same live numbers remain in Stream Controls
+  under Info.
+
+Lid-closed operating constraints (macOS policy, not fixable in-app): wake
+over the network requires "Wake for network access" (womp), which macOS
+enables on AC power but disables on battery by default, and a battery
+machine in standby/hibernation cannot be woken remotely at all. Lid-closed
+hosting is therefore reliable plugged in; on battery only within the
+pre-standby window. FileVault survives sleep (keys stay in memory), but a
+powered-off or hibernated Mac needs a physical power-on.
+
 ### Fix 11: display-reconfig recovery, thermal throttle, faster connect/discovery (1.6.50)
 
 Symptom set from running Apple Screen Sharing and LocalCast together: the

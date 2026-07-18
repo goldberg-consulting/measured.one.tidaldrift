@@ -120,8 +120,11 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
         
         let filter = SCContentFilter(display: display, excludingWindows: [])
         
-        // Full display capture - bounds are the full display
-        captureBounds = nil  // nil means full screen, use main display dimensions
+        // Full display capture. nil bounds means "use the main display" for
+        // input mapping; when capturing a non-main display (clamshell fallback,
+        // external monitor) pass its global Quartz bounds so remote clicks land
+        // on the captured display instead of the main one.
+        captureBounds = displayID == CGMainDisplayID() ? nil : CGDisplayBounds(displayID)
         captureMode = .fullDisplay(displayID)
         try await startStream(with: filter, width: width, height: height, frameRate: frameRate, description: "display \(displayID)")
     }
