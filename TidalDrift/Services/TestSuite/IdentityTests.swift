@@ -19,13 +19,19 @@ extension TidalDriftTestRunner {
         guard first.discoveryKey == second.discoveryKey else {
             return (false, "Peer discovery key changed across IPs: \(first.discoveryKey) vs \(second.discoveryKey)")
         }
-        guard first.discoveryKey == "peer:\(peerId.lowercased())" else {
-            return (false, "Peer discovery key did not use peer ID: \(first.discoveryKey)")
+        guard first.identityKey == second.identityKey else {
+            return (false, "Peer identity key changed across IPs: \(first.identityKey) vs \(second.identityKey)")
         }
-        guard first.identityKey == "host:studio-mac.local" else {
-            return (false, "Untrusted peer used peer ID for secrets: \(first.identityKey)")
+        guard first.identityKey == "peer:\(peerId.lowercased())" else {
+            return (false, "Peer identity key did not use peer ID: \(first.identityKey)")
         }
-        return (true, "Peer discovery key is stable while secret key stays hostname-based")
+        guard first.credentialAliases.contains("host:studio-mac.local") else {
+            return (false, "Hostname alias missing from credential aliases: \(first.credentialAliases)")
+        }
+        guard first.credentialAliases.first == first.identityKey else {
+            return (false, "Canonical alias is not the identity key: \(first.credentialAliases)")
+        }
+        return (true, "Peer ID keys secrets across IP changes, hostname retained as alias")
     }
 
     func testHostnameIdentityFallback() async -> (Bool, String) {

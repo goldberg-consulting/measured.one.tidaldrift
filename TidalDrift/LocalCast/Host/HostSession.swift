@@ -2,6 +2,7 @@ import Foundation
 import AppKit
 import CoreMedia
 import CryptoKit
+import IOKit.pwr_mgt
 import OSLog
 import Network
 import ScreenCaptureKit
@@ -58,13 +59,18 @@ private final class CaptureTransitionQueue {
 class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransportDelegate {
     let logger = Logger(subsystem: "com.tidaldrift", category: "HostSession")
 
-    private let captureManager = ScreenCaptureManager()
-    private let encoder = VideoEncoder()
+    let captureManager = ScreenCaptureManager()
+    let encoder = VideoEncoder()
     let inputInjector = InputInjector()
     let transport = UDPTransport()
     private let captureTransitions = CaptureTransitionQueue()
 
-    private var configuration: LocalCastConfiguration
+    /// Software display for lid-closed / headless hosting. Created on demand
+    /// by `startFullDisplayCapture` when no physical display is capturable;
+    /// torn down when the session stops or the viewer goes idle.
+    let virtualDisplay = VirtualDisplayController()
+
+    var configuration: LocalCastConfiguration
     private(set) var isRunning = false
 
     // MARK: - Cross-queue session state
@@ -136,8 +142,19 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     /// isolated, so the service hops to the main actor inside the closure.
     var onClientRetarget: ((HostCaptureTarget, String) -> Void)?
 
+    /// Invoked when the UDP listener dies underneath the session (system
+    /// sleep tears the socket down; interface changes can too). The owning
+    /// service should rebuild the session; a dead listener cannot be
+    /// restarted in place. Fires on the transport queue.
+    var onTransportDied: (() -> Void)?
+
+    /// Whether the UDP listener has terminally died. The hosting watchdog
+    /// polls this to catch listeners killed across a sleep/DarkWake cycle
+    /// whose failure callback was missed.
+    var isListenerDead: Bool { transport.isListenerDead }
+
     /// PID of the application being streamed (for window resize via Accessibility)
-    private(set) var targetPID: pid_t?
+    var targetPID: pid_t?
     private(set) var allowedAppPIDs: Set<pid_t> = []
     private var allowedWindowIDs: Set<CGWindowID> = []
 
@@ -207,33 +224,35 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     // viewer sees a freeze, then "host can't be reached"), and a clamshell
     // host drops the session the moment the display sleeps. Held only while
     // capture is active for a connected viewer, never while merely hosting.
-    private var streamActivity: NSObjectProtocol?
-    private let streamActivityLock = NSLock()
+    var streamActivity: NSObjectProtocol?
+    let streamActivityLock = NSLock()
 
-    private func beginStreamActivity() {
-        streamActivityLock.lock()
-        defer { streamActivityLock.unlock() }
-        guard streamActivity == nil else { return }
-        // idleDisplaySleepDisabled matters as much as system sleep: when the
-        // host's display sleeps, ScreenCaptureKit suspends frame delivery and
-        // the viewer freezes even though the machine is awake and pongs keep
-        // flowing (so no reconnect fires). Remote viewing generates no local
-        // HID activity, so the display idle timer runs out mid-session.
-        streamActivity = ProcessInfo.processInfo.beginActivity(
-            options: [.idleSystemSleepDisabled, .idleDisplaySleepDisabled, .suddenTerminationDisabled],
-            reason: "LocalCast streaming to a connected viewer"
-        )
-        logger.info("🔋 Sleep prevention ON (viewer connected, capture active)")
-    }
+    /// IOPM assertion holding the machine out of the post-network-wake
+    /// re-sleep while a viewer session is active. The ProcessInfo activity
+    /// above only blocks *idle* sleep, which has no standing during a
+    /// DarkWake linger; kIOPMAssertNetworkClientActive is the public
+    /// assertion documented to keep the system up in dark or full wake (on
+    /// AC power) while serving network clients. Guarded by streamActivityLock.
+    var networkClientAssertion: IOPMAssertionID = 0
 
-    private func endStreamActivity() {
-        streamActivityLock.lock()
-        defer { streamActivityLock.unlock() }
-        guard let activity = streamActivity else { return }
-        ProcessInfo.processInfo.endActivity(activity)
-        streamActivity = nil
-        logger.info("🔋 Sleep prevention OFF")
-    }
+    // MARK: - Remote user activity (full-wake promotion)
+    //
+    // A sleeping host woken by the client's TCP-5900 knock comes up in
+    // DarkWake: the network stack and this process run, but there is no
+    // display and the system schedules itself back to sleep within seconds
+    // ("Notification Wake Back to Sleep" in pmset -g log). The idle-sleep
+    // assertions above cannot stop that re-sleep; only a user-activity
+    // declaration can. Declaring kIOPMUserActiveRemote promotes DarkWake to
+    // full wake and resets the idle timers as if a user were present over
+    // the network, which is exactly what screensharingd does when a VNC
+    // client connects (pmset log: "DarkWake to FullWake ... due to
+    // UserActivity Assertion"). Without this, a lid-closed host answered a
+    // couple of heartbeats and then vanished mid-handshake.
+    // Implementations live in HostSession+Power.swift.
+    var userActivityAssertionID: IOPMAssertionID = 0
+    var lastUserActivityDeclaration = Date.distantPast
+    let userActivityLock = NSLock()
+    static let userActivityMinInterval: TimeInterval = 30
 
     // MARK: - Display reconfiguration
     //
@@ -270,15 +289,26 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             self.displayChangeRestartWorkItem?.cancel()
             let work = DispatchWorkItem { [weak self] in
                 guard let self, self.isRunning else { return }
-                guard self.withCaptureState({ self.captureActive }) else { return }
                 guard self.hasActiveClient else { return }
-                self.logger.info("🖥️ Display parameters changed — rebuilding capture at the new mode")
-                // A display reconfiguration is a known, recoverable cause;
-                // do not let it eat into the failure-restart budget.
-                self.resetCaptureRestartAttempts()
-                Task { [weak self] in
-                    guard let self else { return }
-                    await self.retarget(to: self.captureTarget)
+                if self.withCaptureState({ self.captureActive }) {
+                    self.logger.info("🖥️ Display parameters changed — rebuilding capture at the new mode")
+                    // A display reconfiguration is a known, recoverable cause;
+                    // do not let it eat into the failure-restart budget.
+                    self.resetCaptureRestartAttempts()
+                    Task { [weak self] in
+                        guard let self else { return }
+                        await self.retarget(to: self.captureTarget)
+                    }
+                } else if self.authState == .authenticated {
+                    // A display just appeared while a viewer was waiting with
+                    // no capture (lid-closed host that reached full wake, or
+                    // an external/virtual display coming online). Start
+                    // capture now instead of waiting for the client's next
+                    // stall nudge.
+                    self.logger.info("🖥️ Display appeared with a waiting viewer — starting capture")
+                    self.resetCaptureRestartAttempts()
+                    self.beginCaptureForClient()
+                    self.encoder.forceKeyFrame()
                 }
             }
             self.displayChangeRestartWorkItem = work
@@ -409,7 +439,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     private static let autoBadTicksNeeded = 2
 
     /// Effective encoder bitrate target for the active profile.
-    private var effectiveBitrateMbps: Int {
+    var effectiveBitrateMbps: Int {
         profileLock.lock(); defer { profileLock.unlock() }
         return _fastLANActive ? configuration.fastLANBitrateMbps : configuration.bitrateMbps
     }
@@ -651,6 +681,10 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         captureManager.regionAwareCapture = configuration.regionAware
         encoder.delegate = self
         transport.delegate = self
+        transport.onListenerFailed = { [weak self] in
+            guard let self, self.isRunning else { return }
+            self.onTransportDied?()
+        }
 
         // Configure auth
         if configuration.requireAuthentication, let password = password, !password.isEmpty {
@@ -801,119 +835,13 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             await captureTransitions.run { [weak self] in
                 guard let self else { return }
                 await self.captureManager.stopCapture()
+                // A headless-session virtual display has no viewer left;
+                // release it so the machine can sleep normally. The next
+                // connect recreates it if still needed.
+                self.virtualDisplay.destroy()
                 self.logger.info("⏸️ LocalCast: suspended capture (no active viewer)")
             }
         }
-    }
-
-    /// Update the input injector with the current capture bounds
-    private func updateInputBounds() {
-        inputInjector.captureBounds = captureManager.captureBounds
-
-        if let bounds = captureManager.captureBounds {
-            logger.info("🎯 Input bounds set to: \(NSStringFromRect(bounds))")
-        } else {
-            logger.info("🎯 Input bounds set to full screen")
-        }
-    }
-
-    /// Start full display capture (original behavior)
-    private func startFullDisplayCapture() async throws {
-        targetPID = nil  // No window to resize in full display mode
-        let displayID = CGMainDisplayID()
-        logger.info("Using display ID: \(displayID)")
-
-        // Get display mode for native resolution info
-        let mode = CGDisplayCopyDisplayMode(displayID)
-        let nativeWidth = mode?.pixelWidth ?? CGDisplayPixelsWide(displayID)
-        let nativeHeight = mode?.pixelHeight ?? CGDisplayPixelsHigh(displayID)
-
-        // Cap resolution based on quality preset (ultra=3840, high=2560, etc.),
-        // further reduced by any transport-capacity cap so keyframes stay
-        // deliverable over a non-jumbo link.
-        let maxDimension = effectiveMaxCaptureDimension
-        let scale: Double
-        if nativeWidth > maxDimension || nativeHeight > maxDimension {
-            scale = Double(maxDimension) / Double(max(nativeWidth, nativeHeight))
-        } else {
-            scale = 1.0
-        }
-
-        // Round to even numbers (required for video encoding)
-        let width = Int(Double(nativeWidth) * scale) & ~1
-        let height = Int(Double(nativeHeight) * scale) & ~1
-
-        logger.info("🚀 LocalCast: Capturing at \(width)x\(height) (native: \(nativeWidth)x\(nativeHeight), scale: \(String(format: "%.2f", scale)))")
-
-        encoder.setup(
-            width: width,
-            height: height,
-            codec: configuration.codec,
-            bitrateMbps: effectiveBitrateMbps,
-            fps: configuration.targetFrameRate,
-            quality: configuration.encoderQuality
-        )
-        logger.info("✅ Video encoder configured: \(self.configuration.codec.rawValue), \(self.effectiveBitrateMbps)Mbps, \(self.configuration.targetFrameRate)fps, quality=\(self.configuration.encoderQuality)")
-
-        try await captureManager.startCapture(
-            displayID: displayID,
-            width: width,
-            height: height,
-            frameRate: configuration.targetFrameRate
-        )
-    }
-
-    /// Start window-specific capture
-    private func startWindowCapture(windowID: CGWindowID) async throws {
-        // Look up the owning PID so we can resize the window later via Accessibility
-        if let infoList = CGWindowListCopyWindowInfo(.optionIncludingWindow, windowID) as? [[String: Any]],
-           let info = infoList.first,
-           let pid = info[kCGWindowOwnerPID as String] as? pid_t {
-            targetPID = pid
-            logger.info("📐 Stored target PID \(pid) for window resize")
-        }
-
-        // Pre-create encoder with placeholder dimensions so the very first
-        // frames don't get silently dropped. The encoder auto-reconfigures
-        // when it receives frames at the actual Retina capture resolution.
-        encoder.setup(
-            width: 1920,
-            height: 1080,
-            codec: configuration.codec,
-            bitrateMbps: effectiveBitrateMbps,
-            fps: configuration.targetFrameRate,
-            quality: configuration.encoderQuality
-        )
-        encoder.forceKeyFrame()
-
-        try await captureManager.startWindowCapture(
-            windowID: windowID,
-            frameRate: configuration.targetFrameRate,
-            maxDimension: effectiveMaxCaptureDimension
-        )
-    }
-
-    /// Start app-specific capture
-    private func startAppCapture(processID: pid_t) async throws {
-        targetPID = processID
-
-        // Pre-create encoder with placeholder dimensions (auto-reconfigures
-        // to actual Retina resolution on first frame).
-        encoder.setup(
-            width: 1920,
-            height: 1080,
-            codec: configuration.codec,
-            bitrateMbps: effectiveBitrateMbps,
-            fps: configuration.targetFrameRate,
-            quality: configuration.encoderQuality
-        )
-        encoder.forceKeyFrame()
-
-        try await captureManager.startAppCapture(
-            processID: processID,
-            frameRate: configuration.targetFrameRate,
-            maxDimension: effectiveMaxCaptureDimension
-        )
     }
 
     // MARK: - Live Quality Tuning
@@ -972,10 +900,12 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         clientIdleTimer = nil
         withCaptureState { captureActive = false }
         endStreamActivity()
+        releaseUserActivityAssertion()
         resetAdaptiveBitrate()
 
         await captureTransitions.run { [weak self] in
             await self?.captureManager.stopCapture()
+            self?.virtualDisplay.destroy()
         }
         encoder.invalidate()
         transport.stopListening()
@@ -1447,7 +1377,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     /// Capture longest-edge cap currently in effect: the configured preset value
     /// further reduced by any transport-capacity cap imposed when keyframes were
     /// too large to deliver. Read on the capture-setup path.
-    private var effectiveMaxCaptureDimension: Int {
+    var effectiveMaxCaptureDimension: Int {
         let configured = configuration.maxCaptureDimension
         let cap = capacityDimensionCap
         return cap > 0 ? min(configured, cap) : configured
@@ -1544,6 +1474,13 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         if transport.sessionKey != nil, !wasAuthenticated {
             return
         }
+
+        // Any legitimate client packet counts as remote user presence. This
+        // must happen before the auth gate: on a lid-closed, network-woken
+        // host the very first packets (authRequest, pre-auth heartbeats)
+        // arrive during DarkWake, and without the promotion the system goes
+        // back to sleep before the handshake can finish. Rate-limited inside.
+        declareRemoteUserActivity()
 
         // Update client endpoint if not already set
         if clientEndpoint == nil {

@@ -25,6 +25,7 @@ extension ClientSessionDelegate {
         case resolving = "Resolving host..."
         case connecting = "Connecting..."
         case authenticating = "Authenticating..."
+        case waking = "No response yet — waking the remote Mac..."
         case waitingForVideo = "Connected — waiting for video..."
         case streaming = "Streaming"
         case reconnecting = "Reconnecting..."
@@ -268,6 +269,14 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
     /// Monitor connection progress and provide diagnostics.
     private static let maxDiagnosticDuration: TimeInterval = 60
 
+    /// Silence up to this long is treated as "the host is still waking", not a
+    /// firewall problem. A sleeping Mac woken by the pre-connect knock needs
+    /// several seconds to run through DarkWake, full wake, and the app's
+    /// wake-restart of its UDP listener (measured 5-25s lid-closed), during
+    /// which every heartbeat goes unanswered. The old 6s cutoff misdiagnosed
+    /// that window as "check Firewall settings".
+    private static let wakeGraceDuration: TimeInterval = 25
+
     @MainActor
     private func startDiagnosticTimer() {
         diagnosticTimer?.invalidate()
@@ -283,10 +292,27 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             }
 
             if self.heartbeatsReceived == 0 {
-                if elapsed > 6.0 {
+                // A definitive auth failure owns the status surface; do not
+                // overwrite it with waking/firewall guesses.
+                if self.authError != nil { return }
+                if elapsed > Self.wakeGraceDuration {
                     self.connectionPhase = .firewallBlocked
                     self.connectionStatus = ConnectionPhase.firewallBlocked.rawValue
                     self.logger.warning("⚠️ No heartbeat responses after \(Int(elapsed))s — likely firewall issue on host")
+                } else if elapsed > 4.0 {
+                    self.connectionPhase = .waking
+                    self.connectionStatus = ConnectionPhase.waking.rawValue
+                    self.logger.info("⏰ No heartbeat responses after \(Int(elapsed))s — re-knocking to wake the host")
+                    // Keep prodding the sleep proxy: the first pre-connect knock
+                    // can be dropped, and heartbeats to our UDP port never
+                    // trigger a wake on their own (only TCP to a registered
+                    // service port does).
+                    WakeOnLANService.shared.knock(device: self.device)
+                    // An auth-enabled connect sends its authRequests in the
+                    // first two seconds; against a still-waking host every one
+                    // of them is lost before the listener exists. Re-drive the
+                    // handshake so the host hears it once it is up.
+                    self.retryAuthHandshakeIfStalled()
                 }
             } else {
                 if elapsed > 10.0 {
@@ -334,6 +360,19 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
                   self.clientNonce == nonce else { return }
             self.transmitAuthRequest(nonce: nonce, to: endpoint, attempt: attempt + 1)
         }
+    }
+
+    /// Restart the authRequest retransmit chain for a handshake that has had no
+    /// answer, reusing the existing nonce so a late challenge still matches.
+    /// Driven by the diagnostic timer while the host is presumed to be waking;
+    /// each call sends a fresh 4-shot chain and the chain self-terminates the
+    /// moment a challenge arrives.
+    private func retryAuthHandshakeIfStalled() {
+        guard isAuthenticating,
+              !authChallengeReceived,
+              let nonce = clientNonce,
+              let endpoint = hostEndpoint else { return }
+        transmitAuthRequest(nonce: nonce, to: endpoint, attempt: 1)
     }
 
     /// Step 2: handle authChallenge from host.

@@ -4,7 +4,6 @@ struct LocalCastSettingsView: View {
     @AppStorage("localCastQuality") var quality: LocalCastConfiguration.QualityPreset = .high
     @AppStorage("localCastCodec") var codec: LocalCastConfiguration.Codec = .hevc
     @AppStorage("localCastAdaptive") var adaptiveQuality = true
-    @AppStorage("showLatencyOverlay") var showOverlay = false
     @AppStorage("localCastAutoHost") var autoHost = false
     @AppStorage("localCastRequireAuth") var requireAuth = true
     @AppStorage("localCastInputRateLimit") var inputRateLimit = 120
@@ -110,9 +109,6 @@ struct LocalCastSettingsView: View {
                         Text("H.264 (Faster)").tag(LocalCastConfiguration.Codec.h264)
                         Text("HEVC (Smaller)").tag(LocalCastConfiguration.Codec.hevc)
                     }
-                    
-                    Toggle("Show stats overlay (resolution, codec, mode, bitrate, loss)", isOn: $showOverlay)
-                        .help("Live readout on the stream so you can verify settings took effect (resolution/codec/region-aware apply on the next session).")
                     
                     Toggle("Auto-host on launch", isOn: $autoHost)
                         .help("Automatically start hosting when TidalDrift launches")
