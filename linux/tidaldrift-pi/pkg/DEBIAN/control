@@ -1,0 +1,20 @@
+Package: tidaldrift-pi
+Version: 0.1.0
+Section: net
+Priority: optional
+Architecture: all
+Depends: avahi-daemon, tigervnc-standalone-server
+Recommends: openssh-server
+Maintainer: Goldberg Consulting, LLC <releases@measured.one>
+Description: TidalDrift companion for Raspberry Pi and other Debian systems
+ Makes a Linux machine a first-class target in TidalDrift on macOS.
+ Advertises SSH and VNC over Bonjour (_ssh._tcp, _rfb._tcp) so the
+ machine appears in the TidalDrift device list with working SSH and
+ Screen Share buttons, and runs a TigerVNC virtual desktop pinned to
+ port 5900 for macOS Screen Sharing to connect to.
+ .
+ Also publishes a TidalDrift peer beacon (_tidaldrift._tcp) with a
+ stable per-install peer ID and hardware metadata, so saved logins on
+ the Mac survive DHCP lease changes on this machine.
+ .
+ After installing, run: sudo tidaldrift-pi-setup <username>

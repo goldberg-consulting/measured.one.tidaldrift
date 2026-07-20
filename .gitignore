@@ -119,3 +119,4 @@ TidalDrift/TidalDrift\ *.app/
 
 # Cursor project metadata
 .cursor/
+linux/tidaldrift-pi/*.deb

@@ -1,0 +1,13 @@
+<?xml version="1.0" standalone='no'?>
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<!-- Advertise VNC (RFB) so TidalDrift on macOS shows a Screen Share
+     button. The TigerVNC virtual desktop from tidaldrift-pi-setup is
+     pinned to port 5900, which is also what macOS Screen Sharing
+     expects by default. -->
+<service-group>
+  <name replace-wildcards="yes">%h</name>
+  <service>
+    <type>_rfb._tcp</type>
+    <port>5900</port>
+  </service>
+</service-group>

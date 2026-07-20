@@ -1,0 +1,67 @@
+#!/bin/sh
+set -eu
+
+xml_escape() {
+    printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'
+}
+
+PEER_DIR=/etc/tidaldrift
+PEER_ID_FILE=$PEER_DIR/peer-id
+
+# Stable per-install identity. TidalDrift on macOS keys saved credentials
+# by this ID, so it must survive reinstalls and upgrades; only a purge
+# removes it.
+mkdir -p "$PEER_DIR"
+if [ ! -s "$PEER_ID_FILE" ]; then
+    if command -v uuidgen >/dev/null 2>&1; then
+        uuidgen | tr '[:upper:]' '[:lower:]' > "$PEER_ID_FILE"
+    else
+        cat /proc/sys/kernel/random/uuid > "$PEER_ID_FILE"
+    fi
+    chmod 0644 "$PEER_ID_FILE"
+fi
+PEER_ID=$(cat "$PEER_ID_FILE")
+
+MODEL="Linux"
+if [ -r /proc/device-tree/model ]; then
+    MODEL=$(tr -d '\0' < /proc/device-tree/model)
+fi
+OS="Linux"
+if [ -r /etc/os-release ]; then
+    OS=$(. /etc/os-release && printf '%s' "$PRETTY_NAME")
+fi
+
+# The peer beacon is metadata-only: TidalDrift reads the TXT records via
+# Bonjour and never connects to the advertised port. Generated here (not a
+# shipped conffile) because the peer ID and hardware strings are per-machine.
+cat > /etc/avahi/services/tidaldrift-peer.service <<EOF
+<?xml version="1.0" standalone='no'?>
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<service-group>
+  <name replace-wildcards="yes">%h</name>
+  <service>
+    <type>_tidaldrift._tcp</type>
+    <port>5959</port>
+    <txt-record>peerId=$(xml_escape "$PEER_ID")</txt-record>
+    <txt-record>model=$(xml_escape "$MODEL")</txt-record>
+    <txt-record>os=$(xml_escape "$OS")</txt-record>
+    <txt-record>version=0.1.0</txt-record>
+    <txt-record>screen=1</txt-record>
+    <txt-record>file=0</txt-record>
+  </service>
+</service-group>
+EOF
+
+systemctl daemon-reload >/dev/null 2>&1 || true
+if systemctl is-active --quiet avahi-daemon 2>/dev/null; then
+    systemctl reload-or-restart avahi-daemon >/dev/null 2>&1 || true
+fi
+
+echo ""
+echo "tidaldrift-pi installed. This machine now advertises SSH over Bonjour."
+echo "To enable the VNC virtual desktop (Screen Share button on the Mac):"
+echo ""
+echo "    sudo tidaldrift-pi-setup <username>"
+echo ""
+
+exit 0
