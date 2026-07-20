@@ -1,0 +1,2 @@
+/etc/avahi/services/tidaldrift-ssh.service
+/etc/avahi/services/tidaldrift-rfb.service

@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+
+if [ "$1" = "remove" ] || [ "$1" = "purge" ] || [ "$1" = "deconfigure" ]; then
+    # Stop and disable every per-user VNC instance, best effort.
+    systemctl list-units --type=service --all --plain --no-legend 'tidaldrift-vnc@*' 2>/dev/null \
+        | awk '{print $1}' \
+        | while read -r unit; do
+            [ -n "$unit" ] || continue
+            systemctl stop "$unit" >/dev/null 2>&1 || true
+            systemctl disable "$unit" >/dev/null 2>&1 || true
+        done
+fi
+
+exit 0

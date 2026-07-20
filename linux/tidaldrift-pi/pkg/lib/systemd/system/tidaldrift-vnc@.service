@@ -1,0 +1,23 @@
+[Unit]
+Description=TidalDrift VNC virtual desktop for %i (TigerVNC on port 5900)
+After=network.target avahi-daemon.service
+
+[Service]
+Type=forking
+User=%i
+WorkingDirectory=~
+# No PIDFile: tigervncserver names its pid file after the machine's FQDN,
+# which does not reliably match systemd's %H; Type=forking main-PID
+# detection plus ExecStop's clean kill are sufficient.
+# Virtual desktop on display :1, but pinned to port 5900 so macOS Screen
+# Sharing (and TidalDrift's advertised _rfb._tcp port) connect without a
+# display-number port offset. -localhost no exposes it on the LAN; access
+# is gated by the VNC password created by tidaldrift-pi-setup.
+ExecStartPre=/bin/sh -c 'test -s "/home/%i/.config/tigervnc/passwd" || test -s "/home/%i/.vnc/passwd" || { echo "No VNC password set. Run: sudo tidaldrift-pi-setup %i"; exit 1; }'
+ExecStart=/usr/bin/tigervncserver :1 -rfbport 5900 -localhost no -geometry 1920x1080 -depth 24
+ExecStop=/usr/bin/tigervncserver -kill :1
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,31 @@
+#!/bin/sh
+# Finish tidaldrift-pi setup for one user: set the VNC password and start
+# the virtual desktop service. Run as root: sudo tidaldrift-pi-setup <user>
+set -eu
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Run as root: sudo tidaldrift-pi-setup <username>" >&2
+    exit 1
+fi
+
+USER_NAME="${1:-${SUDO_USER:-}}"
+if [ -z "$USER_NAME" ] || ! id "$USER_NAME" >/dev/null 2>&1; then
+    echo "Usage: sudo tidaldrift-pi-setup <username>" >&2
+    exit 1
+fi
+
+echo "Setting the VNC password for $USER_NAME (used by macOS Screen Sharing)."
+su - "$USER_NAME" -c vncpasswd
+
+systemctl enable --now "tidaldrift-vnc@${USER_NAME}.service"
+systemctl reload-or-restart avahi-daemon
+
+HOSTNAME_LOCAL="$(hostname).local"
+echo ""
+echo "Done. This machine now advertises SSH and Screen Sharing over Bonjour."
+echo "From the Mac: it appears in TidalDrift as '$(hostname)', or connect"
+echo "directly with vnc://${HOSTNAME_LOCAL} and ssh ${USER_NAME}@${HOSTNAME_LOCAL}"
+echo ""
+echo "The VNC session is a virtual desktop (no monitor needed), 1920x1080,"
+echo "TCP 5900, password-protected. Traffic is not encrypted; keep it on"
+echo "the local network."
