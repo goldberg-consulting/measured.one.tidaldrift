@@ -14,7 +14,11 @@ WorkingDirectory=~
 # display-number port offset. -localhost no exposes it on the LAN; access
 # is gated by the VNC password created by tidaldrift-pi-setup.
 ExecStartPre=/bin/sh -c 'test -s "/home/%i/.config/tigervnc/passwd" || test -s "/home/%i/.vnc/passwd" || { echo "No VNC password set. Run: sudo tidaldrift-pi-setup %i"; exit 1; }'
-ExecStart=/usr/bin/tigervncserver :1 -rfbport 5900 -localhost no -geometry 1920x1080 -depth 24
+# SecurityTypes pinned to VncAuth: TigerVNC's default list (VncAuth,TLSVnc)
+# makes the server advertise VeNCrypt first, and macOS Screen Sharing does
+# not speak VeNCrypt; instead of falling back to VncAuth it aborts with
+# "the software on the remote computer appears to be incompatible".
+ExecStart=/usr/bin/tigervncserver :1 -rfbport 5900 -localhost no -geometry 1920x1080 -depth 24 -SecurityTypes VncAuth
 ExecStop=/usr/bin/tigervncserver -kill :1
 Restart=on-failure
 RestartSec=5
