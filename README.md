@@ -35,6 +35,12 @@ TidalDrift replaces the manual workflow of opening System Settings, toggling sha
 - Transfers via mounted SMB share when available; falls back to direct TCP
 - Configurable destination folder
 
+**Raspberry Pi / Linux Targets**
+- `tidaldrift-pi` Debian companion package (attached to each release) makes a Pi a first-class target: SSH and Screen Share buttons work like a Mac's
+- TigerVNC virtual desktop on port 5900 (headless-friendly), advertised over Bonjour, with a stable peer identity so saved logins survive DHCP changes
+- VNC compatibility handled automatically: the client probes RFB security types and adapts to classic VncAuth servers (TigerVNC, wayvnc, x11vnc) vs Mac and RealVNC authentication
+- Details in [docs/RASPBERRY_PI.md](docs/RASPBERRY_PI.md)
+
 **Other**
 - Wake-on-LAN with MAC auto-discovery
 - Clipboard sync between Macs
@@ -175,6 +181,8 @@ TidalDrift/
   Models/                 # DiscoveredDevice, ConnectionRecord, AppSettings
   ViewModels/             # Dashboard/device detail view models
   Utilities/              # NetworkUtils, ShellExecutor
+linux/
+  tidaldrift-pi/          # Debian companion package for Pi/Linux targets
 ```
 
 ## Configuration
