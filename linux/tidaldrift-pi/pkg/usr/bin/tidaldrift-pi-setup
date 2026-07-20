@@ -15,7 +15,13 @@ if [ -z "$USER_NAME" ] || ! id "$USER_NAME" >/dev/null 2>&1; then
 fi
 
 echo "Setting the VNC password for $USER_NAME (used by macOS Screen Sharing)."
-su - "$USER_NAME" -c vncpasswd
+# Prefer the tigervnc-prefixed binary: on systems where RealVNC is also
+# installed, plain vncpasswd resolves to RealVNC's incompatible tool.
+if command -v tigervncpasswd >/dev/null 2>&1; then
+    su - "$USER_NAME" -c tigervncpasswd
+else
+    su - "$USER_NAME" -c vncpasswd
+fi
 
 systemctl enable --now "tidaldrift-vnc@${USER_NAME}.service"
 systemctl reload-or-restart avahi-daemon

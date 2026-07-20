@@ -17,7 +17,7 @@ device list with working SSH and Screen Share buttons.
 ## Install
 
 ```bash
-sudo apt install -y ./tidaldrift-pi_0.1.0_all.deb
+sudo apt install -y ./tidaldrift-pi_0.1.1_all.deb
 sudo tidaldrift-pi-setup <username>
 ```
 
