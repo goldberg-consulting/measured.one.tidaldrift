@@ -193,6 +193,17 @@ jobs:
           git commit -m "bump tidaldrift to ${APP_VERSION}"
           git push origin main
 
+      # Runs after the DMG and tap are done so a companion-package failure
+      # can never block the Mac app release path.
+      - name: Build and upload tidaldrift-pi package
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          brew install dpkg
+          ./linux/tidaldrift-pi/build-deb.sh
+          gh release upload "${{ github.event.release.tag_name }}" \
+            linux/tidaldrift-pi/tidaldrift-pi_*_all.deb --clobber
+
       - name: Cleanup keychain
         if: always()
         run: security delete-keychain build.keychain 2>/dev/null || true
