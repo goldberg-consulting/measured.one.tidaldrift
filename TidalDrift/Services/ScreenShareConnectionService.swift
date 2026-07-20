@@ -95,9 +95,29 @@ class ScreenShareConnectionService: @unchecked Sendable {
             throw ConnectionError.resolutionFailed(error.localizedDescription)
         }
         
-        // Step 2: Connect using the resolved address
-        if let username = username, !username.isEmpty,
-           let password = password, !password.isEmpty {
+        // Step 2: Decide whether the server can use a username at all.
+        // Screen Sharing switches to Mac-style authentication whenever the
+        // vnc:// URL carries a username; against a server that only offers
+        // classic VncAuth (a Raspberry Pi running TigerVNC/wayvnc, x11vnc,
+        // etc.) it then aborts with "the software on the remote computer
+        // appears to be incompatible" instead of falling back to the plain
+        // password prompt. Probe the RFB handshake and drop the credentials
+        // for password-only servers; Screen Sharing then shows its password
+        // prompt and authenticates cleanly. Probe failure means unknown, so
+        // behavior is unchanged (never regress Mac-to-Mac connects).
+        var effectiveUsername = username
+        var effectivePassword = password
+        if let user = username, !user.isEmpty,
+           let types = await Self.probeVNCSecurityTypes(address: resolved.address, port: resolved.port),
+           !Self.serverAcceptsUsername(securityTypes: types) {
+            logger.info("🔌 Server offers security types \(types.sorted()) — password-only VNC; omitting username for compatibility")
+            effectiveUsername = nil
+            effectivePassword = nil
+        }
+
+        // Step 3: Connect using the resolved address
+        if let username = effectiveUsername, !username.isEmpty,
+           let password = effectivePassword, !password.isEmpty {
             try await connectWithCredentials(to: resolved.address, port: resolved.port, username: username, password: password)
         } else {
             // Always use the resolved IP for the VNC URL. Using a .local hostname
@@ -107,7 +127,7 @@ class ScreenShareConnectionService: @unchecked Sendable {
             logger.info("🔌 Using resolved IP for VNC URL: \(resolved.address)")
             
             let urlString: String
-            if let username = username, !username.isEmpty {
+            if let username = effectiveUsername, !username.isEmpty {
                 let escapedUser = username.addingPercentEncoding(withAllowedCharacters: .urlUserAllowed) ?? username
                 urlString = "vnc://\(escapedUser)@\(connectionAddress):\(resolved.port)"
             } else {
@@ -190,6 +210,85 @@ class ScreenShareConnectionService: @unchecked Sendable {
         }
     }
     
+    // MARK: - RFB security probe
+
+    /// Security types macOS Screen Sharing authenticates with a username:
+    /// Apple's DH/system auth family (30-36, offered by macOS hosts; measured
+    /// [30, 33, 35, 36] on a Tahoe host) and the RealVNC RSA-AES family
+    /// (5/6/129/130/133/134). Classic VncAuth (2), None (1), Tight (16), and
+    /// VeNCrypt (19) take no username; handing Screen Sharing one against
+    /// such a server aborts the connect as "incompatible software".
+    private static let usernameCapableSecurityTypes: Set<UInt8> = [5, 6, 30, 31, 32, 33, 34, 35, 36, 129, 130, 133, 134]
+
+    /// Whether a server offering `securityTypes` can consume a username.
+    static func serverAcceptsUsername(securityTypes: Set<UInt8>) -> Bool {
+        !securityTypes.isDisjoint(with: usernameCapableSecurityTypes)
+    }
+
+    /// Read the RFB handshake just far enough to learn the server's offered
+    /// security types (server version, client version reply, type list),
+    /// then close. Returns nil when the answer is unknowable (connect
+    /// failure, timeout, pre-3.7 server that sends no list); callers must
+    /// treat nil as "unknown" and keep their existing behavior.
+    static func probeVNCSecurityTypes(address: String, port: Int, timeout: TimeInterval = 2.5) async -> Set<UInt8>? {
+        guard let nwPort = NWEndpoint.Port(rawValue: UInt16(clamping: port)) else { return nil }
+        let queue = DispatchQueue(label: "com.tidaldrift.rfbprobe")
+
+        return await withCheckedContinuation { (continuation: CheckedContinuation<Set<UInt8>?, Never>) in
+            let connection = NWConnection(host: NWEndpoint.Host(address), port: nwPort, using: .tcp)
+            let didResume = AtomicFlag()
+
+            let finish: @Sendable (Set<UInt8>?) -> Void = { result in
+                guard didResume.compareAndSwap(expected: false, desired: true) else { return }
+                connection.cancel()
+                continuation.resume(returning: result)
+            }
+
+            connection.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    connection.receive(minimumIncompleteLength: 12, maximumLength: 12) { data, _, _, _ in
+                        guard let data, data.count == 12,
+                              let version = String(data: data, encoding: .ascii),
+                              version.hasPrefix("RFB "),
+                              !version.hasPrefix("RFB 003.003") else {
+                            // Not RFB, or a 3.3 server that sends a single
+                            // u32 type instead of a list: unknown.
+                            finish(nil)
+                            return
+                        }
+                        connection.send(content: Data("RFB 003.008\n".utf8), completion: .contentProcessed { error in
+                            guard error == nil else {
+                                finish(nil)
+                                return
+                            }
+                            connection.receive(minimumIncompleteLength: 1, maximumLength: 1) { countData, _, _, _ in
+                                guard let count = countData?.first, count > 0 else {
+                                    finish(nil)
+                                    return
+                                }
+                                connection.receive(minimumIncompleteLength: Int(count), maximumLength: Int(count)) { typesData, _, _, _ in
+                                    guard let typesData, typesData.count == Int(count) else {
+                                        finish(nil)
+                                        return
+                                    }
+                                    finish(Set(typesData))
+                                }
+                            }
+                        })
+                    }
+                case .failed, .cancelled:
+                    finish(nil)
+                default:
+                    break
+                }
+            }
+
+            connection.start(queue: queue)
+            queue.asyncAfter(deadline: .now() + timeout) { finish(nil) }
+        }
+    }
+
     /// Validate address format (IP or hostname)
     private func isValidAddress(_ address: String) -> Bool {
         // Allow .local hostnames
