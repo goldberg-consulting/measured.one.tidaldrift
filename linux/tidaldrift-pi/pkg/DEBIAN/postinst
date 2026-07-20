@@ -45,7 +45,7 @@ cat > /etc/avahi/services/tidaldrift-peer.service <<EOF
     <txt-record>peerId=$(xml_escape "$PEER_ID")</txt-record>
     <txt-record>model=$(xml_escape "$MODEL")</txt-record>
     <txt-record>os=$(xml_escape "$OS")</txt-record>
-    <txt-record>version=0.1.1</txt-record>
+    <txt-record>version=0.1.2</txt-record>
     <txt-record>screen=1</txt-record>
     <txt-record>file=0</txt-record>
   </service>

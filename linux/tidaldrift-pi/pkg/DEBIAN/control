@@ -1,5 +1,5 @@
 Package: tidaldrift-pi
-Version: 0.1.1
+Version: 0.1.2
 Section: net
 Priority: optional
 Architecture: all
