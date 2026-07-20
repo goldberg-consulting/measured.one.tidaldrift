@@ -15,19 +15,24 @@ jobs:
     name: Pre-commit
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install pre-commit and SwiftLint
         run: brew install pre-commit swiftlint
 
       - name: Run pre-commit hooks
+        # no-commit-to-branch guards *local* commits to main; in CI the
+        # checkout of main after a merge trips it and fails every push run.
+        # CI never commits, so the hook has no value here.
+        env:
+          SKIP: no-commit-to-branch
         run: pre-commit run --all-files
 
   homebrew-cask:
     name: Homebrew Cask
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Style cask
         run: brew style Casks/tidaldrift.rb
@@ -52,7 +57,7 @@ jobs:
     name: SwiftLint
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install SwiftLint
         run: brew install swiftlint
@@ -65,7 +70,7 @@ jobs:
     name: SwiftPM Build and Test
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode_16.3.app/Contents/Developer
@@ -82,7 +87,7 @@ jobs:
     name: Xcode Build
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode_16.3.app/Contents/Developer
