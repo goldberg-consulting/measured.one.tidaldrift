@@ -51,7 +51,11 @@ TidalDrift replaces the manual workflow of opening System Settings, toggling sha
 
 ### Homebrew (recommended)
 
+Homebrew 6 and later requires trusting a third-party tap before installing
+from it (one-time):
+
 ```bash
+brew trust --tap goldberg-consulting/tap
 brew install --cask goldberg-consulting/tap/tidaldrift
 ```
 
