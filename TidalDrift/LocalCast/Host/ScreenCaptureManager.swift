@@ -91,11 +91,46 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Current capture mode
     private(set) var captureMode: CaptureMode?
     
+    // Capture geometry is written by the capture transition tasks (start/stop)
+    // and by HostSession's window tracker, and read from the input injection
+    // path, so all of it goes through `geometryLock`.
+    private let geometryLock = NSLock()
+    private var _captureBounds: CGRect?
+    private var _capturedWindowID: CGWindowID?
+
     /// The screen bounds of the captured content (for input coordinate mapping)
-    /// For full display: the display bounds
+    /// For full display: the display bounds, or nil to track the main display
     /// For window: the window's frame on screen
-    /// For app: the bounding box of all app windows
-    private(set) var captureBounds: CGRect?
+    /// For app: the frame of the app window being streamed
+    var captureBounds: CGRect? {
+        geometryLock.lock(); defer { geometryLock.unlock() }
+        return _captureBounds
+    }
+
+    /// The window the active stream is bound to, for window and app capture
+    /// (app capture streams the app's largest window). `HostSession` polls this
+    /// window's live geometry so a moved or resized window does not leave input
+    /// mapping pointing at where the window used to be.
+    var capturedWindowID: CGWindowID? {
+        geometryLock.lock(); defer { geometryLock.unlock() }
+        return _capturedWindowID
+    }
+
+    private func setGeometry(bounds: CGRect?, windowID: CGWindowID?) {
+        geometryLock.lock()
+        _captureBounds = bounds
+        _capturedWindowID = windowID
+        geometryLock.unlock()
+    }
+
+    /// Re-point input mapping at a moved window without disturbing the stream.
+    /// A size change needs more than this: the stream's pixel dimensions are
+    /// fixed at creation, so the capture has to be rebuilt.
+    func refreshCaptureBounds(_ rect: CGRect) {
+        geometryLock.lock()
+        _captureBounds = rect
+        geometryLock.unlock()
+    }
     
     // MARK: - Full Display Capture
     
@@ -124,7 +159,7 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
         // input mapping; when capturing a non-main display (clamshell fallback,
         // external monitor) pass its global Quartz bounds so remote clicks land
         // on the captured display instead of the main one.
-        captureBounds = displayID == CGMainDisplayID() ? nil : CGDisplayBounds(displayID)
+        setGeometry(bounds: displayID == CGMainDisplayID() ? nil : CGDisplayBounds(displayID), windowID: nil)
         captureMode = .fullDisplay(displayID)
         try await startStream(with: filter, width: width, height: height, frameRate: frameRate, description: "display \(displayID)")
     }
@@ -175,7 +210,7 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
         // coordinate space CGEvent injection uses; SCWindow.frame can differ in
         // Y origin and throw remote clicks off when streaming a single window.
         let bounds = Self.quartzWindowBounds(windowID) ?? window.frame
-        captureBounds = bounds
+        setGeometry(bounds: bounds, windowID: windowID)
         captureMode = .singleWindow(windowID)
         
         logger.info("🪟 Window capture bounds (Quartz): \(NSStringFromRect(bounds)) [SCWindow.frame: \(NSStringFromRect(window.frame))]")
@@ -247,7 +282,7 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
         
         // Prefer Quartz (top-left) bounds for input mapping; see startWindowCapture.
         let bounds = Self.quartzWindowBounds(mainWindow.windowID) ?? mainWindow.frame
-        captureBounds = bounds
+        setGeometry(bounds: bounds, windowID: mainWindow.windowID)
         captureMode = .singleApp(processID)
         
         logger.info("📱 App capture bounds (Quartz): \(NSStringFromRect(bounds)) -> \(width)x\(height) pixels (retina: \(retinaScale)x)")
@@ -258,7 +293,7 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Y-down) from CGWindowList. This is the exact space `CGEvent` injection
     /// uses, so mapping remote clicks through it avoids the Y-origin mismatch
     /// that `SCWindow.frame` can introduce for single-window/app streaming.
-    private static func quartzWindowBounds(_ windowID: CGWindowID) -> CGRect? {
+    static func quartzWindowBounds(_ windowID: CGWindowID) -> CGRect? {
         guard let infoList = CGWindowListCopyWindowInfo(.optionIncludingWindow, windowID) as? [[String: Any]],
               let info = infoList.first,
               let boundsDict = info[kCGWindowBounds as String] as? NSDictionary else {
@@ -379,7 +414,7 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
         stream = nil
         activeConfig = nil
         captureMode = nil
-        captureBounds = nil
+        setGeometry(bounds: nil, windowID: nil)
         guard let current else { return }
 
         do {

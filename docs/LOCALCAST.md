@@ -241,6 +241,53 @@ Jellyfin-ffmpeg builds), but Apple Silicon has no hardware AV1 *encoder* exposed
 to VideoToolbox, and software AV1 is too slow for interactive Mac-to-Mac. HEVC
 remains the target codec; AV1 is a deferred research spike, not a dependency.
 
+### Fix 13: window geometry drift and stuck presentation (1.6.55)
+
+Symptom: resizing the viewer, full-screening something on either end, or
+running Apple Screen Sharing alongside LocalCast left the picture offset from
+where clicks landed, and sometimes froze the viewer entirely. Four independent
+causes, one per layer.
+
+- **Streamed window geometry was frozen at capture start (host).** Window and
+  app capture stored the target's on-screen rect once, and the SCStream kept
+  the pixel dimensions it was created with. Neither followed the window, so
+  moving it (drag, Stage Manager, Mission Control) sent every remote click to
+  where the window used to be, and resizing it left ScreenCaptureKit fitting
+  new content into the old frame: the picture arrived letterboxed *inside* the
+  video and input mapped through the wrong aspect ratio. Note the viewer's own
+  resize triggers exactly this, since it resizes the remote window over
+  Accessibility. `HostSession+WindowTracking` now polls the target's Quartz
+  bounds twice a second while capture is live: a move re-points input with no
+  stream disruption, a resize rebuilds capture at the new size (debounced 0.4 s
+  so a drag costs one rebuild, not one per tick), and the viewer coalesces its
+  own resize notifications over 0.25 s.
+- **A dead window target retried forever (host).** An app going full screen
+  destroys its windowed window and creates a new one, so a pinned window ID
+  stopped resolving. Capture start failed, the client's stall nudge re-drove
+  it against the same missing ID, and the viewer stayed frozen indefinitely.
+  A window that disappears (three consecutive misses, so a full-screen
+  animation is not mistaken for one) or fails to start now redirects to the
+  owning app, which picks up whatever window that app has now, and to the full
+  display if the app is gone. The fallback cannot cycle: an app target that
+  already failed to start goes straight to the display.
+- **Two aspect fits that could disagree (client).** The renderer letterboxed
+  against the decoded frame size while input letterboxed against the last
+  resolution callback. Those diverge for every frame after a host resolution
+  change, and permanently in tile mode where the canvas size never produces a
+  callback, which shows up as a constant click offset. Both now derive from
+  `MetalRenderer.aspectFitRect`, which also scales the drawn quad, so the
+  picture and the click are fitted by the same arithmetic (`VideoFitTests`).
+- **The display link could stay paused (client).** Presentation pauses while
+  the viewer is not visible, driven only by occlusion notifications. A
+  full-screen transition, a Space switch, or another window covering the viewer
+  could leave that state stale after the viewer came back: frames kept arriving
+  and decoding, nothing was ever presented, and the stream looked frozen with
+  no stall for the watchdog to detect. Visibility is now recomputed from the
+  window's actual state (occlusion, key, main, miniaturized) on every event
+  that can change it, including entering and leaving full screen. Full-screen
+  transitions also request a keyframe, and moving the viewer between displays
+  re-reads the refresh rate the jitter buffer paces against.
+
 ### Fix 12: lid-closed hosting, wheel scroll speed, stable credential identity (1.6.52)
 
 Lid-closed sessions failed at three independent layers; all are addressed.
