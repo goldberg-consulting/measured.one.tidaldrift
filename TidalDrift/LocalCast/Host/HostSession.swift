@@ -206,7 +206,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     private static let maxCaptureRestartAttempts = 5
 
     /// Sync wrapper so async contexts don't take the lock directly (Swift 6).
-    private func resetCaptureRestartAttempts() {
+    func resetCaptureRestartAttempts() {
         captureRestartLock.lock()
         captureRestartAttempts = 0
         captureRestartLock.unlock()
@@ -315,6 +315,29 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             self.displayChangeQueue.asyncAfter(deadline: .now() + Self.displayChangeDebounce, execute: work)
         }
     }
+
+    // MARK: - Streamed window geometry
+    //
+    // Window and app capture freeze the target's on-screen rect into
+    // `captureBounds` when the stream is created, and the SCStream keeps the
+    // pixel dimensions it was configured with. Neither follows the window, so
+    // moving it (drag, Stage Manager, Mission Control) left every remote click
+    // landing where the window used to be, and resizing it (including the
+    // resize the viewer itself requests) left ScreenCaptureKit fitting new
+    // content into the old frame, so the picture arrived letterboxed inside
+    // the video and input mapped through the wrong aspect. Polling the
+    // window's Quartz bounds catches both, plus the window disappearing
+    // (an app going full screen replaces its window). Implementations live in
+    // HostSession+WindowTracking.swift.
+    var windowTrackTimer: DispatchSourceTimer?
+    var trackedWindowBounds: CGRect?
+    var trackedWindowMisses = 0
+    var windowResizeRebuildWorkItem: DispatchWorkItem?
+    let windowTrackQueue = DispatchQueue(label: "com.tidaldrift.localcast.windowtrack")
+    static let windowTrackInterval: TimeInterval = 0.5
+    static let windowResizeDebounce: TimeInterval = 0.4
+    /// Ignore sub-pixel jitter in reported window geometry.
+    static let windowMoveEpsilon: CGFloat = 1.0
 
     // MARK: - Thermal throttling
     //
@@ -651,6 +674,9 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         return body()
     }
 
+    /// Whether ScreenCaptureKit is currently delivering frames for a viewer.
+    var isCaptureActive: Bool { withCaptureState { captureActive } }
+
     /// True when the client is on the same machine (127.0.0.1 or local IP).
     /// On loopback, input injection is skipped because CGEvent.post() moves the
     /// real cursor, which yanks it out of the viewer window creating a feedback loop.
@@ -668,6 +694,8 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             NotificationCenter.default.removeObserver(observer)
         }
         clientIdleTimer?.cancel()
+        windowTrackTimer?.cancel()
+        windowResizeRebuildWorkItem?.cancel()
         transport.stopListening()
         encoder.invalidate()
         inputInjector.restoreApps()
@@ -807,6 +835,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
                         try await self.startAppCapture(processID: processID)
                     }
                     self.updateInputBounds()
+                    self.startWindowTracking()
                     self.resetCaptureRestartAttempts()
                     // A fresh capture/encoder starts at the configured fps/bitrate;
                     // re-impose any active thermal caps on the new session.
@@ -816,6 +845,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
                     self.logger.error("❌ Failed to start capture for client: \(error.localizedDescription)")
                     self.withCaptureState { self.captureActive = false }
                     self.endStreamActivity()
+                    self.recoverFromCaptureStartFailure(error)
                 }
             }
         }
@@ -830,6 +860,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         }
         guard wasActive else { return }
         endStreamActivity()
+        stopWindowTracking()
 
         Task {
             await captureTransitions.run { [weak self] in
@@ -900,6 +931,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         clientIdleTimer = nil
         withCaptureState { captureActive = false }
         endStreamActivity()
+        stopWindowTracking()
         releaseUserActivityAssertion()
         resetAdaptiveBitrate()
 
@@ -1219,7 +1251,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     }
 
     /// True when a viewer endpoint or connection is installed.
-    private var hasActiveClient: Bool {
+    var hasActiveClient: Bool {
         sessionStateLock.lock()
         defer { sessionStateLock.unlock() }
         return _clientEndpoint != nil || _clientConnection != nil
@@ -1809,6 +1841,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
                 }
 
                 self.updateInputBounds()
+                self.startWindowTracking()
                 self.withCaptureState { self.captureActive = true }
             }
 
@@ -1861,6 +1894,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
                     try await self.startFullDisplayCapture()
                     self.captureTarget = .fullDisplay
                     self.updateInputBounds()
+                    self.startWindowTracking()
                     self.isRunning = true
                     // The start path cleared captureActive; restore it here so
                     // suspendCaptureForIdleClient is not left a permanent no-op.
@@ -1895,6 +1929,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
                 return had
             }
             if hadCapture {
+                self.stopWindowTracking()
                 await self.captureManager.stopCapture()
                 self.encoder.invalidate()
             }

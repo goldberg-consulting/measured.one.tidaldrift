@@ -123,6 +123,51 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     /// MTKView size for input coordinate normalization.
     var viewSize: CGSize { mtkView.frame.size }
 
+    /// The part of the Metal view actually covered by video, in view points.
+    /// The stream is letterboxed or pillarboxed to preserve its aspect ratio,
+    /// so remote coordinates must be normalized against this rect rather than
+    /// the whole view. Derived from the same source dimensions the vertex
+    /// buffer is built from: input used to letterbox against the last
+    /// resolution callback instead, which disagrees with what is drawn for
+    /// every frame after a host-side resolution change, and permanently in
+    /// tile mode where the canvas size never produces a callback. Main thread
+    /// only, like the source dimensions it reads.
+    var videoRect: CGRect {
+        let size = mtkView.frame.size
+        return Self.aspectFitRect(source: CGSize(width: sourceWidth, height: sourceHeight), in: size)
+    }
+
+    /// Letterbox (bars top and bottom) or pillarbox (bars left and right)
+    /// `source` inside `view`, preserving the source aspect ratio. The single
+    /// definition of where the video lands: the vertex buffer scales the quad
+    /// by it and input normalizes against it, so the picture and the click
+    /// cannot end up fitted differently. Degenerate inputs fill the view, which
+    /// is what the shader does before a frame has arrived.
+    static func aspectFitRect(source: CGSize, in view: CGSize) -> CGRect {
+        guard source.width > 0, source.height > 0, view.width > 0, view.height > 0 else {
+            return CGRect(origin: .zero, size: view)
+        }
+        let sourceAspect = source.width / source.height
+        let viewAspect = view.width / view.height
+        if sourceAspect > viewAspect {
+            let height = view.width / sourceAspect
+            return CGRect(x: 0, y: (view.height - height) / 2, width: view.width, height: height)
+        }
+        let width = view.height * sourceAspect
+        return CGRect(x: (view.width - width) / 2, y: 0, width: width, height: view.height)
+    }
+
+    /// Re-read the refresh rate of the screen the view is on. Otherwise this is
+    /// only set at init and on a drawable size change, so dragging the viewer
+    /// between panels of different refresh rates left the display link paced
+    /// for the old one.
+    func refreshDisplayLink() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.mtkView.preferredFramesPerSecond = Self.displayMaxFPS(for: self.mtkView)
+        }
+    }
+
     /// Convert a point from the SwiftUI hosting content view into the MTKView's
     /// coordinate space. This keeps input aligned in full screen where overlays
     /// live in the hosting view but the video is rendered by the Metal view.
@@ -326,20 +371,11 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         if size == lastDrawableSize { return }
         lastDrawableSize = size
         
-        let sourceAspect = CGFloat(sourceWidth) / CGFloat(sourceHeight)
-        let viewAspect = size.width / size.height
-        
-        var scaleX: Float = 1.0
-        var scaleY: Float = 1.0
-        
-        if sourceAspect > viewAspect {
-            // Source is wider than view — letterbox (black bars top/bottom)
-            scaleY = Float(viewAspect / sourceAspect)
-        } else if sourceAspect < viewAspect {
-            // Source is taller than view — pillarbox (black bars left/right)
-            scaleX = Float(sourceAspect / viewAspect)
-        }
-        // If equal, no scaling needed (full screen fill)
+        // Scale the clip-space quad by the same fit the input mapping uses.
+        let fit = Self.aspectFitRect(
+            source: CGSize(width: sourceWidth, height: sourceHeight), in: size)
+        let scaleX = Float(fit.width / size.width)
+        let scaleY = Float(fit.height / size.height)
         
         // Update vertex positions to maintain aspect ratio
         let vertexData: [Float] = [

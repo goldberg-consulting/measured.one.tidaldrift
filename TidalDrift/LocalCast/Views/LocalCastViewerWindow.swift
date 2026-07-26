@@ -9,6 +9,7 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
     private let keyboardTap = RemoteKeyboardTap()
     private var keyboardTapActive = false
     private var remoteResolution: CGSize = CGSize(width: 1280, height: 720)
+    private var hasSizedToRemote = false
     private var didCleanup = false
     
     /// Called when the window is closed so the owner can release its strong reference.
@@ -82,8 +83,14 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
             // For now, let's just update the internal resolution for coordinate mapping
             lcDebug("🌊 LocalCast: Remote resolution updated to \(size.width)x\(size.height)")
             
-            // If the window is still the default size, maybe resize it to fit the remote screen (scaled down if too big)
-            if window.frame.width == 1280 && window.frame.height == 720 {
+            // Size the viewer to the remote screen once, on the first
+            // resolution we learn. Keyed off a flag rather than "is the window
+            // still 1280x720": with the host now rebuilding capture whenever
+            // the streamed window resizes, a viewer that happened to be at the
+            // default size could be resized here, forward that size to the
+            // host, and get resized again by the resulting resolution change.
+            if !self.hasSizedToRemote {
+                self.hasSizedToRemote = true
                 let screenFrame = NSScreen.main?.visibleFrame ?? .zero
                 let maxWidth = screenFrame.width * 0.8
                 let maxHeight = screenFrame.height * 0.8
@@ -144,24 +151,25 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
             // offset that disappeared in full screen. Fall back to the hosting
             // view only if the renderer is not available yet.
             let point: NSPoint
-            let mapSize: CGSize
+            let videoRect: CGRect
             let mapFlipped: Bool
             if let renderer = self.clientSession.renderer, renderer.viewSize.width > 0 {
                 point = renderer.viewPoint(fromWindowPoint: event.locationInWindow)
-                mapSize = renderer.viewSize
+                videoRect = renderer.videoRect
                 mapFlipped = renderer.isViewFlipped
             } else {
                 point = contentView.convert(event.locationInWindow, from: nil)
-                mapSize = contentView.frame.size
+                videoRect = MetalRenderer.aspectFitRect(
+                    source: self.remoteResolution, in: contentView.frame.size)
                 mapFlipped = contentView.isFlipped
             }
             self.handleMouseEvent(
                 event,
                 at: point,
-                viewSize: mapSize,
+                videoRect: videoRect,
                 contentViewIsFlipped: mapFlipped
             )
-            if self.diagCount <= 20 { lcDebug("🖱️ FORWARDED to remote at (\(point.x / mapSize.width), \(point.y / mapSize.height)) flipped=\(mapFlipped)") }
+            if self.diagCount <= 20 { lcDebug("🖱️ FORWARDED to remote in video rect \(NSStringFromRect(videoRect)) flipped=\(mapFlipped)") }
             return nil
         }
         
@@ -222,10 +230,10 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
     private func handleMouseEvent(
         _ event: NSEvent,
         at point: NSPoint,
-        viewSize: CGSize,
+        videoRect: CGRect,
         contentViewIsFlipped: Bool
     ) {
-        guard viewSize.width > 0, viewSize.height > 0 else { return }
+        guard videoRect.width > 0, videoRect.height > 0 else { return }
 
         // Scroll carries deltas, not a position; forward it regardless of where
         // the cursor is (even over the letterbox bars). The precise flag rides
@@ -239,13 +247,6 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
             ))
             return
         }
-
-        // The renderer preserves the source aspect ratio by letterboxing /
-        // pillarboxing the stream inside the view, so the video does NOT fill the
-        // whole content view. Normalize against the actual video rect; otherwise
-        // clicks land offset from the cursor (most visible when the viewer window
-        // aspect differs from the streamed content, e.g. a single window).
-        let videoRect = aspectFitVideoRect(in: viewSize)
 
         let rawX = (point.x - videoRect.minX) / videoRect.width
         let yFromBottom = (point.y - videoRect.minY) / videoRect.height
@@ -274,27 +275,6 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
         }
     }
 
-    /// The rect within the content view actually occupied by the video, honoring
-    /// the source aspect ratio. Mirrors `MetalRenderer`'s letterbox/pillarbox so
-    /// input coordinates line up with what is on screen.
-    private func aspectFitVideoRect(in viewSize: CGSize) -> CGRect {
-        let src = remoteResolution
-        guard src.width > 0, src.height > 0 else {
-            return CGRect(origin: .zero, size: viewSize)
-        }
-        let srcAspect = src.width / src.height
-        let viewAspect = viewSize.width / viewSize.height
-        if srcAspect > viewAspect {
-            // Source wider than view → letterbox (bars top & bottom).
-            let h = viewSize.width / srcAspect
-            return CGRect(x: 0, y: (viewSize.height - h) / 2, width: viewSize.width, height: h)
-        } else {
-            // Source taller than view → pillarbox (bars left & right).
-            let w = viewSize.height * srcAspect
-            return CGRect(x: (viewSize.width - w) / 2, y: 0, width: w, height: viewSize.height)
-        }
-    }
-    
     private func handleKeyEvent(_ event: NSEvent) {
         let keyCode = event.keyCode
         // Keep only the standard, device-independent modifier bits (shift,
@@ -325,6 +305,8 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
 
         keyboardTap.stop()
         keyboardTapActive = false
+        pendingViewerSizeSend?.cancel()
+        pendingViewerSizeSend = nil
         for monitor in localMonitors {
             NSEvent.removeMonitor(monitor)
         }
@@ -341,12 +323,37 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
     
     // MARK: - Viewer → Remote Window Resize
     
+    /// Coalesces the resize notifications a full-screen transition or a Stage
+    /// Manager tile fires in quick succession. Each one that reaches the host
+    /// resizes the remote window and rebuilds its capture, so sending the
+    /// intermediate sizes costs a keyframe apiece for geometry that is already
+    /// stale by the time it arrives.
+    private var pendingViewerSizeSend: DispatchWorkItem?
+
     private func sendViewerSize() {
-        guard let contentView = window?.contentView else { return }
-        let size = contentView.frame.size
-        guard size.width > 0 && size.height > 0 else { return }
-        lcDebug("📐 Viewer content resized to \(size.width)x\(size.height) — forwarding to host")
-        clientSession.sendWindowResize(width: size.width, height: size.height)
+        pendingViewerSizeSend?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, let contentView = self.window?.contentView else { return }
+            let size = contentView.frame.size
+            guard size.width > 0 && size.height > 0 else { return }
+            lcDebug("📐 Viewer content resized to \(size.width)x\(size.height) — forwarding to host")
+            self.clientSession.sendWindowResize(width: size.width, height: size.height)
+        }
+        pendingViewerSizeSend = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
+    }
+
+    /// Recompute the render pause from the window's actual state. This used to
+    /// be driven only by occlusion notifications, so a full-screen transition,
+    /// a Space switch, or another app covering the viewer could leave the
+    /// display link paused after the viewer came back: frames kept arriving and
+    /// decoding but nothing was ever presented, and the stream looked frozen.
+    /// Every event that can change visibility funnels through here instead.
+    private func syncRenderPause() {
+        guard let window = self.window else { return }
+        let visible = !window.isMiniaturized
+            && (window.occlusionState.contains(.visible) || window.isKeyWindow || window.isMainWindow)
+        clientSession.renderer?.setPaused(!visible, reason: .notVisible)
     }
 }
 
@@ -372,17 +379,44 @@ extension LocalCastViewerWindowController: NSWindowDelegate {
     /// (miniaturized, fully covered, or on another Space). Rendering an
     /// invisible window burned GPU/CPU at the display refresh rate.
     func windowDidChangeOcclusionState(_ notification: Notification) {
-        guard let window = self.window else { return }
-        let visible = window.occlusionState.contains(.visible)
-        clientSession.renderer?.setPaused(!visible, reason: .notVisible)
+        syncRenderPause()
     }
 
     func windowDidMiniaturize(_ notification: Notification) {
-        clientSession.renderer?.setPaused(true, reason: .notVisible)
+        syncRenderPause()
     }
 
     func windowDidDeminiaturize(_ notification: Notification) {
-        clientSession.renderer?.setPaused(false, reason: .notVisible)
+        syncRenderPause()
+    }
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        syncRenderPause()
+    }
+
+    func windowDidBecomeMain(_ notification: Notification) {
+        syncRenderPause()
+    }
+
+    /// Full screen changes the surface size and can move the window to another
+    /// Space, either of which can leave the pause state stale. Ask for a
+    /// keyframe too so the first full-screen frame is a clean one rather than a
+    /// delta against whatever the drawable held.
+    func windowDidEnterFullScreen(_ notification: Notification) {
+        syncRenderPause()
+        clientSession.requestKeyFrame()
+    }
+
+    func windowDidExitFullScreen(_ notification: Notification) {
+        syncRenderPause()
+        clientSession.requestKeyFrame()
+    }
+
+    /// Moving between displays changes the refresh rate the jitter buffer paces
+    /// against.
+    func windowDidChangeScreen(_ notification: Notification) {
+        clientSession.renderer?.refreshDisplayLink()
+        syncRenderPause()
     }
 }
 

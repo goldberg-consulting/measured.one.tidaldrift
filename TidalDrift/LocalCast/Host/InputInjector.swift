@@ -11,8 +11,15 @@ class InputInjector {
     private var hasLoggedPermissionWarning = false
     
     /// The capture bounds for input mapping (defaults to full screen)
-    /// When capturing a window/app, this should be set to the window's frame
-    var captureBounds: CGRect?
+    /// When capturing a window/app, this should be set to the window's frame.
+    /// Written by the capture transition tasks and by the window tracker as the
+    /// streamed window moves, read on the input path, hence the lock.
+    private var _captureBounds: CGRect?
+    private let captureBoundsLock = NSLock()
+    var captureBounds: CGRect? {
+        get { captureBoundsLock.lock(); defer { captureBoundsLock.unlock() }; return _captureBounds }
+        set { captureBoundsLock.lock(); _captureBounds = newValue; captureBoundsLock.unlock() }
+    }
 
     /// Mouse button currently held down (0 = left, 1 = right, 2 = other), so a
     /// subsequent move can be injected as a drag rather than a plain move.
