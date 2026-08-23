@@ -4,7 +4,7 @@ struct MenuBarView: View {
     @EnvironmentObject var appState: AppState
     @ObservedObject private var localCast = LocalCastService.shared
     @ObservedObject private var discoveryService = NetworkDiscoveryService.shared
-    @ObservedObject private var clipboardService = ClipboardSyncService.shared
+    @ObservedObject private var clipboardPreferences = ClipboardSyncPreferences.shared
     @State private var isTogglingLocalCast = false
     @State private var isEditingName = false
     @State private var editingNameText = ""
@@ -384,7 +384,7 @@ struct MenuBarView: View {
                 Text("Clipboard Sync")
                     .font(.system(size: 12))
                 Spacer()
-                Toggle("", isOn: $clipboardService.isEnabled)
+                Toggle("", isOn: $clipboardPreferences.isEnabled)
                     .toggleStyle(.switch)
                     .scaleEffect(0.6)
                     .labelsHidden()
