@@ -1265,6 +1265,11 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         _lastClientPacketAt = nil
         _hasSentFirstVideoPacket = false
         sessionStateLock.unlock()
+
+        // UDP offers no delivery guarantee, so a key or button release can be
+        // lost with the client already gone. Clear the latch here or the host
+        // keyboard stays stuck for whoever is sitting in front of it.
+        inputInjector.releaseHeldInput()
     }
 
     /// Drop the client when no packet has arrived within the idle timeout.

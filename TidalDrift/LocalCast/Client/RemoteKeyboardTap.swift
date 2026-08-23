@@ -30,6 +30,12 @@ final class RemoteKeyboardTap {
     private var runLoopSource: CFRunLoopSource?
     private let logger = Logger(subsystem: "com.tidaldrift", category: "RemoteKeyboardTap")
 
+    /// Modifier keys forwarded as pressed and not yet forwarded as released.
+    /// Capture can disengage while a modifier is held (pressing Cmd, then
+    /// Cmd+Tabbing away), in which case the release arrives while we are passing
+    /// events through and would never reach the host.
+    private var heldModifierKeyCodes: Set<UInt16> = []
+
     /// Only the device-independent modifier bits. These line up with
     /// `NSEvent.ModifierFlags` and the host's `CGEventFlags(rawValue:)`, so the
     /// remote sees the same modifier state we do.
@@ -81,12 +87,23 @@ final class RemoteKeyboardTap {
     }
 
     func stop() {
+        releaseHeldModifiers()
         if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: false) }
         if let source = runLoopSource {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
         }
         runLoopSource = nil
         eventTap = nil
+    }
+
+    /// Tell the host to let go of every modifier we reported as pressed.
+    func releaseHeldModifiers() {
+        guard !heldModifierKeyCodes.isEmpty else { return }
+        let stuck = heldModifierKeyCodes
+        heldModifierKeyCodes.removeAll()
+        for keyCode in stuck {
+            onKey?(keyCode, 0, false)
+        }
     }
 
     deinit { stop() }
@@ -100,6 +117,9 @@ final class RemoteKeyboardTap {
         }
 
         guard shouldCapture?() == true else {
+            // Capture just disengaged. Anything still held would never see its
+            // release forwarded, so hand the host a clean slate on the way out.
+            releaseHeldModifiers()
             return Unmanaged.passUnretained(event)
         }
 
@@ -123,10 +143,20 @@ final class RemoteKeyboardTap {
         case .keyUp:
             onKey?(keyCode, modifiers, false)
         case .flagsChanged:
-            // Modifier press/release. Forward as key-down carrying the new flag
-            // set so the host mirrors the modifier state; subsequent key events
-            // carry the same flags, so combos like Cmd+Space resolve correctly.
-            onKey?(keyCode, modifiers, true)
+            // Modifier press or release: the event type is the same for both, so
+            // the direction comes from whether this key's own bit survives in
+            // the new flag set. Forwarding every one as a key-down left the
+            // modifier latched on the host, which swallowed all later typing as
+            // shortcuts.
+            guard let isDown = ModifierKey.isPress(keyCode: keyCode, flags: flags) else {
+                return Unmanaged.passUnretained(event)
+            }
+            if isDown {
+                heldModifierKeyCodes.insert(keyCode)
+            } else {
+                heldModifierKeyCodes.remove(keyCode)
+            }
+            onKey?(keyCode, modifiers, isDown)
         default:
             return Unmanaged.passUnretained(event)
         }

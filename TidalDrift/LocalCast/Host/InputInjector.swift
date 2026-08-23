@@ -4,11 +4,52 @@ import ApplicationServices
 import AppKit
 import OSLog
 
+/// Virtual key codes of the modifier keys, paired with the `CGEventFlags` bit
+/// each one contributes.
+///
+/// A `flagsChanged` event says which modifier changed but not whether it went
+/// down or up, so the client recovers the direction by testing the key's own
+/// bit against the new flag set, and the host uses the same table to know which
+/// modifiers are still latched.
+enum ModifierKey {
+    static let flagsByKeyCode: [UInt16: CGEventFlags] = [
+        54: .maskCommand,     // right command
+        55: .maskCommand,     // left command
+        56: .maskShift,       // left shift
+        60: .maskShift,       // right shift
+        58: .maskAlternate,   // left option
+        61: .maskAlternate,   // right option
+        59: .maskControl,     // left control
+        62: .maskControl,     // right control
+        57: .maskAlphaShift,  // caps lock
+        63: .maskSecondaryFn  // fn
+    ]
+
+    static func isModifier(_ keyCode: UInt16) -> Bool {
+        flagsByKeyCode[keyCode] != nil
+    }
+
+    /// Whether a `flagsChanged` event for `keyCode` is a press rather than a
+    /// release, judged by whether the key's own bit is still set in the flags
+    /// the event carries. Returns nil when `keyCode` is not a modifier.
+    static func isPress(keyCode: UInt16, flags: CGEventFlags) -> Bool? {
+        guard let bit = flagsByKeyCode[keyCode] else { return nil }
+        return flags.contains(bit)
+    }
+}
+
 class InputInjector {
     private let logger = Logger(subsystem: "com.tidaldrift", category: "InputInjector")
     private var inputCount = 0
     private var lastPermissionCheck: Date?
     private var hasLoggedPermissionWarning = false
+
+    /// Modifier keys the client pressed but has not released. Injected modifier
+    /// key-downs latch at the HID level, so a release that never arrives leaves
+    /// every later keystroke reading as a shortcut, which presents as a dead
+    /// keyboard on the host. Tracked so the latch can be cleared on departure.
+    /// `inject(_:)` is called sequentially per client, so a plain var is safe.
+    private var heldModifierKeyCodes: Set<UInt16> = []
     
     /// The capture bounds for input mapping (defaults to full screen)
     /// When capturing a window/app, this should be set to the window's frame.
@@ -291,6 +332,7 @@ class InputInjector {
                 return
             }
             event.flags = CGEventFlags(rawValue: modifiers)
+            if ModifierKey.isModifier(keyCode) { heldModifierKeyCodes.insert(keyCode) }
             lcDebug("[INPUT-DIAG] 💉 INJECTING keyDown keyCode=\(keyCode) modifiers=\(modifiers)")
             event.post(tap: .cghidEventTap)
             
@@ -300,6 +342,7 @@ class InputInjector {
                 return
             }
             event.flags = CGEventFlags(rawValue: modifiers)
+            heldModifierKeyCodes.remove(keyCode)
             lcDebug("[INPUT-DIAG] 💉 INJECTING keyUp keyCode=\(keyCode)")
             event.post(tap: .cghidEventTap)
             
@@ -322,6 +365,36 @@ class InputInjector {
                 logger.info("🔄 InputInjector: scroll deltaX=\(deltaX), deltaY=\(deltaY), units=\(precise ? "pixel" : "line")")
             }
             event.post(tap: .cghidEventTap)
+        }
+    }
+
+    /// Release every modifier key still latched from injected input, and any
+    /// held mouse button. Call this when the client goes away: UDP gives no
+    /// disconnect guarantee, so a release can be lost in flight, and a latched
+    /// Command key makes the host keyboard appear broken to whoever is sitting
+    /// in front of it.
+    func releaseHeldInput() {
+        let stuckKeys = heldModifierKeyCodes
+        heldModifierKeyCodes.removeAll()
+
+        for keyCode in stuckKeys {
+            guard let event = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false) else { continue }
+            event.flags = []
+            event.post(tap: .cghidEventTap)
+        }
+
+        if let button = heldMouseButton {
+            heldMouseButton = nil
+            let type: CGEventType = button == 0 ? .leftMouseUp : (button == 1 ? .rightMouseUp : .otherMouseUp)
+            let location = CGEvent(source: nil)?.location ?? .zero
+            if let mouseButton = CGMouseButton(rawValue: UInt32(button)),
+               let event = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: location, mouseButton: mouseButton) {
+                event.post(tap: .cghidEventTap)
+            }
+        }
+
+        if !stuckKeys.isEmpty {
+            logger.info("⌨️ Released \(stuckKeys.count) latched modifier key(s) after client departure")
         }
     }
 }
