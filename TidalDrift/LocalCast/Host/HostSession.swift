@@ -1295,6 +1295,9 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         sessionStateLock.unlock()
 
         logger.info("🛑 LocalCast: client idle > \(Self.clientIdleTimeout)s, dropping endpoint")
+        // The idle drop bypasses clearActiveClient, so clear the input latch
+        // here too; the vanished client can never send its releases.
+        inputInjector.releaseHeldInput()
         resetAuthForNewClient()
         suspendCaptureForIdleClient()
         return true
