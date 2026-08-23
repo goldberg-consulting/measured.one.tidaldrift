@@ -24,6 +24,8 @@ struct LocalCastPacket {
         case qualityUpdate = 19       // Client sends streaming quality tuning snapshot to host
         case tileUpdate = 20          // Host sends a changed screen region (region-aware streaming)
         case disconnect = 21          // Client notifies host it is leaving so the host can re-arm auth
+        case clipboardUpdate = 22     // Either side announces a clipboard change (inline content or bulk offer)
+        case clipboardFetchRequest = 23 // Host asks the client to connect and push offered clipboard content (payload: offer token)
     }
     
     static let headerSize = 13 // 1 (type) + 4 (seq) + 8 (timestamp)

@@ -144,6 +144,7 @@ class TidalDriftTestRunner: ObservableObject {
         allTests.append(("Streaming Tuning Interpolation", "LocalCast", testStreamingTuningInterpolation))
         allTests.append(("Quality Payload Encode/Decode", "LocalCast", testQualityPayloadCodable))
         allTests.append(("Packet Protocol Encode/Decode", "LocalCast", testPacketProtocol))
+        allTests.append(("Clipboard Bulk Loopback", "LocalCast", testClipboardBulkLoopback))
         allTests.append(("Host Session Start (loopback)", "LocalCast", testHostSessionLoopback))
     }
 }

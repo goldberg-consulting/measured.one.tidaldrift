@@ -25,7 +25,7 @@ final class LocalCastPipelineTests: XCTestCase {
             .config, .appListRequest, .appListResponse, .streamAppRequest,
             .streamAppResponse, .windowResize, .authRequest, .authChallenge,
             .authComplete, .authSuccess, .focusAppRequest, .isolateAppRequest,
-            .restoreAppsRequest, .qualityUpdate
+            .restoreAppsRequest, .qualityUpdate, .clipboardUpdate, .clipboardFetchRequest
         ]
 
         for type in allTypes {

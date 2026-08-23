@@ -173,6 +173,21 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
     /// Auth error message, if any.
     @Published var authError: String?
 
+    // MARK: - Clipboard sync
+
+    /// Created and driven on the main actor once the session is post-auth.
+    private var clipboardEngine: ClipboardSyncEngine?
+    private let clipboardBulk = ClipboardBulkClient()
+    /// The host resolves this address for the UDP session; the bulk channel
+    /// connects to the same address on the clipboard port.
+    private var resolvedHostAddress: String?
+    /// Outbound bulk content awaiting the host's clipboardFetchRequest.
+    /// Written on the main actor, read on the transport queue.
+    private let clipboardOutboundLock = NSLock()
+    private var clipboardOutbound: ClipboardSyncEngine.OutboundBulk?
+    /// Dedup for the triple-sent fetch request.
+    private var recentFetchTokens: [Data] = []
+
     init(device: DiscoveredDevice) {
         self.device = device
         transport.delegate = self
@@ -218,6 +233,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         // Store the host endpoint with resolved address (port from config so it can be changed if blocked)
         let port = NWEndpoint.Port(rawValue: LocalCastConfiguration.hostPort)!
         hostEndpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(resolvedAddress), port: port)
+        resolvedHostAddress = resolvedAddress
         logger.info("LocalCast: Host endpoint set to \(resolvedAddress):\(LocalCastConfiguration.hostPort)")
 
         // NOTE: We do NOT start a listener on the client side.
@@ -256,6 +272,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
     private func startPostAuthFlow() {
         DispatchQueue.main.async { [weak self] in
             self?.startHeartbeat()
+            self?.startClipboardSync()
         }
 
         for delay in [0.0, 0.5, 1.5] {
@@ -502,6 +519,8 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         diagnosticTimer = nil
         // Tearing down: no recovery cycle should be left pending.
         clearRecoveryState()
+
+        stopClipboardSync()
 
         // Tell the host we are leaving so it can re-arm auth immediately
         // instead of waiting out the idle timeout. Encrypted under the
@@ -808,6 +827,137 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         }
     }
 
+
+    // MARK: - Clipboard sync
+
+    @MainActor
+    private func startClipboardSync() {
+        // A loopback session (viewing this same Mac) would have both roles
+        // watching one pasteboard.
+        if let host = resolvedHostAddress,
+           host == "127.0.0.1" || host == "::1" || host == NetworkUtils.getLocalIPAddress() {
+            return
+        }
+
+        let engine = clipboardEngine ?? ClipboardSyncEngine()
+        clipboardEngine = engine
+
+        engine.sendUpdate = { [weak self] payload in
+            self?.sendClipboardUpdate(payload)
+        }
+        engine.publishOutbound = { [weak self] outbound in
+            guard let self else { return }
+            self.clipboardOutboundLock.lock()
+            self.clipboardOutbound = outbound
+            self.clipboardOutboundLock.unlock()
+        }
+        engine.cancelOutbound = { [weak self] in
+            guard let self else { return }
+            self.clipboardOutboundLock.lock()
+            self.clipboardOutbound = nil
+            self.clipboardOutboundLock.unlock()
+            self.clipboardBulk.cancelActive()
+        }
+        engine.fetchEager = { [weak self] offer, kind, completion in
+            guard let self, let host = self.resolvedHostAddress else {
+                completion(.failure(ClipboardBulkError.cancelled))
+                return
+            }
+            let key = self.transport.sessionKey.map(SessionCrypto.deriveClipboardKey)
+            Task {
+                do {
+                    let received = try await self.clipboardBulk.fetch(
+                        offer: offer, expectedKind: kind, host: host, key: key, cacheDir: nil
+                    )
+                    completion(.success(received))
+                } catch {
+                    completion(.failure(error))
+                }
+            }
+        }
+        engine.fetchFilesForPaste = { [weak self] offer, completion in
+            guard let self, let host = self.resolvedHostAddress else {
+                completion(.failure(ClipboardBulkError.cancelled))
+                return
+            }
+            let key = self.transport.sessionKey.map(SessionCrypto.deriveClipboardKey)
+            Task {
+                do {
+                    let received = try await self.clipboardBulk.fetch(
+                        offer: offer, expectedKind: .files, host: host, key: key,
+                        cacheDir: Self.clipboardCacheDirectory()
+                    )
+                    guard case .files(let urls) = received else {
+                        completion(.failure(ClipboardBulkError.manifestMismatch))
+                        return
+                    }
+                    completion(.success(urls))
+                } catch {
+                    completion(.failure(error))
+                }
+            }
+        }
+        engine.isFileSyncAllowed = { [weak self] in
+            self?.transport.sessionKey != nil
+        }
+        engine.start()
+    }
+
+    private func stopClipboardSync() {
+        clipboardBulk.cancelActive()
+        clipboardOutboundLock.lock()
+        clipboardOutbound = nil
+        clipboardOutboundLock.unlock()
+        DispatchQueue.main.async { [weak self] in
+            self?.clipboardEngine?.stop()
+        }
+    }
+
+    private func sendClipboardUpdate(_ payload: ClipboardUpdatePayload) {
+        guard let endpoint = hostEndpoint,
+              let encoded = try? JSONEncoder().encode(payload) else { return }
+        let packet = LocalCastPacket(
+            type: .clipboardUpdate,
+            sequenceNumber: 0,
+            timestamp: CFAbsoluteTimeGetCurrent() + kCFAbsoluteTimeIntervalSince1970,
+            payload: encoded
+        )
+        transport.send(packet: packet, to: endpoint)
+    }
+
+    /// The host asked for our offered content (its user pasted, or it is
+    /// eagerly resolving an image/text offer). Triple-sent, so dedup by token.
+    private func handleClipboardFetchRequest(token: Data) {
+        clipboardOutboundLock.lock()
+        if recentFetchTokens.contains(token) {
+            clipboardOutboundLock.unlock()
+            return
+        }
+        recentFetchTokens.append(token)
+        if recentFetchTokens.count > 8 { recentFetchTokens.removeFirst() }
+        let outbound = clipboardOutbound
+        clipboardOutboundLock.unlock()
+
+        guard let outbound, SessionCrypto.constantTimeEquals(outbound.token, token),
+              let host = resolvedHostAddress else { return }
+        let key = transport.sessionKey.map(SessionCrypto.deriveClipboardKey)
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await self.clipboardBulk.push(
+                    content: outbound.content, manifest: outbound.manifest,
+                    token: token, host: host, key: key
+                )
+            } catch {
+                lcDebug("📋 ClientSession: clipboard push failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private static func clipboardCacheDirectory() -> URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("TidalDriftClipboard", isDirectory: true)
+    }
 
     @MainActor
     private func startHeartbeat() {
@@ -1168,6 +1318,18 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
 
         case .authSuccess:
             handleAuthSuccess(payload: packet.payload)
+
+        case .clipboardUpdate:
+            // Inline limit plus JSON/base64 slack; anything larger is hostile.
+            guard packet.payload.count <= 64_000,
+                  let payload = try? JSONDecoder().decode(ClipboardUpdatePayload.self, from: packet.payload) else { return }
+            DispatchQueue.main.async { [weak self] in
+                self?.clipboardEngine?.handleRemoteUpdate(payload)
+            }
+
+        case .clipboardFetchRequest:
+            guard packet.payload.count == 32 else { return }
+            handleClipboardFetchRequest(token: packet.payload)
 
         default:
             lcDebug("❓ ClientSession: Received unknown packet type: \(packet.type)")

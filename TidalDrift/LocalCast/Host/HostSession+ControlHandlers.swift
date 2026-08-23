@@ -132,6 +132,7 @@ extension HostSession {
         setActiveClient(endpoint: endpoint, connection: nil)
         beginCaptureForClient()
         forceInitialKeyframes()
+        startClipboardSyncIfEligible()
     }
 
     // MARK: - Window Resize
