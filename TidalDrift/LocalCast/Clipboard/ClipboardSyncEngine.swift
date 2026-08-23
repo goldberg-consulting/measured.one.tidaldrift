@@ -38,6 +38,14 @@ final class ClipboardSyncEngine {
     private var timer: Timer?
     private var lastChangeCount = 0
     private var lastAppliedDigest: Data?
+    /// When the last remote apply happened. The outbound digest gate only
+    /// suppresses within a short window after an apply: its sole job is the
+    /// app-rewrite echo (an app observing our write and re-writing the same
+    /// content with a new change count), which happens promptly. An unbounded
+    /// gate would swallow the user deliberately re-copying that content for
+    /// the rest of the session.
+    private var lastAppliedAt: Date = .distantPast
+    private static let appliedEchoWindow: TimeInterval = 2.0
     private var recentUpdateIds: [UUID] = []
     private var promiseDelegate: ClipboardFilePromiseDelegate?
     private(set) var isRunning = false
@@ -75,9 +83,12 @@ final class ClipboardSyncEngine {
         lastChangeCount = count
 
         guard let snapshot = ClipboardPasteboard.capture(from: pasteboard) else { return }
-        // Echo gate: the content we just applied from the peer, possibly
-        // rewritten by an app that bumps the change count.
-        guard snapshot.digest != lastAppliedDigest else { return }
+        // Echo gate: the content we just applied from the peer, rewritten by
+        // an app that bumps the change count. Time-boxed; see lastAppliedAt.
+        if snapshot.digest == lastAppliedDigest,
+           Date().timeIntervalSince(lastAppliedAt) < Self.appliedEchoWindow {
+            return
+        }
         broadcast(snapshot)
     }
 
@@ -86,6 +97,9 @@ final class ClipboardSyncEngine {
         cancelOutbound?()
         promiseDelegate?.invalidate()
         promiseDelegate = nil
+        // The local pasteboard has moved on, so the receive-side duplicate
+        // gate must not keep suppressing the content it once applied.
+        lastAppliedDigest = nil
 
         let updateId = UUID()
 
@@ -236,5 +250,6 @@ final class ClipboardSyncEngine {
     private func recordApplied(changeCount: Int, digest: Data) {
         lastChangeCount = max(lastChangeCount, changeCount)
         lastAppliedDigest = digest
+        lastAppliedAt = Date()
     }
 }

@@ -24,7 +24,7 @@ final class ClipboardSyncTests: XCTestCase {
         let body = Data("clipboard hello".utf8)
         let frame = try XCTUnwrap(ClipboardBulkFraming.encodeFrame(type: .hello, body: body, key: key))
 
-        let length = frame.prefix(4).withUnsafeBytes { $0.load(as: UInt32.self) }.bigEndian
+        let length = frame.prefix(4).withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }.bigEndian
         XCTAssertEqual(Int(length), frame.count - 4)
 
         let plaintext = try XCTUnwrap(ClipboardBulkFraming.unseal(Data(frame.dropFirst(4)), key: key))
@@ -63,6 +63,36 @@ final class ClipboardSyncTests: XCTestCase {
         let decoded = try XCTUnwrap(ClipboardBulkFraming.decodeChunkBody(body))
         XCTAssertEqual(decoded.sequence, 7)
         XCTAssertEqual(decoded.content, content)
+    }
+
+    func test_chunkBody_decodesFromMisalignedSlice() throws {
+        // The real receive path hands decodeChunkBody a slice at offset 1 of
+        // the decrypted frame (behind the type tag). An aligned load(as:)
+        // traps on that; this pins the loadUnaligned fix.
+        let content = Data(repeating: 0xEE, count: 100)
+        var plaintext = Data([ClipboardBulkFrameType.chunk.rawValue])
+        plaintext.append(ClipboardBulkFraming.encodeChunkBody(sequence: 3, content: content))
+
+        let frame = try XCTUnwrap(ClipboardBulkFraming.decodeFrame(plaintext))
+        XCTAssertEqual(frame.type, .chunk)
+        let chunk = try XCTUnwrap(ClipboardBulkFraming.decodeChunkBody(frame.body))
+        XCTAssertEqual(chunk.sequence, 3)
+        XCTAssertEqual(chunk.content, content)
+    }
+
+    func test_promiseFileName_isSanitized() {
+        // The pasting app builds its destination path from fileNameForType;
+        // a raw manifest name would allow traversal out of the paste target.
+        let stubs = [ClipboardFileStub(name: "../../../evil.plist", size: 1)]
+        let delegate = ClipboardFilePromiseDelegate(stubs: stubs) { completion in
+            completion(.failure(ClipboardBulkError.cancelled))
+        }
+        let providers = delegate.makeProviders()
+        XCTAssertEqual(providers.count, 1)
+        XCTAssertEqual(
+            delegate.filePromiseProvider(providers[0], fileNameForType: "public.data"),
+            "evil.plist"
+        )
     }
 
     // MARK: - Names and collisions

@@ -66,7 +66,10 @@ final class ClipboardFilePromiseDelegate: NSObject, NSFilePromiseProviderDelegat
 
     func filePromiseProvider(_ filePromiseProvider: NSFilePromiseProvider, fileNameForType fileType: String) -> String {
         guard let index = filePromiseProvider.userInfo as? Int, stubs.indices.contains(index) else { return "clipboard" }
-        return stubs[index].name
+        // The pasting app builds the destination path from this name. The raw
+        // manifest name comes from the peer; handing it back unsanitized would
+        // let a crafted "../../name" land the paste outside the destination.
+        return ClipboardBulkFraming.sanitizeFileName(stubs[index].name) ?? "clipboard"
     }
 
     func operationQueue(for filePromiseProvider: NSFilePromiseProvider) -> OperationQueue {

@@ -185,8 +185,11 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
     /// Written on the main actor, read on the transport queue.
     private let clipboardOutboundLock = NSLock()
     private var clipboardOutbound: ClipboardSyncEngine.OutboundBulk?
-    /// Dedup for the triple-sent fetch request.
-    private var recentFetchTokens: [Data] = []
+    /// Dedup for the triple-sent fetch request. Time-windowed, not a permanent
+    /// set: file tokens are multi-use (a promise can be pasted again after a
+    /// failed or repeated paste), so only copies arriving close together may
+    /// collapse.
+    private var recentFetchTokens: [(token: Data, at: Date)] = []
 
     init(device: DiscoveredDevice) {
         self.device = device
@@ -928,13 +931,16 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
     /// The host asked for our offered content (its user pasted, or it is
     /// eagerly resolving an image/text offer). Triple-sent, so dedup by token.
     private func handleClipboardFetchRequest(token: Data) {
+        guard ClipboardSyncPreferences.isEnabledSnapshot() else { return }
+
+        let now = Date()
         clipboardOutboundLock.lock()
-        if recentFetchTokens.contains(token) {
+        recentFetchTokens.removeAll { now.timeIntervalSince($0.at) > 2.0 }
+        if recentFetchTokens.contains(where: { $0.token == token }) {
             clipboardOutboundLock.unlock()
             return
         }
-        recentFetchTokens.append(token)
-        if recentFetchTokens.count > 8 { recentFetchTokens.removeFirst() }
+        recentFetchTokens.append((token, now))
         let outbound = clipboardOutbound
         clipboardOutboundLock.unlock()
 
@@ -1320,8 +1326,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             handleAuthSuccess(payload: packet.payload)
 
         case .clipboardUpdate:
-            // Inline limit plus JSON/base64 slack; anything larger is hostile.
-            guard packet.payload.count <= 64_000,
+            guard packet.payload.count <= LocalCastConfiguration.clipboardInlinePacketCap,
                   let payload = try? JSONDecoder().decode(ClipboardUpdatePayload.self, from: packet.payload) else { return }
             DispatchQueue.main.async { [weak self] in
                 self?.clipboardEngine?.handleRemoteUpdate(payload)

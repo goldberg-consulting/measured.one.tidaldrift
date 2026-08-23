@@ -2,6 +2,7 @@ import Foundation
 import Network
 import CryptoKit
 import OSLog
+import os
 
 /// One framed, sealed TCP stream of the clipboard bulk protocol.
 /// Wraps an NWConnection with async frame reads and writes, enforcing the
@@ -25,18 +26,32 @@ final class ClipboardBulkStream: @unchecked Sendable {
     func awaitReady(timeout: TimeInterval) async throws {
         try await withDeadline(timeout) {
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-                var finished = false
+                // The handler can fire again after resolution (.cancelled
+                // following .ready); the lock guards the one-shot resume and
+                // satisfies strict concurrency for the captured state.
+                let finished = OSAllocatedUnfairLock(initialState: false)
                 self.connection.stateUpdateHandler = { state in
-                    guard !finished else { return }
+                    let isTerminal: Bool
                     switch state {
-                    case .ready:
-                        finished = true
-                        cont.resume()
-                    case .failed, .cancelled:
-                        finished = true
-                        cont.resume(throwing: ClipboardBulkError.connectionFailed)
+                    // .waiting means no viable path right now (host gone, port
+                    // closed). For a LAN peer with a live session this will
+                    // not self-heal within our window; fail fast.
+                    case .ready, .failed, .cancelled, .waiting:
+                        isTerminal = true
                     default:
-                        break
+                        isTerminal = false
+                    }
+                    guard isTerminal else { return }
+                    let shouldResume = finished.withLock { alreadyFinished in
+                        if alreadyFinished { return false }
+                        alreadyFinished = true
+                        return true
+                    }
+                    guard shouldResume else { return }
+                    if case .ready = state {
+                        cont.resume()
+                    } else {
+                        cont.resume(throwing: ClipboardBulkError.connectionFailed)
                     }
                 }
                 self.connection.start(queue: self.queue)
@@ -64,7 +79,7 @@ final class ClipboardBulkStream: @unchecked Sendable {
     /// Read one frame. Returns nil on orderly remote close before any bytes.
     func readFrame(timeout: TimeInterval = LocalCastConfiguration.clipboardIdleTimeout) async throws -> (type: ClipboardBulkFrameType, body: Data)? {
         guard let header = try await receiveExactly(4, timeout: timeout, eofAllowed: true) else { return nil }
-        let length = header.withUnsafeBytes { $0.load(as: UInt32.self) }.bigEndian
+        let length = header.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }.bigEndian
         guard length > 0, Int(length) <= ClipboardBulkFraming.maxFrameLength else {
             throw ClipboardBulkError.frameTooLarge
         }
@@ -84,6 +99,7 @@ final class ClipboardBulkStream: @unchecked Sendable {
     /// the first byte (returns nil); a close mid-read always throws.
     private func receiveExactly(_ count: Int, timeout: TimeInterval, eofAllowed: Bool) async throws -> Data? {
         var buffer = Data()
+        var consecutiveEmptyReads = 0
         while buffer.count < count {
             let remaining = count - buffer.count
             let piece = try await withDeadline(timeout) {
@@ -105,15 +121,34 @@ final class ClipboardBulkStream: @unchecked Sendable {
                 if buffer.isEmpty && eofAllowed { return nil }
                 throw ClipboardBulkError.badFrame
             }
+            // An empty non-terminal read should not occur with a minimum
+            // length of 1; bound it so a misbehaving stack cannot spin us.
+            if piece.isEmpty {
+                consecutiveEmptyReads += 1
+                guard consecutiveEmptyReads <= 32 else { throw ClipboardBulkError.badFrame }
+                continue
+            }
+            consecutiveEmptyReads = 0
             buffer.append(piece)
         }
         return buffer
     }
 
-    /// Race an operation against a wall-clock deadline.
+    /// Race an operation against a wall-clock deadline. The NWConnection
+    /// callbacks never observe Swift task cancellation on their own, so the
+    /// cancellation handler tears the connection down; that errors the pending
+    /// callback, resumes the continuation, and lets the child unwind. Without
+    /// it, a silent peer parks the operation child forever and the group never
+    /// returns, wedging the single-flight channel.
     private func withDeadline<T: Sendable>(_ seconds: TimeInterval, _ operation: @escaping @Sendable () async throws -> T) async throws -> T {
         try await withThrowingTaskGroup(of: T.self) { group in
-            group.addTask { try await operation() }
+            group.addTask {
+                try await withTaskCancellationHandler {
+                    try await operation()
+                } onCancel: {
+                    self.connection.cancel()
+                }
+            }
             group.addTask {
                 try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
                 throw ClipboardBulkError.timedOut
@@ -153,7 +188,7 @@ enum ClipboardBulkTransfer {
         case .files(let urls):
             for url in urls {
                 guard let handle = try? FileHandle(forReadingFrom: url) else {
-                    throw ClipboardBulkError.fileUnreadable(url.lastPathComponent)
+                    throw ClipboardBulkError.fileUnreadable
                 }
                 defer { try? handle.close() }
                 while let slice = try handle.read(upToCount: ClipboardBulkFraming.chunkSize), !slice.isEmpty {
@@ -181,58 +216,14 @@ enum ClipboardBulkTransfer {
             throw ClipboardBulkError.limitExceeded
         }
 
+        if let stubs = manifest.files {
+            guard manifest.kind == .files, let cacheDirectory else { throw ClipboardBulkError.manifestMismatch }
+            return try await receiveFiles(stubs: stubs, manifest: manifest, over: stream, cacheDirectory: cacheDirectory)
+        }
+
         var hasher = SHA256()
         var expectedSequence: UInt32 = 0
         var receivedBytes: Int64 = 0
-
-        if let stubs = manifest.files {
-            guard manifest.kind == .files, let cacheDirectory else { throw ClipboardBulkError.manifestMismatch }
-            let staging = cacheDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-            try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
-            var finished: [(name: String, temp: URL)] = []
-            var failed = true
-            defer { if failed { try? FileManager.default.removeItem(at: staging) } }
-
-            for stub in stubs {
-                guard let safeName = ClipboardBulkFraming.sanitizeFileName(stub.name), stub.size >= 0 else {
-                    throw ClipboardBulkError.manifestMismatch
-                }
-                let temp = staging.appendingPathComponent(UUID().uuidString)
-                FileManager.default.createFile(atPath: temp.path, contents: nil)
-                guard let handle = try? FileHandle(forWritingTo: temp) else {
-                    throw ClipboardBulkError.fileUnreadable(safeName)
-                }
-                var remaining = stub.size
-                while remaining > 0 {
-                    guard let frame = try await stream.readFrame(), frame.type == .chunk,
-                          let chunk = ClipboardBulkFraming.decodeChunkBody(frame.body),
-                          chunk.sequence == expectedSequence,
-                          Int64(chunk.content.count) <= remaining else {
-                        try? handle.close()
-                        throw ClipboardBulkError.badFrame
-                    }
-                    expectedSequence &+= 1
-                    hasher.update(data: chunk.content)
-                    try handle.write(contentsOf: chunk.content)
-                    remaining -= Int64(chunk.content.count)
-                    receivedBytes += Int64(chunk.content.count)
-                }
-                try handle.close()
-                finished.append((safeName, temp))
-            }
-
-            try await verifyTrailer(stream: stream, hasher: hasher)
-
-            var urls: [URL] = []
-            for entry in finished {
-                let destination = ClipboardBulkFraming.collisionFreeURL(for: entry.name, in: staging)
-                try FileManager.default.moveItem(at: entry.temp, to: destination)
-                urls.append(destination)
-            }
-            failed = false
-            return .files(urls)
-        }
-
         var data = Data()
         while receivedBytes < manifest.totalBytes {
             guard let frame = try await stream.readFrame(), frame.type == .chunk,
@@ -251,13 +242,78 @@ enum ClipboardBulkTransfer {
         return .data(kind: manifest.kind, data: data)
     }
 
+    /// Files branch of `receive`. Per-file sizes come from the peer's
+    /// manifest, so they are validated against the declared total, which was
+    /// itself validated against the transfer cap; without this a manifest
+    /// declaring a tiny total with huge per-file sizes streams unbounded
+    /// bytes to disk.
+    private static func receiveFiles(
+        stubs: [ClipboardFileStub],
+        manifest: ClipboardBulkManifest,
+        over stream: ClipboardBulkStream,
+        cacheDirectory: URL
+    ) async throws -> ClipboardBulkReceived {
+        let declaredTotal = stubs.reduce(Int64(0)) { $0 + $1.size }
+        guard stubs.allSatisfy({ $0.size >= 0 }),
+              declaredTotal == manifest.totalBytes,
+              declaredTotal <= LocalCastConfiguration.clipboardMaxTransferBytes else {
+            throw ClipboardBulkError.limitExceeded
+        }
+
+        var hasher = SHA256()
+        var expectedSequence: UInt32 = 0
+
+        let staging = cacheDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+        var finished: [(name: String, temp: URL)] = []
+        var failed = true
+        defer { if failed { try? FileManager.default.removeItem(at: staging) } }
+
+        for stub in stubs {
+            guard let safeName = ClipboardBulkFraming.sanitizeFileName(stub.name) else {
+                throw ClipboardBulkError.manifestMismatch
+            }
+            let temp = staging.appendingPathComponent(UUID().uuidString)
+            FileManager.default.createFile(atPath: temp.path, contents: nil)
+            guard let handle = try? FileHandle(forWritingTo: temp) else {
+                throw ClipboardBulkError.fileUnreadable
+            }
+            var remaining = stub.size
+            while remaining > 0 {
+                guard let frame = try await stream.readFrame(), frame.type == .chunk,
+                      let chunk = ClipboardBulkFraming.decodeChunkBody(frame.body),
+                      chunk.sequence == expectedSequence,
+                      Int64(chunk.content.count) <= remaining else {
+                    try? handle.close()
+                    throw ClipboardBulkError.badFrame
+                }
+                expectedSequence &+= 1
+                hasher.update(data: chunk.content)
+                try handle.write(contentsOf: chunk.content)
+                remaining -= Int64(chunk.content.count)
+            }
+            try handle.close()
+            finished.append((safeName, temp))
+        }
+
+        try await verifyTrailer(stream: stream, hasher: hasher)
+
+        var urls: [URL] = []
+        for entry in finished {
+            let destination = ClipboardBulkFraming.collisionFreeURL(for: entry.name, in: staging)
+            try FileManager.default.moveItem(at: entry.temp, to: destination)
+            urls.append(destination)
+        }
+        failed = false
+        return .files(urls)
+    }
+
     private static func verifyTrailer(stream: ClipboardBulkStream, hasher: SHA256) async throws {
         guard let frame = try await stream.readFrame(), frame.type == .trailer,
               let trailer = try? JSONDecoder().decode(ClipboardBulkTrailer.self, from: frame.body) else {
             throw ClipboardBulkError.badFrame
         }
-        var finalHasher = hasher
-        let digest = Data(finalHasher.finalize())
+        let digest = Data(hasher.finalize())
         guard SessionCrypto.constantTimeEquals(digest, trailer.sha256) else {
             throw ClipboardBulkError.digestMismatch
         }

@@ -1678,8 +1678,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             handleQualityUpdate(payload: packet.payload)
 
         case .clipboardUpdate:
-            // Inline limit plus JSON/base64 slack; anything larger is hostile.
-            guard packet.payload.count <= 64_000,
+            guard packet.payload.count <= LocalCastConfiguration.clipboardInlinePacketCap,
                   let payload = try? JSONDecoder().decode(ClipboardUpdatePayload.self, from: packet.payload) else { return }
             DispatchQueue.main.async { [weak self] in
                 self?.clipboardEngine?.handleRemoteUpdate(payload)

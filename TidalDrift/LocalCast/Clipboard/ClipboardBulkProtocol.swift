@@ -21,12 +21,12 @@ enum ClipboardBulkFrameType: UInt8 {
 /// First frame on every connection. `push` supplies its own manifest;
 /// `fetch` presents a token and receives the manifest in the hello-ack.
 struct ClipboardBulkHello: Codable {
-    enum Op: String, Codable {
+    enum Operation: String, Codable {
         case push
         case fetch
     }
 
-    let op: Op
+    let op: Operation
     let token: Data
     let manifest: ClipboardBulkManifest?
 }
@@ -83,7 +83,9 @@ enum ClipboardBulkError: Error, LocalizedError {
     case limitExceeded
     case timedOut
     case cancelled
-    case fileUnreadable(String)
+    // Deliberately carries no file name: this description reaches the logs,
+    // and file names are user content (potentially PHI/PII).
+    case fileUnreadable
 
     var errorDescription: String? {
         switch self {
@@ -97,7 +99,7 @@ enum ClipboardBulkError: Error, LocalizedError {
         case .limitExceeded: return "Clipboard content exceeds the transfer limit"
         case .timedOut: return "Clipboard transfer timed out"
         case .cancelled: return "Clipboard transfer was cancelled"
-        case .fileUnreadable(let name): return "Could not read \(name)"
+        case .fileUnreadable: return "Could not read one of the copied files"
         }
     }
 }
@@ -163,7 +165,9 @@ enum ClipboardBulkFraming {
 
     static func decodeChunkBody(_ body: Data) -> (sequence: UInt32, content: Data)? {
         guard body.count >= 4 else { return nil }
-        let seq = body.prefix(4).withUnsafeBytes { $0.load(as: UInt32.self) }.bigEndian
+        // The body is a slice starting one byte into the decrypted frame (the
+        // type tag), so it is never 4-byte aligned; a plain load(as:) traps.
+        let seq = body.prefix(4).withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }.bigEndian
         return (seq, body.dropFirst(4))
     }
 

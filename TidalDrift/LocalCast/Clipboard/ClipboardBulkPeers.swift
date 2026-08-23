@@ -8,6 +8,17 @@ import OSLog
 /// requested. Runs only while a session with an authenticated, non-loopback
 /// client is active.
 final class ClipboardBulkHost: @unchecked Sendable {
+    /// One armed inbound push: the token the host asked the client to use,
+    /// what kind of content it may carry, where files stage, a timer covering
+    /// "the client never connected", and the caller's completion.
+    private struct ExpectedPush {
+        let token: Data
+        let kind: ClipboardContentKind
+        let cacheDir: URL?
+        let timeout: DispatchWorkItem
+        let completion: (Result<ClipboardBulkReceived, Error>) -> Void
+    }
+
     private let logger = Logger(subsystem: "com.tidaldrift", category: "ClipboardBulkHost")
     private let queue = DispatchQueue(label: "com.tidaldrift.clipboard.bulk.host")
     private let lock = NSLock()
@@ -17,12 +28,23 @@ final class ClipboardBulkHost: @unchecked Sendable {
     private var key: SymmetricKey?
     private var allowedHost: String?
     private var busy = false
+    private var listening = false
 
     private var outbound: (token: Data, manifest: ClipboardBulkManifest, content: ClipboardBulkContent)?
-    private var expectedPush: (token: Data, kind: ClipboardContentKind, cacheDir: URL?, timeout: DispatchWorkItem, completion: (Result<ClipboardBulkReceived, Error>) -> Void)?
+    private var expectedPush: ExpectedPush?
 
     /// Whether the listener is bound; false degrades the session to inline-only sync.
-    private(set) var isListening = false
+    var isListening: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return listening
+    }
+
+    private func setListening(_ value: Bool) {
+        lock.lock()
+        listening = value
+        lock.unlock()
+    }
 
     func start(key: SymmetricKey?, allowedHost: String?) {
         lock.lock()
@@ -38,7 +60,7 @@ final class ClipboardBulkHost: @unchecked Sendable {
     func stop() {
         lock.lock()
         active = false
-        isListening = false
+        listening = false
         let listener = self.listener
         self.listener = nil
         outbound = nil
@@ -86,7 +108,10 @@ final class ClipboardBulkHost: @unchecked Sendable {
 
         lock.lock()
         let superseded = expectedPush
-        expectedPush = (token, kind, cacheDir, timeoutItem, completion)
+        expectedPush = ExpectedPush(
+            token: token, kind: kind, cacheDir: cacheDir,
+            timeout: timeoutItem, completion: completion
+        )
         lock.unlock()
 
         if let superseded {
@@ -111,10 +136,10 @@ final class ClipboardBulkHost: @unchecked Sendable {
                 guard let self else { return }
                 switch state {
                 case .ready:
-                    self.isListening = true
+                    self.setListening(true)
                     self.logger.info("📋 Clipboard bulk listener ready on \(LocalCastConfiguration.clipboardPort)")
                 case .failed(let error):
-                    self.isListening = false
+                    self.setListening(false)
                     self.logger.error("📋 Clipboard bulk listener failed: \(error.localizedDescription), rebinding")
                     self.lock.lock()
                     self.listener = nil
@@ -131,7 +156,7 @@ final class ClipboardBulkHost: @unchecked Sendable {
             lock.unlock()
             listener.start(queue: queue)
         } catch {
-            isListening = false
+            setListening(false)
             guard attempt < 3 else {
                 logger.error("📋 Clipboard bulk listener could not bind port \(LocalCastConfiguration.clipboardPort); file and large-payload sync disabled for this session")
                 return
@@ -144,6 +169,13 @@ final class ClipboardBulkHost: @unchecked Sendable {
     }
 
     private func handle(_ connection: NWConnection) {
+        // The doc promises a disabled receiver refuses bulk connections, not
+        // just that it stops offering.
+        guard ClipboardSyncPreferences.isEnabledSnapshot() else {
+            connection.cancel()
+            return
+        }
+
         lock.lock()
         let key = self.key
         let allowed = self.allowedHost
@@ -215,7 +247,7 @@ final class ClipboardBulkHost: @unchecked Sendable {
         lock.unlock()
     }
 
-    private func takeExpectedPush(matching token: Data, kind: ClipboardContentKind?) -> (token: Data, kind: ClipboardContentKind, cacheDir: URL?, timeout: DispatchWorkItem, completion: (Result<ClipboardBulkReceived, Error>) -> Void)? {
+    private func takeExpectedPush(matching token: Data, kind: ClipboardContentKind?) -> ExpectedPush? {
         lock.lock()
         defer { lock.unlock() }
         guard let expected = expectedPush,
@@ -335,7 +367,14 @@ final class ClipboardBulkClient: @unchecked Sendable {
         )
         let stream = ClipboardBulkStream(connection: connection, key: key, queue: queue)
         install(stream)
-        try await stream.awaitReady(timeout: 10)
+        do {
+            try await stream.awaitReady(timeout: 10)
+        } catch {
+            // The callers' defer only exists after open returns; without this
+            // a failed connect leaks the connection until the next copy.
+            finish(stream)
+            throw error
+        }
         return stream
     }
 
@@ -355,10 +394,23 @@ final class ClipboardBulkClient: @unchecked Sendable {
 
 enum ClipboardBulkPeerAddress {
     /// Extract the bare host string from an endpoint, stripping any interface
-    /// scope suffix ("192.168.1.20%en0" becomes "192.168.1.20").
+    /// scope suffix ("fe80::1%en0" becomes "fe80::1"). Switches on the host
+    /// enum rather than parsing the endpoint's description, whose format is
+    /// not a stable API. On keyless sessions this string is the only peer
+    /// gate, so both sides of the comparison must come through here.
     static func hostString(from endpoint: NWEndpoint) -> String? {
         guard case .hostPort(let host, _) = endpoint else { return nil }
-        let described = String(describing: host)
+        let described: String
+        switch host {
+        case .ipv4(let address):
+            described = String(describing: address)
+        case .ipv6(let address):
+            described = String(describing: address)
+        case .name(let name, _):
+            described = name
+        @unknown default:
+            return nil
+        }
         return described.split(separator: "%").first.map(String.init)
     }
 }

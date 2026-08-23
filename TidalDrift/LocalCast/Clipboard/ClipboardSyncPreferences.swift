@@ -12,7 +12,7 @@ import Combine
 final class ClipboardSyncPreferences: ObservableObject {
     static let shared = ClipboardSyncPreferences()
 
-    private nonisolated static let key = "clipboardSyncEnabled"
+    nonisolated private static let key = "clipboardSyncEnabled"
 
     @Published var isEnabled: Bool {
         didSet { UserDefaults.standard.set(isEnabled, forKey: Self.key) }

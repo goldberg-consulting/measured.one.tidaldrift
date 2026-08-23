@@ -181,6 +181,11 @@ struct LocalCastConfiguration: Codable {
     /// UDP control message dies on any single lost fragment.
     static let clipboardInlineLimit = 32 * 1024
 
+    /// Hard ceiling both sessions apply to a received clipboardUpdate packet
+    /// before decoding: the inline limit plus JSON/base64 slack. Kept next to
+    /// the limit so the two cannot drift apart.
+    static let clipboardInlinePacketCap = 64 * 1024
+
     /// Upper bound for one bulk transfer. Copying something larger is skipped
     /// with a log rather than stalling the session.
     static let clipboardMaxTransferBytes: Int64 = 100 * 1024 * 1024
