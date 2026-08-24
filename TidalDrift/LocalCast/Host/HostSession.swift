@@ -1274,6 +1274,11 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         _hasSentFirstVideoPacket = false
         sessionStateLock.unlock()
 
+        // UDP offers no delivery guarantee, so a key or button release can be
+        // lost with the client already gone. Clear the latch here or the host
+        // keyboard stays stuck for whoever is sitting in front of it.
+        inputInjector.releaseHeldInput()
+
         stopClipboardSync()
     }
 
@@ -1300,6 +1305,9 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         sessionStateLock.unlock()
 
         logger.info("🛑 LocalCast: client idle > \(Self.clientIdleTimeout)s, dropping endpoint")
+        // The idle drop bypasses clearActiveClient, so clear the input latch
+        // here too; the vanished client can never send its releases.
+        inputInjector.releaseHeldInput()
         stopClipboardSync()
         resetAuthForNewClient()
         suspendCaptureForIdleClient()

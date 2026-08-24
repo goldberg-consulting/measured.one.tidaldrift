@@ -289,7 +289,17 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
         case .keyUp:
             clientSession.sendInput(.keyUp(keyCode: keyCode, modifiers: UInt64(modifiers)))
         case .flagsChanged:
-            clientSession.sendInput(.keyDown(keyCode: keyCode, modifiers: UInt64(modifiers)))
+            // One event type covers both press and release, so the direction
+            // comes from whether this key's own bit survives in the new flag
+            // set. Sending a key-down for the release latched the modifier on
+            // the host and made the keyboard look dead.
+            let flags = CGEventFlags(rawValue: UInt64(modifiers))
+            guard let isDown = ModifierKey.isPress(keyCode: keyCode, flags: flags) else { break }
+            if isDown {
+                clientSession.sendInput(.keyDown(keyCode: keyCode, modifiers: UInt64(modifiers)))
+            } else {
+                clientSession.sendInput(.keyUp(keyCode: keyCode, modifiers: UInt64(modifiers)))
+            }
         default:
             break
         }
