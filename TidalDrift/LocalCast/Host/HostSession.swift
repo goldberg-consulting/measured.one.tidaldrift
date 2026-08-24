@@ -63,6 +63,12 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     let encoder = VideoEncoder()
     let inputInjector = InputInjector()
     let transport = UDPTransport()
+
+    /// Clipboard sync over the session (see HostSession+Clipboard.swift).
+    /// The engine is created and driven on the main actor; the bulk host has
+    /// its own queue and locking.
+    let clipboardBulkHost = ClipboardBulkHost()
+    var clipboardEngine: ClipboardSyncEngine?
     private let captureTransitions = CaptureTransitionQueue()
 
     /// Software display for lid-closed / headless hosting. Created on demand
@@ -158,14 +164,16 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     private(set) var allowedAppPIDs: Set<pid_t> = []
     private var allowedWindowIDs: Set<CGWindowID> = []
 
-    // Store both the endpoint and the connection for proper bidirectional communication
+    // Store both the endpoint and the connection for proper bidirectional
+    // communication. Readable by same-module extensions (clipboard sync routes
+    // control packets to the active client); mutation stays in this file.
     private var _clientEndpoint: NWEndpoint?
-    private var clientEndpoint: NWEndpoint? {
+    private(set) var clientEndpoint: NWEndpoint? {
         get { sessionStateLock.lock(); defer { sessionStateLock.unlock() }; return _clientEndpoint }
         set { sessionStateLock.lock(); _clientEndpoint = newValue; sessionStateLock.unlock() }
     }
     private var _clientConnection: NWConnection?
-    private var clientConnection: NWConnection? {
+    private(set) var clientConnection: NWConnection? {
         get { sessionStateLock.lock(); defer { sessionStateLock.unlock() }; return _clientConnection }
         set { sessionStateLock.lock(); _clientConnection = newValue; sessionStateLock.unlock() }
     }
@@ -1270,6 +1278,8 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         // lost with the client already gone. Clear the latch here or the host
         // keyboard stays stuck for whoever is sitting in front of it.
         inputInjector.releaseHeldInput()
+
+        stopClipboardSync()
     }
 
     /// Drop the client when no packet has arrived within the idle timeout.
@@ -1298,6 +1308,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         // The idle drop bypasses clearActiveClient, so clear the input latch
         // here too; the vanished client can never send its releases.
         inputInjector.releaseHeldInput()
+        stopClipboardSync()
         resetAuthForNewClient()
         suspendCaptureForIdleClient()
         return true
@@ -1475,6 +1486,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
 
         beginCaptureForClient()
         forceInitialKeyframes()
+        startClipboardSyncIfEligible()
     }
 
     /// Force an initial keyframe and schedule three follow-ups over the next
@@ -1672,6 +1684,13 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
 
         case .qualityUpdate:
             handleQualityUpdate(payload: packet.payload)
+
+        case .clipboardUpdate:
+            guard packet.payload.count <= LocalCastConfiguration.clipboardInlinePacketCap,
+                  let payload = try? JSONDecoder().decode(ClipboardUpdatePayload.self, from: packet.payload) else { return }
+            DispatchQueue.main.async { [weak self] in
+                self?.clipboardEngine?.handleRemoteUpdate(payload)
+            }
 
         case .stats:
             if let telemetry = try? JSONDecoder().decode(LocalCastClientTelemetry.self, from: packet.payload) {

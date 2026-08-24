@@ -121,7 +121,7 @@ struct TroubleshootingView: View {
                         FeatureCheckRow(icon: "checkmark.circle.fill", text: "All Standard features", available: true)
                         FeatureCheckRow(icon: "checkmark.circle.fill", text: "Auto peer detection", available: true)
                         FeatureCheckRow(icon: "checkmark.circle.fill", text: "TidalDrop (drag & drop files)", available: true)
-                        FeatureCheckRow(icon: "checkmark.circle.fill", text: "Clipboard sync (β)", available: true)
+                        FeatureCheckRow(icon: "checkmark.circle.fill", text: "Clipboard sync (during LocalCast)", available: true)
                         FeatureCheckRow(icon: "checkmark.circle.fill", text: "Hardware info display", available: true)
                         FeatureCheckRow(icon: "checkmark.circle.fill", text: "One-click setup", available: true)
                     }
@@ -372,13 +372,14 @@ struct TroubleshootingView: View {
 
                 InfoCard(
                     icon: "doc.on.clipboard",
-                    title: "Clipboard Sync (β)",
+                    title: "Clipboard Sync",
                     description: """
-                    Shares your clipboard between Macs running TidalDrift.
+                    Shares your clipboard between the two Macs of an active LocalCast session, in both directions.
 
-                    Current status: Basic implementation. Uses Bonjour to find peers and syncs text content. May not work reliably with images or large content.
+                    Text, rich text, images, and files are supported. Traffic is encrypted with the session key on password-protected sessions.
+                    Password-manager copies are never synced. Copied files transfer when you paste them and land where you paste.
                     """,
-                    status: .experimental
+                    status: .info
                 )
             }
         }

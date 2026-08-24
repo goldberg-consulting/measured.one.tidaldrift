@@ -5,7 +5,7 @@ import ApplicationServices
 struct StatusCardView: View {
     @EnvironmentObject var appState: AppState
     @ObservedObject private var localCast = LocalCastService.shared
-    @ObservedObject private var clipboard = ClipboardSyncService.shared
+    @ObservedObject private var clipboard = ClipboardSyncPreferences.shared
     private let logger = Logger(subsystem: "com.tidaldrift", category: "StatusCard")
 
     @State private var isTogglingScreen = false

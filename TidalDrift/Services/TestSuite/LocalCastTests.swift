@@ -116,6 +116,63 @@ extension TidalDriftTestRunner {
         return (true, "Packet protocol: serialize/deserialize OK, \(testTypes.count) types verified, \(serialized.count)B wire format")
     }
     
+    func testClipboardBulkLoopback() async -> (Bool, String) {
+        let key = SessionCrypto.deriveClipboardKey(from: SessionCrypto.generateSessionKey())
+        let host = ClipboardBulkHost()
+        host.start(key: key, allowedHost: "127.0.0.1")
+        defer { host.stop() }
+        try? await Task.sleep(nanoseconds: 300_000_000)
+
+        // Fetch path: host offers large text, client fetches it. The size
+        // forces multiple sealed chunk frames.
+        let text = String(repeating: "tidal", count: 60_000)
+        guard let content = try? JSONEncoder().encode(ClipboardTextContent(text: text, rtf: nil)) else {
+            return (false, "Could not encode test content")
+        }
+        let token = SessionCrypto.generateNonce()
+        let manifest = ClipboardBulkManifest(
+            updateId: UUID(), kind: .text, totalBytes: Int64(content.count), files: nil
+        )
+        host.publishOffer(token: token, manifest: manifest, content: .data(kind: .text, data: content))
+
+        let client = ClipboardBulkClient()
+        let offer = ClipboardBulkOffer(token: token, totalBytes: manifest.totalBytes, files: nil)
+        do {
+            let received = try await client.fetch(
+                offer: offer, expectedKind: .text, host: "127.0.0.1", key: key, cacheDir: nil
+            )
+            guard case .data(_, let data) = received, data == content else {
+                return (false, "Fetched content does not match the offer")
+            }
+        } catch {
+            return (false, "Fetch failed: \(error.localizedDescription)")
+        }
+
+        // Push path: host arms the expected-push slot, client pushes an image
+        // blob, host receives it verified.
+        let blob = Data((0..<600_000).map { UInt8($0 % 251) })
+        let pushToken = SessionCrypto.generateNonce()
+        let pushManifest = ClipboardBulkManifest(
+            updateId: UUID(), kind: .image, totalBytes: Int64(blob.count), files: nil
+        )
+        let pushResult: Result<ClipboardBulkReceived, Error> = await withCheckedContinuation { cont in
+            host.expectPush(token: pushToken, kind: .image, cacheDir: nil) { result in
+                cont.resume(returning: result)
+            }
+            Task {
+                try? await client.push(
+                    content: .data(kind: .image, data: blob), manifest: pushManifest,
+                    token: pushToken, host: "127.0.0.1", key: key
+                )
+            }
+        }
+        guard case .success(.data(_, let pushed)) = pushResult, pushed == blob else {
+            return (false, "Pushed content did not arrive intact")
+        }
+
+        return (true, "Bulk loopback OK: fetched \(content.count)B text, pushed \(blob.count)B image, sealed and digest-verified")
+    }
+
     func testHostSessionLoopback() async -> (Bool, String) {
         guard CGPreflightScreenCaptureAccess() else {
             return (false, "Skipped — Screen Recording permission required")

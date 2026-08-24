@@ -33,7 +33,6 @@
         <string>_afpovertcp._tcp</string>
         <string>_ssh._tcp</string>
         <string>_tidaldrift._tcp</string>
-        <string>_tidalclip._tcp</string>
         <string>_tidalstream._tcp</string>
         <string>_tidaldrop._tcp</string>
         <string>_tidaldrift-cast._udp</string>

@@ -9,6 +9,9 @@ enum SessionCrypto {
     
     /// Domain separator prevents cross-protocol key reuse.
     private static let pairingInfo = "LocalCast-Pairing-v1".data(using: .utf8)!
+
+    /// Domain separator for the clipboard bulk channel subkey.
+    private static let clipboardInfo = Data("LocalCast-Clipboard-v1".utf8)
     
     // MARK: - Key & PIN Generation
     
@@ -17,11 +20,12 @@ enum SessionCrypto {
         SymmetricKey(size: .bits256)
     }
     
-    /// Generate a random 32-byte nonce for the auth handshake.
+    /// Generate 32 random bytes (auth nonces, clipboard offer tokens).
+    /// CryptoKit's RNG traps rather than silently failing, unlike
+    /// SecRandomCopyBytes whose ignored status could have yielded an all-zero,
+    /// predictable token.
     static func generateNonce() -> Data {
-        var bytes = [UInt8](repeating: 0, count: 32)
-        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
-        return Data(bytes)
+        SymmetricKey(size: .bits256).withUnsafeBytes { Data($0) }
     }
     
     // MARK: - Key Derivation
@@ -44,6 +48,26 @@ enum SessionCrypto {
         return derived
     }
     
+    /// Derive the clipboard bulk-channel key from the session key. A distinct
+    /// subkey keeps bulk traffic cryptographically separated from the UDP
+    /// session without a second handshake.
+    static func deriveClipboardKey(from sessionKey: SymmetricKey) -> SymmetricKey {
+        HKDF<SHA256>.deriveKey(
+            inputKeyMaterial: sessionKey,
+            info: clipboardInfo,
+            outputByteCount: 32
+        )
+    }
+
+    /// Compare two byte sequences without early exit, for token checks where a
+    /// timing side channel would let a connecting peer probe byte by byte.
+    static func constantTimeEquals(_ lhs: Data, _ rhs: Data) -> Bool {
+        guard lhs.count == rhs.count else { return false }
+        var diff: UInt8 = 0
+        for (a, b) in zip(lhs, rhs) { diff |= a ^ b }
+        return diff == 0
+    }
+
     // MARK: - Encrypt / Decrypt
     
     /// Plaintext prefix byte (used during auth handshake only).

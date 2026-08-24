@@ -191,5 +191,8 @@ The build script:
 - Audio capture and forwarding
 - Stronger password key derivation: the pairing key currently uses HKDF-SHA256, which is fast by design and not a brute-force-resistant password hash. A slow, memory-hard KDF (for example scrypt or Argon2) over the password would harden weak passwords against offline guessing.
 - Re-enabling the client-driven in-viewer app picker (the host side already handles `streamAppRequest`)
-- Clipboard sync during LocalCast sessions
 - File drop into the viewer window
+
+## Clipboard sync
+
+While a session is active, copying on either machine makes the content pasteable on the other, in both directions. Small text and RTF payloads (at or below 32 KiB encoded) travel as `clipboardUpdate` packets on the UDP session, sent three times and deduplicated by update id, inheriting the session's AES-256-GCM encryption. Images and large payloads move eagerly over a TCP bulk channel on port 5906; the client always initiates the connection, frames are sealed with an HKDF subkey of the session key, and a SHA-256 trailer validates the transfer. Copied files are offered lazily: the receiver's pasteboard holds file promises, and bytes move only when the user pastes, landing in the paste destination without overwriting existing names. File sync requires a password-protected session; passwordless sessions sync text and images only. Pasteboards marked with the nspasteboard.org concealed, transient, or auto-generated types (password managers) are never synced. Design details: `docs/CLIPBOARD_SYNC.md`.

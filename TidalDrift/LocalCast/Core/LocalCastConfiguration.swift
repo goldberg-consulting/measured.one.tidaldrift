@@ -166,6 +166,35 @@ struct LocalCastConfiguration: Codable {
     /// Host listens here; client connects here. If your firewall blocks 5904, change this and ensure
     /// both host and client use the same port (e.g. via a build-time constant or settings).
     static let hostPort: UInt16 = 5904
+
+    // MARK: - Clipboard sync
+
+    /// TCP port for the clipboard bulk channel. The host listens here only
+    /// while a session with an authenticated, non-loopback client is running;
+    /// the client initiates every connection regardless of transfer direction.
+    /// 5905 is taken by the UDP speed test.
+    static let clipboardPort: UInt16 = 5906
+
+    /// Clipboard payloads whose encoded size is at or below this ride the UDP
+    /// session inline (triple-send, updateId dedup). Larger payloads and all
+    /// files go over the TCP bulk channel, which retransmits; a multi-fragment
+    /// UDP control message dies on any single lost fragment.
+    static let clipboardInlineLimit = 32 * 1024
+
+    /// Hard ceiling both sessions apply to a received clipboardUpdate packet
+    /// before decoding: the inline limit plus JSON/base64 slack. Kept next to
+    /// the limit so the two cannot drift apart.
+    static let clipboardInlinePacketCap = 64 * 1024
+
+    /// Upper bound for one bulk transfer. Copying something larger is skipped
+    /// with a log rather than stalling the session.
+    static let clipboardMaxTransferBytes: Int64 = 100 * 1024 * 1024
+
+    /// Upper bound on files in a single clipboard copy.
+    static let clipboardMaxFiles = 64
+
+    /// A bulk transfer with no frame activity for this long is abandoned.
+    static let clipboardIdleTimeout: TimeInterval = 30
 }
 
 // MARK: - Live Streaming Quality Tuning

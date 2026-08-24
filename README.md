@@ -23,6 +23,7 @@ TidalDrift replaces the manual workflow of opening System Settings, toggling sha
 - Retina-quality with adaptive resolution (720p to 4K)
 - Remote mouse and keyboard input with configurable rate limiting
 - Live quality tuning slider synced between client and host
+- Clipboard sync during sessions: text, rich text, images, and files paste across machines in both directions, encrypted with the session key; password-manager copies are never synced
 
 **Network Discovery**
 - Bonjour/mDNS service browsing for `_rfb._tcp`, `_smb._tcp`, `_ssh._tcp`, and TidalDrift peers
@@ -43,7 +44,6 @@ TidalDrift replaces the manual workflow of opening System Settings, toggling sha
 
 **Other**
 - Wake-on-LAN with MAC auto-discovery
-- Clipboard sync between Macs
 - Guided setup wizard for Screen Sharing, File Sharing, SSH, and Firewall
 - Built-in integration test suite (22 tests covering Bonjour, networking, crypto, file transfer, and streaming)
 

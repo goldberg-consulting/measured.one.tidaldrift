@@ -234,7 +234,7 @@ struct MaintenanceSettingsView: View {
 
 struct GeneralSettingsView: View {
     @EnvironmentObject var appState: AppState
-    @ObservedObject private var clipboardService = ClipboardSyncService.shared
+    @ObservedObject private var clipboardPreferences = ClipboardSyncPreferences.shared
     @State private var launchAtLoginError: String?
 
     private var launchAtLoginBinding: Binding<Bool> {
@@ -268,9 +268,9 @@ struct GeneralSettingsView: View {
             }
             
             Section("Clipboard") {
-                Toggle("Sync clipboard between Macs", isOn: $clipboardService.isEnabled)
-                
-                Text("When enabled, anything you copy will be available on other Macs running TidalDrift on your network.")
+                Toggle("Sync clipboard during LocalCast sessions", isOn: $clipboardPreferences.isEnabled)
+
+                Text("While you are connected to another Mac with LocalCast, anything you copy on either machine can be pasted on the other, including files. Content marked confidential by password managers is never synced.")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
@@ -286,7 +286,7 @@ struct GeneralSettingsView: View {
                             .foregroundColor(.purple)
                         VStack(alignment: .leading) {
                             Text("Show Experimental Features")
-                            Text("Enable Clipboard Sync in sidebar")
+                            Text("Unlock in-development toggles (debug builds)")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                         }
