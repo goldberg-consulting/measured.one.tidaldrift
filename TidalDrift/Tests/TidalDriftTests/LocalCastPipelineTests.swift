@@ -73,6 +73,52 @@ final class LocalCastPipelineTests: XCTestCase {
         XCTAssertGreaterThan(tuning.effectiveMaxDimension, lowDim)
     }
 
+    // MARK: - Modifier key direction
+
+    func test_modifierKey_isPress_trueOnlyWhileBitPresent() {
+        // A flagsChanged event carries no direction, so the press/release call
+        // is made from the flags it reports. Releasing Cmd reports flags with
+        // the Command bit cleared; reading that as a press latched the modifier
+        // on the host and made every later keystroke behave as a shortcut.
+        let leftCommand: UInt16 = 55
+
+        XCTAssertEqual(ModifierKey.isPress(keyCode: leftCommand, flags: .maskCommand), true)
+        XCTAssertEqual(ModifierKey.isPress(keyCode: leftCommand, flags: []), false)
+
+        // Releasing Cmd while Shift stays held still reads as a Cmd release.
+        XCTAssertEqual(ModifierKey.isPress(keyCode: leftCommand, flags: .maskShift), false)
+    }
+
+    func test_modifierKey_isPress_coversBothSidesOfKeyboard() {
+        let pairs: [(UInt16, CGEventFlags)] = [
+            (54, .maskCommand), (55, .maskCommand),
+            (56, .maskShift), (60, .maskShift),
+            (58, .maskAlternate), (61, .maskAlternate),
+            (59, .maskControl), (62, .maskControl),
+            (57, .maskAlphaShift), (63, .maskSecondaryFn)
+        ]
+
+        for (keyCode, flag) in pairs {
+            XCTAssertEqual(
+                ModifierKey.isPress(keyCode: keyCode, flags: flag), true,
+                "Key code \(keyCode) should read as a press when its own bit is set"
+            )
+            XCTAssertEqual(
+                ModifierKey.isPress(keyCode: keyCode, flags: []), false,
+                "Key code \(keyCode) should read as a release when its bit is cleared"
+            )
+        }
+    }
+
+    func test_modifierKey_isPress_nilForNonModifiers() {
+        // 'C' and 'V': the copy/paste keys must not be mistaken for modifiers,
+        // or their flagsChanged handling would swallow real key events.
+        XCTAssertNil(ModifierKey.isPress(keyCode: 8, flags: .maskCommand))
+        XCTAssertNil(ModifierKey.isPress(keyCode: 9, flags: .maskCommand))
+        XCTAssertFalse(ModifierKey.isModifier(8))
+        XCTAssertTrue(ModifierKey.isModifier(55))
+    }
+
     // Note: the real network round-trip for the Metal pipeline is covered
     // by the in-app Test Suite (`TidalDriftTestRunner`): "LocalCast Bonjour
     // Advertise+Browse" exercises discovery over dns-sd, and "Host Session
