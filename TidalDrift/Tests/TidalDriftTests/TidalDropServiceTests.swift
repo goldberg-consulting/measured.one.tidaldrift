@@ -26,6 +26,14 @@ final class TidalDropServiceTests: XCTestCase {
         XCTAssertEqual(TidalDropService.sanitizeFilename("no-extension"), "no-extension")
     }
 
+    func test_isLocalPeerAddress_ignoresZoneAndRejectsPublic() {
+        XCTAssertTrue(NetworkUtils.isLocalPeerAddress("fe80::1c2a:3b4c%en0"))
+        XCTAssertTrue(NetworkUtils.isLocalPeerAddress("192.168.0.9"))
+        XCTAssertFalse(NetworkUtils.isLocalPeerAddress("1.1.1.1"))
+        XCTAssertFalse(NetworkUtils.isLocalPeerAddress("not-an-ip"))
+        XCTAssertFalse(NetworkUtils.isLocalPeerAddress("fdxx::1"), "must be a parseable address, not just a prefix match")
+    }
+
     func test_isAcceptableSender_localOnly() {
         XCTAssertTrue(TidalDropService.isAcceptableSender("127.0.0.1"))
         XCTAssertTrue(TidalDropService.isAcceptableSender("::1"))

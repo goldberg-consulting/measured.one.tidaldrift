@@ -560,10 +560,7 @@ class TidalDropService: ObservableObject {
     /// network (private IPv4, IPv6 link-local/ULA, loopback for tests) may
     /// push files.
     static func isAcceptableSender(_ ip: String) -> Bool {
-        if ip == "127.0.0.1" || ip == "::1" { return true }
-        if NetworkUtils.isLocalNetworkAddress(ip) { return true }
-        let lower = ip.lowercased()
-        return lower.hasPrefix("fe80:") || lower.hasPrefix("fd") || lower.hasPrefix("fc")
+        NetworkUtils.isLocalPeerAddress(ip)
     }
 
     /// A destination that does not clobber anything already in the folder.

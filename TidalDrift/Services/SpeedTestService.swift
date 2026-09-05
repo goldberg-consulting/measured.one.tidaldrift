@@ -1,6 +1,7 @@
 import Foundation
 import Network
 import OSLog
+import Security
 
 /// Peer-to-peer UDP bandwidth + latency test.
 ///
@@ -22,15 +23,27 @@ final class SpeedTestService {
     private let logger = Logger(subsystem: "com.tidaldrift", category: "SpeedTest")
     private let queue = DispatchQueue(label: "com.tidaldrift.speedtest", qos: .userInitiated)
 
+    /// Wire format. A burst is only ever sent to a source that has completed a
+    /// ping/pong round trip: the pong carries a per-source token that must be
+    /// echoed in `downloadRequest` and `uploadStart`. Without that, a 7-byte
+    /// datagram with a forged source address turned the responder into a
+    /// 30 MB amplifier aimed at whatever address the attacker chose.
     private enum PType: UInt8 {
-        case ping = 1
-        case pong = 2
-        case downloadRequest = 3   // initiator -> responder: [count: UInt32][size: UInt16]
+        case ping = 1              // initiator -> responder: [seq: UInt32][sentAt: Double]
+        case pong = 2              // responder -> initiator: ping payload + [token: 8 bytes]
+        case downloadRequest = 3   // initiator -> responder: [count: UInt32][size: UInt16][token: 8 bytes]
         case downloadData = 4      // responder -> initiator
-        case uploadStart = 5       // initiator -> responder: [count: UInt32][size: UInt16]
+        case uploadStart = 5       // initiator -> responder: [count: UInt32][size: UInt16][token: 8 bytes]
         case uploadData = 6        // initiator -> responder
         case uploadResult = 7      // responder -> initiator: [packets: UInt32][bytes: UInt32][ms: UInt32]
     }
+
+    private static let tokenLength = 8
+    /// Bytes the responder will burst to one source per minute: a little over
+    /// one full test, so a peer can re-run but cannot use this Mac as a
+    /// traffic source.
+    private static let burstBudgetPerMinute = 8_000_000
+    private static let maxTrackedSources = 256
 
     struct Result: Sendable {
         let rttMs: Double
@@ -95,6 +108,54 @@ final class SpeedTestService {
     private var uploadExpected: [String: Int] = [:]
     private var uploadReceived: [String: (packets: Int, bytes: Int, firstAt: Date?, lastAt: Date?)] = [:]
     private var uploadResultSent: Set<String> = []
+    /// Per-source proof of a completed round trip, and per-source burst budget.
+    private var sourceTokens: [String: (token: Data, issuedAt: Date)] = [:]
+    private var burstBudget: [String: (bytes: Int, windowStart: Date)] = [:]
+
+    private static func hostString(of endpoint: NWEndpoint) -> String? {
+        guard case .hostPort(let host, _) = endpoint else { return nil }
+        return "\(host)"
+    }
+
+    /// Token for `key`, minting one on first contact. Caller holds `respLock`.
+    private func tokenLocked(for key: String) -> Data {
+        if let existing = sourceTokens[key] { return existing.token }
+        if sourceTokens.count >= Self.maxTrackedSources,
+           let oldest = sourceTokens.min(by: { $0.value.issuedAt < $1.value.issuedAt }) {
+            sourceTokens.removeValue(forKey: oldest.key)
+        }
+        var token = Data(count: Self.tokenLength)
+        token.withUnsafeMutableBytes { buffer in
+            _ = SecRandomCopyBytes(kSecRandomDefault, Self.tokenLength, buffer.baseAddress!)
+        }
+        sourceTokens[key] = (token, Date())
+        return token
+    }
+
+    /// Whether `data` (a downloadRequest or uploadStart) carries the token
+    /// issued to `key`, and the source's budget allows `bytes` more.
+    private func authorizeBurst(_ data: Data, key: String, bytes: Int) -> Bool {
+        let tokenStart = 7
+        guard data.count >= tokenStart + Self.tokenLength else { return false }
+        let presented = data.subdata(in: tokenStart..<tokenStart + Self.tokenLength)
+
+        respLock.lock()
+        defer { respLock.unlock() }
+        guard let issued = sourceTokens[key], SessionCrypto.constantTimeEquals(issued.token, presented) else {
+            return false
+        }
+        let now = Date()
+        var budget = burstBudget[key] ?? (0, now)
+        if now.timeIntervalSince(budget.windowStart) > 60 { budget = (0, now) }
+        guard budget.bytes + bytes <= Self.burstBudgetPerMinute else { return false }
+        budget.bytes += bytes
+        burstBudget[key] = budget
+        if burstBudget.count > Self.maxTrackedSources,
+           let oldest = burstBudget.min(by: { $0.value.windowStart < $1.value.windowStart }) {
+            burstBudget.removeValue(forKey: oldest.key)
+        }
+        return true
+    }
 
     /// Start the always-on responder so peers can test against this Mac.
     func startResponder() {
@@ -133,30 +194,50 @@ final class SpeedTestService {
 
     private func handleResponder(_ data: Data, on conn: NWConnection) {
         guard let type = PType(rawValue: data[0]) else { return }
+        // The responder is unauthenticated; only LAN peers get any reply.
+        guard let host = Self.hostString(of: conn.endpoint), NetworkUtils.isLocalPeerAddress(host) else { return }
         let key = "\(conn.endpoint)"
 
         switch type {
         case .ping:
-            // Echo the payload (carries the initiator's send timestamp) as a pong.
-            var out = data
+            // Echo the payload (carries the initiator's send timestamp) as a
+            // pong, plus the token that authorizes this source's bursts. The
+            // pong only reaches the real owner of the source address.
+            respLock.lock()
+            let token = tokenLocked(for: key)
+            respLock.unlock()
+            var out = Data(data.prefix(13))
             out[0] = PType.pong.rawValue
+            out.append(token)
             conn.send(content: out, completion: .idempotent)
 
         case .downloadRequest:
-            let count = Int(Self.readU32(data, 1))
-            let size = Int(Self.readU16(data, 5))
+            let count = min(max(Int(Self.readU32(data, 1)), 1), 20_000)
+            let size = min(max(Int(Self.readU16(data, 5)), 64), 1500)
+            guard authorizeBurst(data, key: key, bytes: count * size) else {
+                logger.warning("Speed test: refused download burst for \(key, privacy: .private) (no token or over budget)")
+                return
+            }
             sendDownloadBurst(on: conn, count: count, size: size)
 
         case .uploadStart:
+            // Uploads cost this Mac nothing to send, but the tracking entry and
+            // the result datagram are still gated on the round trip.
+            guard authorizeBurst(data, key: key, bytes: 0) else { return }
             let count = Int(Self.readU32(data, 1))
             respLock.lock()
             uploadExpected[key] = count
             uploadReceived[key] = (0, 0, nil, nil)
             uploadResultSent.remove(key)
             respLock.unlock()
-            // Safety net: report even if the tail of the burst is lost.
+            // Safety net: report even if the tail of the burst is lost, then
+            // drop the source's state so the tables do not grow per peer.
             queue.asyncAfter(deadline: .now() + 5) { [weak self] in
-                self?.sendUploadResult(on: conn, key: key)
+                guard let self else { return }
+                self.sendUploadResult(on: conn, key: key)
+                self.respLock.lock()
+                self.uploadResultSent.remove(key)
+                self.respLock.unlock()
             }
 
         case .uploadData:
@@ -200,6 +281,8 @@ final class SpeedTestService {
         }
         let r = uploadReceived[key] ?? (0, 0, nil, nil)
         uploadResultSent.insert(key)
+        uploadReceived.removeValue(forKey: key)
+        uploadExpected.removeValue(forKey: key)
         respLock.unlock()
 
         // Measure over the actual receive window (first to last packet), not to
@@ -225,6 +308,8 @@ final class SpeedTestService {
     private final class InitiatorState: @unchecked Sendable {
         let lock = NSLock()
         var rtts: [Double] = []
+        /// Burst authorization token from the responder's pongs.
+        var token: Data?
         var downloadPackets = 0
         var downloadBytes = 0
         var downloadFirstAt: Date?
@@ -275,10 +360,22 @@ final class SpeedTestService {
         }
         try? await Task.sleep(nanoseconds: 300_000_000) // drain late pongs
 
+        // No pong means no token, and a responder that never answered pings
+        // (old build, firewall) would ignore the burst requests anyway.
+        state.lock.lock()
+        let token = state.token
+        state.lock.unlock()
+        guard let token else {
+            conn.cancel()
+            logger.warning("Speed test: no pong from \(host):\(Self.port); both Macs need the current build")
+            return computeResult(state)
+        }
+
         // Phase 2: download — peer blasts to us; measure a receive window.
         var req = Data([PType.downloadRequest.rawValue])
         Self.appendU32(&req, UInt32(Self.testPackets))
         Self.appendU16(&req, UInt16(Self.packetSize))
+        req.append(token)
         conn.send(content: req, completion: .idempotent)
         try? await Task.sleep(nanoseconds: 4_000_000_000)
 
@@ -286,6 +383,7 @@ final class SpeedTestService {
         var us = Data([PType.uploadStart.rawValue])
         Self.appendU32(&us, UInt32(Self.testPackets))
         Self.appendU16(&us, UInt16(Self.packetSize))
+        us.append(token)
         conn.send(content: us, completion: .idempotent)
         try? await Task.sleep(nanoseconds: 100_000_000)
 
@@ -317,6 +415,9 @@ final class SpeedTestService {
                     let sent = Self.readDouble(data, 5)
                     let rtt = (CFAbsoluteTimeGetCurrent() - sent) * 1000
                     if rtt >= 0, rtt < 10_000 { state.rtts.append(rtt) }
+                    if data.count >= 13 + Self.tokenLength {
+                        state.token = data.subdata(in: 13..<13 + Self.tokenLength)
+                    }
                 case .downloadData:
                     if state.downloadFirstAt == nil { state.downloadFirstAt = now }
                     state.downloadLastAt = now
