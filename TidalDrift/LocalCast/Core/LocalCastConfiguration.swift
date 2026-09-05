@@ -52,7 +52,11 @@ struct LocalCastConfiguration: Codable {
     /// visual quality. The encoder falls back to H.264 if HEVC setup fails.
     var codec: Codec = .hevc
     var targetFrameRate: Int = 60
-    var adaptiveQuality: Bool = false // Disable by default for "fastest pipe" on LAN
+    /// On by default (matching the settings UI and the service fallback). The
+    /// controller only steps bitrate down in response to reported loss and
+    /// climbs back on clean windows, so on a clean 10GbE link it sits at the
+    /// ceiling and costs nothing.
+    var adaptiveQuality: Bool = true
     /// When false (default), the host omits its cursor from the capture and the
     /// pointer the viewer sees is the local macOS cursor, so pointer motion
     /// never round-trips the capture/encode/decode pipeline. Enable to

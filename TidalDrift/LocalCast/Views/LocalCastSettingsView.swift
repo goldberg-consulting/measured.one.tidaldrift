@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct LocalCastSettingsView: View {
-    @AppStorage("localCastQuality") var quality: LocalCastConfiguration.QualityPreset = .high
+    @AppStorage("localCastQuality") var quality: LocalCastConfiguration.QualityPreset = .ultra
     @AppStorage("localCastCodec") var codec: LocalCastConfiguration.Codec = .hevc
     @AppStorage("localCastAdaptive") var adaptiveQuality = true
     @AppStorage("localCastAutoHost") var autoHost = false

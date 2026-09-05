@@ -119,6 +119,137 @@ final class LocalCastPipelineTests: XCTestCase {
         XCTAssertTrue(ModifierKey.isModifier(55))
     }
 
+    // MARK: - Remote input wire format (#146)
+
+    func test_remoteInput_deserialize_rejectsOutOfRangeMouseButton() {
+        var packet = InputInjector.RemoteInput.mouseDown(button: 1, x: 0.5, y: 0.5).serialize()
+        XCTAssertNotNil(InputInjector.RemoteInput.deserialize(packet))
+        packet[1] = 3
+        XCTAssertNil(InputInjector.RemoteInput.deserialize(packet), "button 3 has no CGMouseButton and must be rejected")
+        packet[1] = 255
+        XCTAssertNil(InputInjector.RemoteInput.deserialize(packet))
+        var up = InputInjector.RemoteInput.mouseUp(button: 2, x: 0, y: 0).serialize()
+        XCTAssertNotNil(InputInjector.RemoteInput.deserialize(up))
+        up[1] = 7
+        XCTAssertNil(InputInjector.RemoteInput.deserialize(up))
+    }
+
+    func test_remoteInput_deserialize_worksOnSlices() {
+        let inner = InputInjector.RemoteInput.keyDown(keyCode: 0x24, modifiers: 0x100000).serialize()
+        let framed = Data([0xAA, 0xBB]) + inner
+        let slice = framed[2...]
+        XCTAssertNotEqual(slice.startIndex, 0)
+        guard case .keyDown(let code, let mods)? = InputInjector.RemoteInput.deserialize(slice) else {
+            return XCTFail("slice did not deserialize")
+        }
+        XCTAssertEqual(code, 0x24)
+        XCTAssertEqual(mods, 0x100000)
+    }
+
+    func test_remoteInput_coordinateClamp() {
+        XCTAssertEqual(InputInjector.clampNormalized(0.25), 0.25)
+        XCTAssertEqual(InputInjector.clampNormalized(-3), 0)
+        XCTAssertEqual(InputInjector.clampNormalized(5), 1)
+        XCTAssertEqual(InputInjector.clampNormalized(.nan), 0)
+        XCTAssertEqual(InputInjector.clampNormalized(.infinity), 0)
+        XCTAssertEqual(InputInjector.clampNormalized(-.infinity), 0)
+    }
+
+    // MARK: - Scoped keyboard policy (#150)
+
+    func test_keystrokeFlags_scopedBlocksDangerousCommandChords() {
+        let cmd = CGEventFlags.maskCommand.rawValue
+        let ctrlCmd = cmd | CGEventFlags.maskControl.rawValue
+        let shiftCmd = cmd | CGEventFlags.maskShift.rawValue
+        // Q, Tab, Space, Esc, 3 (screenshot)
+        for key: UInt16 in [12, 48, 49, 53, 20] {
+            XCTAssertNil(InputInjector.keystrokeFlags(keyCode: key, modifiers: cmd, scoped: true), "Cmd+\(key)")
+        }
+        XCTAssertNil(InputInjector.keystrokeFlags(keyCode: 12, modifiers: ctrlCmd, scoped: true), "Ctrl+Cmd+Q locks the host")
+        XCTAssertNil(InputInjector.keystrokeFlags(keyCode: 12, modifiers: shiftCmd, scoped: true), "Cmd+Shift+Q logs out")
+        // Allowed editing chords and bare modifiers still pass.
+        XCTAssertEqual(InputInjector.keystrokeFlags(keyCode: 8, modifiers: cmd, scoped: true), .maskCommand)
+        XCTAssertEqual(InputInjector.keystrokeFlags(keyCode: 6, modifiers: shiftCmd, scoped: true), [.maskCommand, .maskShift])
+        XCTAssertEqual(InputInjector.keystrokeFlags(keyCode: 55, modifiers: cmd, scoped: true), .maskCommand, "Command key itself")
+        XCTAssertEqual(InputInjector.keystrokeFlags(keyCode: 12, modifiers: 0, scoped: true), [], "plain Q")
+        // Full-display mode passes everything through.
+        XCTAssertEqual(InputInjector.keystrokeFlags(keyCode: 12, modifiers: cmd, scoped: false), .maskCommand)
+    }
+
+    func test_keystrokeFlags_stripsNonStandardBits() {
+        let junk: UInt64 = 0xFFFF_0000_0000_0001 | CGEventFlags.maskShift.rawValue
+        XCTAssertEqual(InputInjector.keystrokeFlags(keyCode: 0, modifiers: junk, scoped: false), .maskShift)
+    }
+
+    // MARK: - Tile codec bounds (#147)
+
+    func test_tileCodec_rejectsOversizedHeaderBeforeAllocating() {
+        // 65535 x 65535 LZFSE tile with a 1-byte body: must return nil without
+        // materializing the 17 GB output buffer.
+        var header = Data()
+        for v: UInt16 in [0, 0, 0xFFFF, 0xFFFF] {
+            header.append(UInt8(v >> 8)); header.append(UInt8(v & 0xFF))
+        }
+        header.append(TileEncoding.lzfse.rawValue)
+        header.append(0x00)
+        XCTAssertNil(TileCodec.decode(header))
+    }
+
+    func test_tileCodec_roundTripAndCanvasBounds() {
+        let w = 8, h = 4
+        var pixels = Data(count: w * h * 4)
+        for i in 0..<pixels.count { pixels[i] = UInt8(truncatingIfNeeded: i * 7) }
+        let payload = TileCodec.encode(x: 10, y: 20, width: w, height: h, bgra: pixels)!
+        let tile = TileCodec.decode(payload)
+        XCTAssertEqual(tile?.bgra, pixels)
+        XCTAssertNotNil(TileCodec.decode(payload, canvas: (width: 18, height: 24)))
+        XCTAssertNil(TileCodec.decode(payload, canvas: (width: 17, height: 24)), "tile past the right edge")
+        XCTAssertNil(TileCodec.decode(payload, canvas: (width: 18, height: 23)), "tile past the bottom edge")
+    }
+
+    // MARK: - Pairing handshake
+
+    func test_authRequestPayload_roundTripsVersionAndStaysV1Compatible() {
+        let nonce = SessionCrypto.generateNonce()
+
+        // A bare 32-byte nonce is what pre-v2 clients send; it must parse as v1.
+        let v1 = SessionCrypto.authRequestPayload(nonce: nonce, version: .v1)
+        XCTAssertEqual(v1, nonce)
+        XCTAssertEqual(SessionCrypto.parseAuthRequest(v1)?.version, .v1)
+        XCTAssertEqual(SessionCrypto.parseAuthRequest(v1)?.nonce, nonce)
+
+        let v2 = SessionCrypto.authRequestPayload(nonce: nonce, version: .v2)
+        XCTAssertEqual(v2.count, nonce.count + 1)
+        XCTAssertEqual(SessionCrypto.parseAuthRequest(v2)?.version, .v2)
+        XCTAssertEqual(SessionCrypto.parseAuthRequest(v2)?.nonce, nonce)
+
+        XCTAssertNil(SessionCrypto.parseAuthRequest(Data(repeating: 1, count: 31)))
+        XCTAssertNil(SessionCrypto.parseAuthRequest(nonce + Data([0xFF])), "unknown version byte must be rejected")
+    }
+
+    func test_derivePairingKey_v2DiffersFromV1AndIsDeterministic() {
+        let clientNonce = SessionCrypto.generateNonce()
+        let hostNonce = SessionCrypto.generateNonce()
+
+        let v1 = SessionCrypto.derivePairingKey(password: "correct horse", clientNonce: clientNonce, hostNonce: hostNonce, version: .v1)
+        let v2a = SessionCrypto.derivePairingKey(password: "correct horse", clientNonce: clientNonce, hostNonce: hostNonce, version: .v2)
+        let v2b = SessionCrypto.derivePairingKey(password: "correct horse", clientNonce: clientNonce, hostNonce: hostNonce, version: .v2)
+        let v2wrong = SessionCrypto.derivePairingKey(password: "correct horsf", clientNonce: clientNonce, hostNonce: hostNonce, version: .v2)
+
+        XCTAssertEqual(v2a.withUnsafeBytes { Data($0) }, v2b.withUnsafeBytes { Data($0) })
+        XCTAssertNotEqual(v1.withUnsafeBytes { Data($0) }, v2a.withUnsafeBytes { Data($0) })
+        XCTAssertNotEqual(v2a.withUnsafeBytes { Data($0) }, v2wrong.withUnsafeBytes { Data($0) })
+
+        // The session key wrapped under a v2 pairing key opens with the same
+        // derivation and with nothing else; this is the challenge step.
+        let sessionKey = SessionCrypto.generateSessionKey().withUnsafeBytes { Data($0) }
+        let wrapped = SessionCrypto.encrypt(sessionKey, using: v2a)
+        XCTAssertNotNil(wrapped)
+        XCTAssertEqual(SessionCrypto.decrypt(wrapped!, using: v2b), sessionKey)
+        XCTAssertNil(SessionCrypto.decrypt(wrapped!, using: v1))
+        XCTAssertNil(SessionCrypto.decrypt(wrapped!, using: v2wrong))
+    }
+
     // Note: the real network round-trip for the Metal pipeline is covered
     // by the in-app Test Suite (`TidalDriftTestRunner`): "LocalCast Bonjour
     // Advertise+Browse" exercises discovery over dns-sd, and "Host Session

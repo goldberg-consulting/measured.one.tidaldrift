@@ -46,24 +46,35 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     private var primed = false
     private var lastPresentTime: CFTimeInterval = 0
 
+    // Arrival statistics are written on the decoder callback thread
+    // (`update(with:)`) and read on the main thread (`draw(in:)`), so they
+    // live under `frameQueueLock` with the queue they pace.
     private var lastArrival: CFTimeInterval = 0
     private var arrivalIntervalEWMA: Double = 1.0 / 60.0  // est. source frame interval
     private var jitterEWMA: Double = 0
     private var targetDepth = 2
-    var latencyMode: LocalCastConfiguration.LatencyMode =
+    private var frameCount = 0
+
+    private var _latencyMode: LocalCastConfiguration.LatencyMode =
         (UserDefaults.standard.string(forKey: "localCastLatencyMode")
             .flatMap(LocalCastConfiguration.LatencyMode.init(rawValue:))) ?? .low
+    var latencyMode: LocalCastConfiguration.LatencyMode {
+        get { frameQueueLock.lock(); defer { frameQueueLock.unlock() }; return _latencyMode }
+        set { frameQueueLock.lock(); _latencyMode = newValue; frameQueueLock.unlock() }
+    }
 
-    private var minDepth: Int {
-        switch latencyMode {
+    /// Caller holds `frameQueueLock`.
+    private func minDepth(for mode: LocalCastConfiguration.LatencyMode) -> Int {
+        switch mode {
         case .low: return 0
         case .balanced: return 1
         case .smooth: return 2
         }
     }
 
-    private var maxDepth: Int {
-        switch latencyMode {
+    /// Caller holds `frameQueueLock`.
+    private func maxDepth(for mode: LocalCastConfiguration.LatencyMode) -> Int {
+        switch mode {
         case .low: return 2
         case .balanced: return 6
         case .smooth: return 10
@@ -79,7 +90,13 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     // All canvas mutations and presentation happen on the main thread (the MTKView
     // draw callback and the dispatched apply/update blocks), so blits and the
     // present are committed to one queue in order (no GPU read/write race).
-    private var canvasMode = false
+    private var _canvasMode = false
+    /// Written on main (tile apply / canvas creation), read on the decoder
+    /// thread in `update(with:)`; guarded by `frameQueueLock`.
+    private var canvasMode: Bool {
+        get { frameQueueLock.lock(); defer { frameQueueLock.unlock() }; return _canvasMode }
+        set { frameQueueLock.lock(); _canvasMode = newValue; frameQueueLock.unlock() }
+    }
     private var canvasTexture: MTLTexture?
 
     /// Set whenever the canvas contents change (tile blit, full-frame heal,
@@ -195,7 +212,6 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     /// the BGRA canvas (no letterboxing, the target is exactly source-sized).
     private var identityVertices: MTLBuffer?
     
-    private var frameCount = 0
     private var hasLoggedSuccess = false
     
     // Track source resolution for aspect-ratio-preserving scaling
@@ -428,7 +444,6 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         // arrive as BGRA), so an NV12 heal frame is converted to BGRA first. Done
         // on the main thread so it orders correctly with tile blits and present.
         if canvasMode {
-            frameCount += 1
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.ensureCanvas(width: width, height: height, seedFrom: nil)
@@ -447,6 +462,8 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         // (jitter / frame interval) so a jittery link gets enough cushion, while
         // a clean link stays near one frame of latency.
         let now = CACurrentMediaTime()
+        frameQueueLock.lock()
+        let cap = maxDepth(for: _latencyMode)
         if lastArrival > 0 {
             let interval = now - lastArrival
             let a = 0.1
@@ -454,19 +471,19 @@ class MetalRenderer: NSObject, MTKViewDelegate {
             arrivalIntervalEWMA = (1 - a) * arrivalIntervalEWMA + a * interval
             jitterEWMA = (1 - a) * jitterEWMA + a * dev
             let fi = max(arrivalIntervalEWMA, 1.0 / 120.0)
-            targetDepth = min(maxDepth, max(minDepth, Int((jitterEWMA / fi).rounded()) + 1))
+            targetDepth = min(cap, max(minDepth(for: _latencyMode), Int((jitterEWMA / fi).rounded()) + 1))
         }
         lastArrival = now
 
-        frameQueueLock.lock()
         frameQueue.append(frame)
         // Drop-to-newest if the queue outgrows the cap (we're behind).
-        if frameQueue.count > maxDepth {
-            frameQueue.removeFirst(frameQueue.count - maxDepth)
+        if frameQueue.count > cap {
+            frameQueue.removeFirst(frameQueue.count - cap)
         }
+        frameCount += 1
+        let count = frameCount
         frameQueueLock.unlock()
 
-        frameCount += 1
         // A live frame means the stream is (back) up; clear any disconnect
         // pause so the display link resumes presenting.
         setPaused(false, reason: .disconnected)
@@ -474,7 +491,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
             logger.info("🖥️ MetalRenderer: First frame received! \(width)x\(height)")
             hasLoggedSuccess = true
         }
-        if frameCount % 120 == 0, let cache = textureCache {
+        if count % 120 == 0, let cache = textureCache {
             // Flush stale cache entries periodically to bound GPU memory.
             CVMetalTextureCacheFlush(cache, 0)
         }
@@ -536,7 +553,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
             // the gate (saves up to a display interval per frame). Pacing still
             // applies in .low when the queue is deeper, and always in the
             // other modes.
-            let bypassPacing = latencyMode == .low && frameQueue.count <= 1
+            let bypassPacing = _latencyMode == .low && frameQueue.count <= 1
             let due = bypassPacing || (now - lastPresentTime) >= interval * 0.85
             if due {
                 if frameQueue.isEmpty {

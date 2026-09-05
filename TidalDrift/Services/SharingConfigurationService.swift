@@ -23,35 +23,15 @@ class SharingConfigurationService: ObservableObject, @unchecked Sendable {
         }
     }
     
-    /// Run a Process without blocking the Swift concurrency thread pool.
-    /// Uses `terminationHandler` instead of `waitUntilExit()`.
-    private func runProcess(_ executablePath: String, arguments: [String]) async -> (output: String, exitCode: Int32) {
-        await withCheckedContinuation { continuation in
-            let task = Process()
-            task.executableURL = URL(fileURLWithPath: executablePath)
-            task.arguments = arguments
-            
-            let pipe = Pipe()
-            task.standardOutput = pipe
-            task.standardError = pipe
-            
-            let resumed = AtomicFlag(false)
-            task.terminationHandler = { process in
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                let output = String(data: data, encoding: .utf8) ?? ""
-                if resumed.compareAndSwap(expected: false, desired: true) {
-                    continuation.resume(returning: (output, process.terminationStatus))
-                }
-            }
-            
-            do {
-                try task.run()
-            } catch {
-                if resumed.compareAndSwap(expected: false, desired: true) {
-                    continuation.resume(returning: ("", -1))
-                }
-            }
-        }
+    /// Run a Process off the Swift concurrency thread pool. ShellExecutor
+    /// drains stdout as the child writes, so `launchctl list` and
+    /// `socketfilterfw --listapps` cannot deadlock on a full pipe.
+    private func runProcess(
+        _ executablePath: String, arguments: [String], timeout: TimeInterval = ShellExecutor.defaultTimeout
+    ) async -> (output: String, exitCode: Int32) {
+        await Task.detached(priority: .userInitiated) {
+            ShellExecutor.execute(executable: executablePath, arguments: arguments, timeout: timeout)
+        }.value
     }
     
     @MainActor
@@ -85,13 +65,11 @@ class SharingConfigurationService: ObservableObject, @unchecked Sendable {
             connection.stateUpdateHandler = { [weak self] state in
                 switch state {
                 case .ready:
-                    guard !didResume.value else { return }
-                    didResume.value = true
+                    guard didResume.compareAndSwap(expected: false, desired: true) else { return }
                     self?.cleanupConnection(id: connectionId)
                     continuation.resume(returning: true)
                 case .failed:
-                    guard !didResume.value else { return }
-                    didResume.value = true
+                    guard didResume.compareAndSwap(expected: false, desired: true) else { return }
                     self?.cleanupConnection(id: connectionId)
                     continuation.resume(returning: false)
                 case .cancelled:
@@ -99,8 +77,7 @@ class SharingConfigurationService: ObservableObject, @unchecked Sendable {
                     self?.activeConnections.removeValue(forKey: connectionId)
                     self?.connectionsLock.unlock()
                     
-                    guard !didResume.value else { return }
-                    didResume.value = true
+                    guard didResume.compareAndSwap(expected: false, desired: true) else { return }
                     continuation.resume(returning: false)
                 default:
                     break
@@ -111,8 +88,7 @@ class SharingConfigurationService: ObservableObject, @unchecked Sendable {
             
             // Timeout for localhost
             DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { [weak self] in
-                guard !didResume.value else { return }
-                didResume.value = true
+                guard didResume.compareAndSwap(expected: false, desired: true) else { return }
                 self?.cleanupConnection(id: connectionId)
                 continuation.resume(returning: false)
             }
@@ -323,12 +299,15 @@ class SharingConfigurationService: ObservableObject, @unchecked Sendable {
     }
     
     private func runAppleScript(_ source: String) async -> Bool {
-        logger.info("Running AppleScript: \(source.prefix(150))...")
-        let result = await runProcess("/usr/bin/osascript", arguments: ["-e", source])
+        // Never log the script body: the account-creation path embeds the new
+        // user's password in it, and the unified log is readable by any admin.
+        logger.info("Running privileged AppleScript (\(source.count) chars)")
+        // Admin prompts wait on the user; allow well past the default timeout.
+        let result = await runProcess("/usr/bin/osascript", arguments: ["-e", source], timeout: 180)
         
         logger.info("osascript exit code: \(result.exitCode)")
         if !result.output.isEmpty {
-            logger.info("osascript output: \(result.output, privacy: .public)")
+            logger.info("osascript output: \(result.output, privacy: .private)")
         }
         
         return result.exitCode == 0
@@ -403,11 +382,14 @@ class SharingConfigurationService: ObservableObject, @unchecked Sendable {
         return addresses
     }
 
-    private static func shellEscaped(_ value: String) -> String {
+    /// Single-quote a value for POSIX sh. Callers embedding the result inside
+    /// an AppleScript string literal must also pass it through
+    /// `appleScriptEscaped`, in that order (shell first, then AppleScript).
+    static func shellEscaped(_ value: String) -> String {
         "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
     }
 
-    private static func appleScriptEscaped(_ value: String) -> String {
+    static func appleScriptEscaped(_ value: String) -> String {
         value
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")

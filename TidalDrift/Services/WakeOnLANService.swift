@@ -468,7 +468,7 @@ class WakeOnLANService {
             return nil
         }
 
-        let result = ShellExecutor.execute("arp -n '\(ipAddress)'")
+        let result = ShellExecutor.execute(executable: "/usr/sbin/arp", arguments: ["-n", ipAddress])
 
         // Parse ARP output: "? (192.168.1.100) at aa:bb:cc:dd:ee:ff on en0 ifscope [ethernet]"
         let pattern = "([0-9a-fA-F]{1,2}:[0-9a-fA-F]{1,2}:[0-9a-fA-F]{1,2}:[0-9a-fA-F]{1,2}:[0-9a-fA-F]{1,2}:[0-9a-fA-F]{1,2})"
@@ -484,10 +484,10 @@ class WakeOnLANService {
     /// Scan network and get MAC addresses for all discovered devices
     func discoverMACAddresses() -> [String: String] {
         // First, ping the broadcast to populate ARP table
-        _ = ShellExecutor.execute("ping -c 1 -t 1 255.255.255.255 2>/dev/null")
+        _ = ShellExecutor.execute(executable: "/sbin/ping", arguments: ["-c", "1", "-t", "1", "255.255.255.255"], timeout: 5)
 
         // Get ARP table
-        let result = ShellExecutor.execute("arp -a")
+        let result = ShellExecutor.execute(executable: "/usr/sbin/arp", arguments: ["-a"])
 
         var macAddresses: [String: String] = [:]
         let lines = result.output.split(separator: "\n")

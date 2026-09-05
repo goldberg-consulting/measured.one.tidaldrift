@@ -30,8 +30,12 @@ final class ClipboardSyncEngine {
     var fetchEager: ((ClipboardBulkOffer, ClipboardContentKind, @escaping (Result<ClipboardBulkReceived, Error>) -> Void) -> Void)?
     /// Resolve a file offer at paste time, delivering staged URLs in offer order.
     var fetchFilesForPaste: ((ClipboardBulkOffer, @escaping (Result<[URL], Error>) -> Void) -> Void)?
-    /// File sync needs a keyed session; text and images match the session's level.
-    var isFileSyncAllowed: (() -> Bool)?
+    /// Whether the bulk (TCP) channel may be used. Bulk needs a keyed session:
+    /// on a keyless one the offer token rides in a sniffable UDP packet and
+    /// the listener has no cryptographic gate, so any LAN host could fetch the
+    /// offered content or push into an armed slot. Keyless sessions sync
+    /// inline (small text and images) only.
+    var isBulkSyncAllowed: (() -> Bool)?
 
     private let logger = Logger(subsystem: "com.tidaldrift", category: "ClipboardSyncEngine")
     private let pasteboard = NSPasteboard.general
@@ -116,8 +120,8 @@ final class ClipboardSyncEngine {
             }
         }
 
-        if snapshot.kind == .files, isFileSyncAllowed?() != true {
-            logger.info("📋 File copy not offered: file sync requires a password-protected session")
+        if isBulkSyncAllowed?() != true {
+            logger.info("📋 \(snapshot.kind == .files ? "File" : "Large") copy not offered: bulk sync requires a password-protected session")
             return
         }
 
@@ -191,9 +195,9 @@ final class ClipboardSyncEngine {
             return
         }
 
+        guard isBulkSyncAllowed?() == true else { return }
         switch payload.kind {
         case .files:
-            guard isFileSyncAllowed?() == true else { return }
             applyFileOffer(bulk, digest: payload.digest)
         case .text, .image:
             guard bulk.totalBytes <= LocalCastConfiguration.clipboardMaxTransferBytes else { return }

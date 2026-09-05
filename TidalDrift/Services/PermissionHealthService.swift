@@ -92,9 +92,8 @@ class PermissionHealthService: ObservableObject {
     /// Background queue so the prompt doesn't appear to "freeze" the app.
     func restartScreenSharing() async -> Bool {
         await Task.detached(priority: .userInitiated) {
-            let result = ShellExecutor.execute("""
-                osascript -e 'do shell script "launchctl kickstart -k system/com.apple.screensharing" with administrator privileges' 2>&1
-            """)
+            let result = ShellExecutor.osascript(
+                "do shell script \"launchctl kickstart -k system/com.apple.screensharing\" with administrator privileges")
             return result.exitCode == 0
         }.value
     }
@@ -135,9 +134,8 @@ class PermissionHealthService: ObservableObject {
         defer { isRestartingCoreAudio = false }
 
         let success: Bool = await Task.detached(priority: .userInitiated) {
-            let result = ShellExecutor.execute("""
-                osascript -e 'do shell script "launchctl kickstart -k system/com.apple.audio.coreaudiod" with administrator privileges' 2>&1
-            """)
+            let result = ShellExecutor.osascript(
+                "do shell script \"launchctl kickstart -k system/com.apple.audio.coreaudiod\" with administrator privileges")
             return result.exitCode == 0
         }.value
 
@@ -175,7 +173,7 @@ class PermissionHealthService: ObservableObject {
     nonisolated private static func runTccReset(service: String, bundle: String) -> Bool {
         // The bundle id and service name are both compile-time constants from
         // our own code, so command injection isn't a concern here.
-        let result = ShellExecutor.execute("tccutil reset \(service) \(bundle) 2>&1")
+        let result = ShellExecutor.execute(executable: "/usr/bin/tccutil", arguments: ["reset", service, bundle])
         return result.exitCode == 0
     }
 }

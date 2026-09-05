@@ -1,4 +1,5 @@
 import Foundation
+import CommonCrypto
 import CryptoKit
 import OSLog
 
@@ -10,8 +11,54 @@ enum SessionCrypto {
     /// Domain separator prevents cross-protocol key reuse.
     private static let pairingInfo = "LocalCast-Pairing-v1".data(using: .utf8)!
 
+    /// Domain separator for the v2 (password-stretched) pairing key.
+    private static let pairingInfoV2 = Data("LocalCast-Pairing-v2".utf8)
+
     /// Domain separator for the clipboard bulk channel subkey.
     private static let clipboardInfo = Data("LocalCast-Clipboard-v1".utf8)
+
+    /// Pairing handshake versions. The authRequest payload is the 32-byte
+    /// client nonce, optionally followed by a single version byte; a bare
+    /// 32-byte nonce is v1. The host derives the pairing key for whichever
+    /// version the request carries, so old and new builds interoperate:
+    /// a v2 client talking to a v1 host falls back to v1 in its retransmit
+    /// chain, and a v1 client talking to a v2 host is served v1.
+    enum PairingVersion: UInt8 {
+        /// Plain HKDF over the password. Fast, so a sniffed handshake can be
+        /// brute-forced offline at hash speed. Kept only for interop.
+        case v1 = 1
+        /// PBKDF2-HMAC-SHA256 stretch of the password (salted with both
+        /// nonces) before HKDF. Makes an offline guess cost ~150k hashes.
+        case v2 = 2
+
+        static let current: PairingVersion = .v2
+    }
+
+    /// Payload of an authRequest for the given version.
+    static func authRequestPayload(nonce: Data, version: PairingVersion) -> Data {
+        switch version {
+        case .v1: return nonce
+        case .v2: return nonce + Data([version.rawValue])
+        }
+    }
+
+    /// Parse an authRequest payload into (clientNonce, version). Nil for any
+    /// shape this build does not understand.
+    static func parseAuthRequest(_ payload: Data) -> (nonce: Data, version: PairingVersion)? {
+        switch payload.count {
+        case 32:
+            return (payload, .v1)
+        case 33:
+            guard let version = PairingVersion(rawValue: payload[payload.startIndex + 32]), version != .v1 else { return nil }
+            return (payload.prefix(32), version)
+        default:
+            return nil
+        }
+    }
+
+    /// PBKDF2-HMAC-SHA256 work factor for v2 (the OWASP 2023 floor). Measured
+    /// at ~70 ms on an M-series Mac; paid once per handshake on each side.
+    static let pbkdf2Iterations: UInt32 = 600_000
     
     // MARK: - Key & PIN Generation
     
@@ -34,18 +81,51 @@ enum SessionCrypto {
     /// The PIN never travels over the wire; both sides compute this independently.
     /// Derive a pairing key from the shared secret (password) and both nonces.
     /// The password never travels over the wire; both sides compute this independently.
-    static func derivePairingKey(password: String, clientNonce: Data, hostNonce: Data) -> SymmetricKey {
-        let passData = Data(password.utf8)
-        // Use the password as the input key material, nonces as salt
+    static func derivePairingKey(password: String, clientNonce: Data, hostNonce: Data, version: PairingVersion = .v1) -> SymmetricKey {
         let salt = clientNonce + hostNonce
-        let inputKey = SymmetricKey(data: passData)
-        let derived = HKDF<SHA256>.deriveKey(
-            inputKeyMaterial: inputKey,
-            salt: salt,
-            info: pairingInfo,
-            outputByteCount: 32
-        )
-        return derived
+        switch version {
+        case .v1:
+            let inputKey = SymmetricKey(data: Data(password.utf8))
+            return HKDF<SHA256>.deriveKey(
+                inputKeyMaterial: inputKey,
+                salt: salt,
+                info: pairingInfo,
+                outputByteCount: 32
+            )
+        case .v2:
+            let stretched = pbkdf2(password: password, salt: salt, iterations: pbkdf2Iterations)
+            return HKDF<SHA256>.deriveKey(
+                inputKeyMaterial: SymmetricKey(data: stretched),
+                salt: salt,
+                info: pairingInfoV2,
+                outputByteCount: 32
+            )
+        }
+    }
+
+    /// PBKDF2-HMAC-SHA256 via CommonCrypto (CryptoKit has no PBKDF).
+    private static func pbkdf2(password: String, salt: Data, iterations: UInt32) -> Data {
+        let passwordBytes = Array(password.utf8)
+        var output = [UInt8](repeating: 0, count: 32)
+        let status = salt.withUnsafeBytes { saltBuf -> Int32 in
+            CCKeyDerivationPBKDF(
+                CCPBKDFAlgorithm(kCCPBKDF2),
+                passwordBytes.map { CChar(bitPattern: $0) }, passwordBytes.count,
+                saltBuf.baseAddress?.assumingMemoryBound(to: UInt8.self), salt.count,
+                CCPseudoRandomAlgorithm(kCCPRFHmacAlgSHA256),
+                iterations,
+                &output, output.count
+            )
+        }
+        // CCKeyDerivationPBKDF only fails on parameter errors, which the fixed
+        // arguments above rule out. Fail closed anyway: returning the zeroed
+        // buffer would let both sides derive the same key from an empty
+        // secret and pass the handshake with any password.
+        if status != kCCSuccess {
+            logger.error("PBKDF2 failed with status \(status); handshake will not match")
+            return generateNonce()
+        }
+        return Data(output)
     }
     
     /// Derive the clipboard bulk-channel key from the session key. A distinct

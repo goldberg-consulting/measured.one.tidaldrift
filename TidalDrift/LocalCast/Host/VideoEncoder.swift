@@ -155,6 +155,14 @@ class VideoEncoder {
         
         // Low-latency tuning: emit each frame immediately instead of buffering
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 0 as CFNumber)
+        // The host is a desktop streaming at hundreds of Mbps; never let the
+        // encoder trade frame time for power.
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaximizePowerEfficiency, value: kCFBooleanFalse)
+        if codec == .h264 {
+            // CABAC is ~10% smaller than CAVLC at equal quality and the hardware
+            // decoder handles it at any of our frame rates.
+            VTSessionSetProperty(session, key: kVTCompressionPropertyKey_H264EntropyMode, value: kVTH264EntropyMode_CABAC)
+        }
         // Quality-focused: let the hardware encoder spend more time per frame.
         // Do NOT set PrioritizeEncodingSpeedOverQuality — we want the best visual
         // quality the encoder can produce within real-time constraints.
@@ -280,7 +288,10 @@ class VideoEncoder {
         
         if let kfi = keyframeIntervalSeconds {
             let s1 = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: kfi as CFNumber)
-            let kfiFrames = currentFps * Int(kfi)
+            // Round rather than truncate: Int(1.5) is 1, which at 60 fps
+            // requested a keyframe every 60 frames while the duration key
+            // asked for 90, and the encoder honours whichever fires first.
+            let kfiFrames = max(1, Int((Double(currentFps) * kfi).rounded()))
             let s2 = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: kfiFrames as CFNumber)
             if s1 == noErr && s2 == noErr {
                 logger.info("Live update: keyframe interval → \(kfi)s (\(kfiFrames) frames)")

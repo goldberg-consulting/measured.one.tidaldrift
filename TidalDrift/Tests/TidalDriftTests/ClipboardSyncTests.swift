@@ -17,6 +17,55 @@ final class ClipboardSyncTests: XCTestCase {
         NSPasteboard(name: NSPasteboard.Name("com.tidaldrift.tests.\(UUID().uuidString)"))
     }
 
+    // MARK: - Image pixel cap (#155)
+
+    func test_pngPixelCount_readsHeaderAndRejectsGarbage() {
+        let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil, pixelsWide: 7, pixelsHigh: 5, bitsPerSample: 8,
+            samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+        let png = rep.representation(using: .png, properties: [:])!
+        XCTAssertEqual(ClipboardPasteboard.pngPixelCount(png), 35)
+        XCTAssertNil(ClipboardPasteboard.pngPixelCount(Data("not an image".utf8)))
+        XCTAssertNil(ClipboardPasteboard.pngPixelCount(Data()))
+    }
+
+    func test_applyInline_dropsImageDeclaringHugeCanvas() {
+        // Minimal PNG whose IHDR declares 65535 x 65535 with no pixel data.
+        // ImageIO reads the header without decoding, so the cap has to trip.
+        var png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+        png += Data([0x00, 0x00, 0x00, 0x0D]) + Data("IHDR".utf8)
+        png += Data([0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0xFF, 0xFF, 0x08, 0x06, 0x00, 0x00, 0x00])
+        png += Data([0x00, 0x00, 0x00, 0x00])  // CRC (ImageIO tolerates a bad one)
+        if let pixels = ClipboardPasteboard.pngPixelCount(png) {
+            XCTAssertGreaterThan(pixels, ClipboardPasteboard.maxImagePixels)
+        }
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("test.\(UUID().uuidString)"))
+        ClipboardPasteboard.applyInline(kind: .image, text: nil, rtf: nil, png: png, to: pasteboard)
+        XCTAssertNil(pasteboard.data(forType: .png))
+        XCTAssertNil(pasteboard.data(forType: .tiff))
+        pasteboard.releaseGlobally()
+    }
+
+    // MARK: - Manifest validation (#148)
+
+    func test_declaredTotal_rejectsOverflowNegativeAndOversized() {
+        let cap = LocalCastConfiguration.clipboardMaxTransferBytes
+        XCTAssertEqual(ClipboardBulkTransfer.declaredTotal(of: []), 0)
+        XCTAssertEqual(ClipboardBulkTransfer.declaredTotal(of: [
+            ClipboardFileStub(name: "a", size: 10), ClipboardFileStub(name: "b", size: 32),
+        ]), 42)
+        XCTAssertNil(ClipboardBulkTransfer.declaredTotal(of: [
+            ClipboardFileStub(name: "a", size: Int64.max), ClipboardFileStub(name: "b", size: 1),
+        ]), "Int64.max + 1 must not trap")
+        XCTAssertNil(ClipboardBulkTransfer.declaredTotal(of: [ClipboardFileStub(name: "a", size: -1)]))
+        XCTAssertNil(ClipboardBulkTransfer.declaredTotal(of: [ClipboardFileStub(name: "a", size: cap + 1)]))
+        XCTAssertNil(ClipboardBulkTransfer.declaredTotal(of: [
+            ClipboardFileStub(name: "a", size: cap), ClipboardFileStub(name: "b", size: 1),
+        ]), "sum over the cap")
+        XCTAssertEqual(ClipboardBulkTransfer.declaredTotal(of: [ClipboardFileStub(name: "a", size: cap)]), cap)
+    }
+
     // MARK: - Framing
 
     func test_framing_roundTrip_keyed() throws {

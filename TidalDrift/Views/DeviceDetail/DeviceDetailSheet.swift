@@ -65,16 +65,6 @@ struct DeviceDetailSheet: View {
                 viewModel.connectionError = nil
             }
 
-            // Add "Fix Remote" button if it's the "not permitted" error and device is a TidalDrift peer
-            if let error = viewModel.connectionError,
-               error.contains("not permitted") && device.isTidalDriftPeer {
-                Button("Fix Remote Screen Sharing") {
-                    Task {
-                        _ = await ScreenShareConnectionService.shared.requestRemoteScreenSharingRestart(ipAddress: device.ipAddress)
-                    }
-                    viewModel.connectionError = nil
-                }
-            }
         } message: {
             if let error = viewModel.connectionError {
                 if error.contains("not permitted") {
@@ -83,7 +73,7 @@ struct DeviceDetailSheet: View {
 
                     This is a known macOS bug. The remote machine needs to restart its Screen Sharing service.
 
-                    \(device.isTidalDriftPeer ? "Click 'Fix Remote Screen Sharing' to fix automatically." : "On the remote Mac: System Settings → Sharing → Toggle Screen Sharing OFF then ON.")
+                    On the remote Mac: System Settings → Sharing → Toggle Screen Sharing OFF then ON.
                     """)
                 } else {
                     Text(error)
@@ -141,8 +131,6 @@ struct DeviceDetailSheet: View {
         .padding(20)
     }
 
-    @State private var isFixingRemoteScreenSharing = false
-    @State private var fixRemoteResult: Bool?
 
     private var connectionSection: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -184,39 +172,6 @@ struct DeviceDetailSheet: View {
                 .controlSize(.small)
 
                 Spacer()
-
-                // Fix Remote Screen Sharing button (for "not permitted" error)
-                if device.isTidalDriftPeer && device.services.contains(.screenSharing) {
-                    Button {
-                        Task {
-                            isFixingRemoteScreenSharing = true
-                            fixRemoteResult = nil
-                            let success = await ScreenShareConnectionService.shared.requestRemoteScreenSharingRestart(ipAddress: device.ipAddress)
-                            fixRemoteResult = success
-                            isFixingRemoteScreenSharing = false
-
-                            // Auto-clear result after 3 seconds
-                            try? await Task.sleep(nanoseconds: 3_000_000_000)
-                            fixRemoteResult = nil
-                        }
-                    } label: {
-                        HStack(spacing: 4) {
-                            if isFixingRemoteScreenSharing {
-                                ProgressView()
-                                    .scaleEffect(0.6)
-                            } else if let result = fixRemoteResult {
-                                Image(systemName: result ? "checkmark.circle" : "xmark.circle")
-                                    .foregroundColor(result ? .green : .red)
-                            } else {
-                                Image(systemName: "wrench.fill")
-                            }
-                            Text("Fix Remote")
-                        }
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .help("Restart Screen Sharing on remote machine (fixes 'not permitted' error)")
-                }
 
                 Button {
                     Task {

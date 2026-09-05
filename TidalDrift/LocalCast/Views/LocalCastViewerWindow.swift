@@ -8,6 +8,12 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
     private var localMonitors: [Any] = []
     private let keyboardTap = RemoteKeyboardTap()
     private var keyboardTapActive = false
+    /// Modifiers forwarded as pressed by the NSEvent fallback path and not yet
+    /// forwarded as released. The monitor only sees events for this window, so
+    /// a release after Cmd+Tab or after capture is toggled off never arrives;
+    /// these are released explicitly at those points.
+    private var fallbackHeldModifiers: Set<UInt16> = []
+    private var cancellables = Set<AnyCancellable>()
     private var remoteResolution: CGSize = CGSize(width: 1280, height: 720)
     private var hasSizedToRemote = false
     private var didCleanup = false
@@ -45,7 +51,8 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
         let contentView = LocalCastContentView(
             mtkView: mtkView,
             session: session,
-            tuning: LocalCastService.shared.streamingTuning
+            tuning: LocalCastService.shared.streamingTuning,
+            overlayFrames: overlayFrameStore
         )
         window.contentView = NSHostingView(rootView: contentView)
         
@@ -110,8 +117,11 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
         }
     }
     
-    private let toolbarRegionHeight: CGFloat = 55
-    private let bottomBarRegionHeight: CGFloat = 32
+    /// Frames of the viewer's own overlay controls, in content-view
+    /// coordinates, reported by SwiftUI via preference so the mouse monitor
+    /// can pass clicks through to them instead of forwarding to the host.
+    private let overlayFrameStore = ViewerOverlayFrames()
+    private var overlayFrames: [CGRect] { overlayFrameStore.frames }
     
     private var diagCount = 0
     
@@ -134,13 +144,16 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
             if self.clientSession.isOverlayActive { return event }
             
             guard let contentView = window.contentView else { return event }
-            let contentHeight = contentView.frame.height
-            let y = event.locationInWindow.y
             
-            let isInToolbar = y > (contentHeight - 24)
-            let isInBottomBar = y < self.bottomBarRegionHeight
-            if isInToolbar || isInBottomBar {
-                if self.diagCount <= 20 { lcDebug("🖱️ PASS-THROUGH: toolbar=\(isInToolbar) bottomBar=\(isInBottomBar) y=\(Int(y)) h=\(Int(contentHeight))") }
+            // Let clicks on the viewer's own controls (top chevron, bottom
+            // status capsule) reach them; everything else on the surface is
+            // remote input. Hit-testing the reported control frames rather
+            // than fixed top/bottom bands matters in full screen, where a
+            // band would swallow clicks meant for the remote menu bar and Dock.
+            let pointInContent = contentView.convert(event.locationInWindow, from: nil)
+            if event.type != .scrollWheel,
+               self.overlayFrames.contains(where: { $0.insetBy(dx: -4, dy: -4).contains(pointInContent) }) {
+                if self.diagCount <= 20 { lcDebug("🖱️ PASS-THROUGH: viewer control at \(NSStringFromPoint(pointInContent))") }
                 return event
             }
             
@@ -200,6 +213,16 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
             }
         }
         keyboardTapActive = keyboardTap.start()
+
+        // Capture toggled off (hotkey or HUD button): whatever is held on the
+        // host would otherwise stay latched until the session ends.
+        clientSession.$inputCaptureEnabled
+            .dropFirst()
+            .removeDuplicates()
+            .filter { !$0 }
+            .sink { [weak self] _ in self?.releaseHeldModifiers() }
+            .store(in: &cancellables)
+
         guard !keyboardTapActive else { return }
 
         let keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged]) { [weak self] event in
@@ -296,12 +319,25 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
             let flags = CGEventFlags(rawValue: UInt64(modifiers))
             guard let isDown = ModifierKey.isPress(keyCode: keyCode, flags: flags) else { break }
             if isDown {
+                fallbackHeldModifiers.insert(keyCode)
                 clientSession.sendInput(.keyDown(keyCode: keyCode, modifiers: UInt64(modifiers)))
             } else {
+                fallbackHeldModifiers.remove(keyCode)
                 clientSession.sendInput(.keyUp(keyCode: keyCode, modifiers: UInt64(modifiers)))
             }
         default:
             break
+        }
+    }
+
+    /// Send a release for every modifier either keyboard path reported as
+    /// pressed. Called when capture disengages for any reason.
+    private func releaseHeldModifiers() {
+        keyboardTap.releaseHeldModifiers()
+        let stuck = fallbackHeldModifiers
+        fallbackHeldModifiers.removeAll()
+        for keyCode in stuck {
+            clientSession.sendInput(.keyUp(keyCode: keyCode, modifiers: 0))
         }
     }
     
@@ -313,6 +349,8 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
         guard !didCleanup else { return }
         didCleanup = true
 
+        cancellables.removeAll()
+        releaseHeldModifiers()
         keyboardTap.stop()
         keyboardTapActive = false
         pendingViewerSizeSend?.cancel()
@@ -322,6 +360,9 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
         }
         localMonitors.removeAll()
         clientSession.disconnect()
+        // The renderer owns the MTKView, its CAMetalLayer, the texture cache
+        // and the last decoded frames; the session outlives this window.
+        clientSession.renderer = nil
         onClose?(self)
         onClose = nil
     }
@@ -401,7 +442,17 @@ extension LocalCastViewerWindowController: NSWindowDelegate {
     }
 
     func windowDidBecomeKey(_ notification: Notification) {
+        keyboardTap.setEnabled(true)
         syncRenderPause()
+    }
+
+    /// Losing key (Cmd+Tab, clicking another window) means no release for a
+    /// held modifier will reach either keyboard path. Let the host go, and
+    /// stop the session-wide tap from touching every keystroke meant for
+    /// other apps.
+    func windowDidResignKey(_ notification: Notification) {
+        releaseHeldModifiers()
+        keyboardTap.setEnabled(false)
     }
 
     func windowDidBecomeMain(_ notification: Notification) {
@@ -430,10 +481,39 @@ extension LocalCastViewerWindowController: NSWindowDelegate {
     }
 }
 
+/// Main-thread mailbox for overlay control frames. SwiftUI writes it from
+/// `onPreferenceChange`; the window controller's mouse monitor reads it.
+final class ViewerOverlayFrames {
+    var frames: [CGRect] = []
+}
+
+private struct OverlayFramePreferenceKey: PreferenceKey {
+    static var defaultValue: [CGRect] = []
+    static func reduce(value: inout [CGRect], nextValue: () -> [CGRect]) {
+        value.append(contentsOf: nextValue())
+    }
+}
+
+private extension View {
+    /// Reports this view's frame (hosting-view coordinates) as a pass-through
+    /// region for the viewer's mouse monitor.
+    func reportOverlayFrame() -> some View {
+        background(
+            GeometryReader { proxy in
+                Color.clear.preference(
+                    key: OverlayFramePreferenceKey.self,
+                    value: [proxy.frame(in: .global)]
+                )
+            }
+        )
+    }
+}
+
 struct LocalCastContentView: View {
     let mtkView: MTKView
     @ObservedObject var session: ClientSession
     @ObservedObject var tuning: StreamingTuning
+    let overlayFrames: ViewerOverlayFrames
     @State private var showControlsPanel = false
     @State private var controlsTab: LocalCastControlsPanel.Tab = .quality
     
@@ -467,6 +547,7 @@ struct LocalCastContentView: View {
                     .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
+                .reportOverlayFrame()
                 .padding(.bottom, 4)
                 .help("Stream controls (quality, apps, info)")
                 
@@ -490,6 +571,9 @@ struct LocalCastContentView: View {
                 Spacer()
                 bottomStatusBar
             }
+        }
+        .onPreferenceChange(OverlayFramePreferenceKey.self) { frames in
+            overlayFrames.frames = frames
         }
         .onChange(of: showControlsPanel) { _ in syncOverlayState() }
         .onReceive(tuning.objectWillChange.debounce(for: .milliseconds(200), scheduler: DispatchQueue.main)) { _ in
@@ -548,6 +632,7 @@ struct LocalCastContentView: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 6)
         .background(.black.opacity(0.55), in: Capsule())
+        .reportOverlayFrame()
         .padding(.bottom, 8)
     }
 }

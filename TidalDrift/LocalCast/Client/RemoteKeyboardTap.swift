@@ -86,6 +86,17 @@ final class RemoteKeyboardTap {
         return true
     }
 
+    /// Enable or disable the installed tap without tearing it down. A disabled
+    /// tap costs nothing per keystroke; an enabled one adds a round trip
+    /// through this process to every key event on the system, so the owner
+    /// disables it whenever the viewer is not the key window. Disabling also
+    /// releases anything reported as held, since no release could follow.
+    func setEnabled(_ enabled: Bool) {
+        guard let tap = eventTap else { return }
+        if !enabled { releaseHeldModifiers() }
+        CGEvent.tapEnable(tap: tap, enable: enabled)
+    }
+
     func stop() {
         releaseHeldModifiers()
         if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: false) }

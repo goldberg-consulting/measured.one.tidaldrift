@@ -25,20 +25,38 @@ class TidalDriftPeerService: NSObject, ObservableObject {
         
         // File I/O is slow - do on background queue
         logQueue.async {
-            let logPath = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("tidaldrift-peer.log")
             let timestamp = ISO8601DateFormatter().string(from: Date())
-            let logLine = "[\(timestamp)] \(message)\n"
-            if let data = logLine.data(using: .utf8) {
-                if FileManager.default.fileExists(atPath: logPath.path) {
-                    if let handle = try? FileHandle(forWritingTo: logPath) {
-                        handle.seekToEndOfFile()
-                        handle.write(data)
-                        try? handle.close()
-                    }
-                } else {
-                    try? data.write(to: logPath)
-                }
-            }
+            appendToLogFile("[\(timestamp)] \(message)\n")
+        }
+    }
+    
+    /// `~/Library/Logs/TidalDrift/peer.log`, rotated once past `maxLogBytes`
+    /// (one `.1` generation kept). Peer TXT records land here every 45 s, so
+    /// an unbounded file in the home directory was a slow disk leak.
+    private static let maxLogBytes: UInt64 = 2 * 1024 * 1024
+    private static let logDirectory = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Logs/TidalDrift", isDirectory: true)
+    private static let logFileURL = logDirectory.appendingPathComponent("peer.log")
+    
+    /// Runs on `logQueue`.
+    private static func appendToLogFile(_ line: String) {
+        let fm = FileManager.default
+        guard let data = line.data(using: .utf8) else { return }
+        try? fm.createDirectory(at: logDirectory, withIntermediateDirectories: true)
+        
+        if let size = (try? fm.attributesOfItem(atPath: logFileURL.path)[.size]) as? UInt64,
+           size + UInt64(data.count) > maxLogBytes {
+            let rotated = logDirectory.appendingPathComponent("peer.log.1")
+            try? fm.removeItem(at: rotated)
+            try? fm.moveItem(at: logFileURL, to: rotated)
+        }
+        
+        if let handle = try? FileHandle(forWritingTo: logFileURL) {
+            handle.seekToEndOfFile()
+            handle.write(data)
+            try? handle.close()
+        } else {
+            try? data.write(to: logFileURL)
         }
     }
     
@@ -123,7 +141,7 @@ class TidalDriftPeerService: NSObject, ObservableObject {
             processorInfo: Self.getProcessorInfo(),
             memoryGB: Self.getMemoryGB(),
             macOSVersion: Self.getMacOSVersion(),
-            userName: NSUserName(),
+            userName: "",  // never advertised; see #162
             uptimeHours: Self.getUptimeHours(),
             tidalDriftVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0",
             screenSharingEnabled: true,
@@ -224,7 +242,6 @@ class TidalDriftPeerService: NSObject, ObservableObject {
             "cpu=\(localInfo.processorInfo)",
             "mem=\(localInfo.memoryGB)",
             "os=\(localInfo.macOSVersion)",
-            "user=\(localInfo.userName)",
             "uptime=\(Self.getUptimeHours())",
             "version=\(localInfo.tidalDriftVersion)",
             "screen=\(localInfo.screenSharingEnabled ? "1" : "0")",
@@ -402,7 +419,6 @@ class TidalDriftPeerService: NSObject, ObservableObject {
         txt["cpu"] = localInfo.processorInfo
         txt["mem"] = "\(localInfo.memoryGB)"
         txt["os"] = localInfo.macOSVersion
-        txt["user"] = localInfo.userName
         txt["uptime"] = "\(localInfo.uptimeHours)"
         txt["version"] = localInfo.tidalDriftVersion
         txt["screen"] = localInfo.screenSharingEnabled ? "1" : "0"
@@ -418,7 +434,6 @@ class TidalDriftPeerService: NSObject, ObservableObject {
         dict["cpu"] = localInfo.processorInfo.data(using: .utf8)
         dict["mem"] = "\(localInfo.memoryGB)".data(using: .utf8)
         dict["os"] = localInfo.macOSVersion.data(using: .utf8)
-        dict["user"] = localInfo.userName.data(using: .utf8)
         dict["uptime"] = "\(localInfo.uptimeHours)".data(using: .utf8)
         dict["version"] = localInfo.tidalDriftVersion.data(using: .utf8)
         dict["screen"] = (localInfo.screenSharingEnabled ? "1" : "0").data(using: .utf8)
@@ -659,12 +674,6 @@ class TidalDriftPeerService: NSObject, ObservableObject {
     private let nwConnectionsLock = NSLock()
     
     private func resolveServiceViaDnsSd(name: String) {
-        // Skip if already resolving this service
-        resolveLock.lock()
-        let alreadyResolving = resolveProcesses[name] != nil
-        resolveLock.unlock()
-        guard !alreadyResolving else { return }
-        
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/dns-sd")
         process.arguments = ["-L", name, serviceType, "local."]
@@ -672,6 +681,19 @@ class TidalDriftPeerService: NSObject, ObservableObject {
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
+        
+        // Claim the slot before launching. The reconfirm timer (main) and the
+        // browse pipe handler (background) both call in here; a check that
+        // released the lock before `run()` let both launch a resolver and the
+        // second insert orphaned the first child.
+        resolveLock.lock()
+        guard resolveProcesses[name] == nil else {
+            resolveLock.unlock()
+            return
+        }
+        resolveProcesses[name] = process
+        resolvePipes[name] = pipe
+        resolveLock.unlock()
         
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
@@ -682,17 +704,12 @@ class TidalDriftPeerService: NSObject, ObservableObject {
         
         do {
             try process.run()
-            
-            resolveLock.lock()
-            resolveProcesses[name] = process
-            resolvePipes[name] = pipe
-            resolveLock.unlock()
-            
             DispatchQueue.global().asyncAfter(deadline: .now() + 10) { [weak self] in
                 self?.cleanupResolve(name: name)
             }
         } catch {
             Self.log("❌ Failed to resolve \(name): \(error)")
+            cleanupResolve(name: name)
         }
     }
     
@@ -781,14 +798,6 @@ class TidalDriftPeerService: NSObject, ObservableObject {
     }
     
     private func lookupIP(for name: String, hostname: String) {
-        // Skip if already looking up this name
-        lookupLock.lock()
-        if lookupProcesses[name] != nil || lookupCompleted.contains(name) {
-            lookupLock.unlock()
-            return
-        }
-        lookupLock.unlock()
-        
         // Use dns-sd -G to lookup IPv4 address
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/dns-sd")
@@ -797,6 +806,17 @@ class TidalDriftPeerService: NSObject, ObservableObject {
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
+        
+        // Claim the slot under one lock hold so two callers cannot both
+        // launch a lookup for the same name (see resolveServiceViaDnsSd).
+        lookupLock.lock()
+        if lookupProcesses[name] != nil || lookupCompleted.contains(name) {
+            lookupLock.unlock()
+            return
+        }
+        lookupProcesses[name] = process
+        lookupPipes[name] = pipe
+        lookupLock.unlock()
         
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             guard let self = self else { return }
@@ -840,22 +860,13 @@ class TidalDriftPeerService: NSObject, ObservableObject {
         }
         
         do {
-            lookupLock.lock()
-            lookupProcesses[name] = process
-            lookupPipes[name] = pipe
-            lookupLock.unlock()
-            
             try process.run()
-            
             DispatchQueue.global().asyncAfter(deadline: .now() + 8) { [weak self] in
                 self?.cleanupLookup(name: name)
             }
         } catch {
-            lookupLock.lock()
-            lookupProcesses.removeValue(forKey: name)
-            lookupPipes.removeValue(forKey: name)
-            lookupLock.unlock()
             Self.log("❌ Failed to lookup IP for \(hostname): \(error)")
+            cleanupLookup(name: name)
         }
     }
     
@@ -899,11 +910,13 @@ class TidalDriftPeerService: NSObject, ObservableObject {
             // Use TXT record data if available, otherwise "Unknown"
             let modelName = txt?["model"] ?? "TidalDrift Peer"
             let osVersion = txt?["os"] ?? "macOS"
-            let userName = txt?["user"] ?? name.replacingOccurrences(of: "-", with: " ")
+            // Current peers no longer advertise `user`; older builds still
+            // might. Empty hides the row in the UI.
+            let userName = txt?["user"] ?? ""
             let version = txt?["version"] ?? "1.0"
             
             Self.log("✅ Discovered peer: \(name) at \(actualIP)")
-            Self.log("   Model: \(modelName), OS: \(osVersion), User: \(userName)")
+            Self.log("   Model: \(modelName), OS: \(osVersion)")
             
             peer = PeerInfo(
                 peerId: txt?["peerId"],
@@ -1034,7 +1047,7 @@ class TidalDriftPeerService: NSObject, ObservableObject {
             processorInfo: txt?["cpu"] ?? "Unknown",
             memoryGB: Int(txt?["mem"] ?? "0") ?? 0,
             macOSVersion: txt?["os"] ?? "Unknown",
-            userName: txt?["user"] ?? "Unknown",
+            userName: txt?["user"] ?? "",
             uptimeHours: Int(txt?["uptime"] ?? "0") ?? 0,
             tidalDriftVersion: txt?["version"] ?? "1.0",
             screenSharingEnabled: txt?["screen"] == "1",
@@ -1268,7 +1281,7 @@ extension TidalDriftPeerService: NetServiceBrowserDelegate {
             processorInfo: txtValues["cpu"] ?? "Unknown",
             memoryGB: Int(txtValues["mem"] ?? "0") ?? 0,
             macOSVersion: txtValues["os"] ?? "Unknown",
-            userName: txtValues["user"] ?? "Unknown",
+            userName: txtValues["user"] ?? "",
             uptimeHours: Int(txtValues["uptime"] ?? "0") ?? 0,
             tidalDriftVersion: txtValues["version"] ?? "1.0",
             screenSharingEnabled: txtValues["screen"] == "1",

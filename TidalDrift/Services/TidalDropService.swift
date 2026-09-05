@@ -491,17 +491,21 @@ class TidalDropService: ObservableObject {
         
         // 1. Receive metadata size (4 bytes)
         print("🌊 TidalDrop: Waiting for metadata size (4 bytes)...")
-        connection.receive(minimumIncompleteLength: 4, maximumLength: 4) { [weak self] data, _, isComplete, error in
+        // Every early exit cancels the connection; otherwise a peer that sends
+        // a short or malformed header pins the socket open indefinitely.
+        connection.receive(minimumIncompleteLength: 4, maximumLength: 4) { [weak self] data, _, _, error in
             if let error = error {
                 print("❌ TidalDrop: Error receiving metadata size: \(error)")
+                connection.cancel()
                 return
             }
-            guard let self = self, let d = data else {
+            guard let self = self, let d = data, d.count == 4 else {
                 print("❌ TidalDrop: No data received for metadata size")
+                connection.cancel()
                 return
             }
             
-            let metadataSize = Int(d.withUnsafeBytes { $0.load(as: UInt32.self).bigEndian })
+            let metadataSize = Int(d.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self).bigEndian })
             
             guard metadataSize > 0 && metadataSize <= 1_048_576 else {
                 print("❌ TidalDrop: Metadata size out of bounds: \(metadataSize)")
@@ -514,15 +518,18 @@ class TidalDropService: ObservableObject {
             connection.receive(minimumIncompleteLength: metadataSize, maximumLength: metadataSize) { [weak self] data, _, _, error in
                 if let error = error {
                     print("❌ TidalDrop: Error receiving metadata: \(error)")
+                    connection.cancel()
                     return
                 }
                 guard let self = self, let d = data else {
                     print("❌ TidalDrop: No data received for metadata")
+                    connection.cancel()
                     return
                 }
                 
                 guard let metadata = try? JSONDecoder().decode(FileMetadata.self, from: d) else {
                     print("❌ TidalDrop: Failed to decode metadata JSON")
+                    connection.cancel()
                     return
                 }
                 
@@ -532,12 +539,44 @@ class TidalDropService: ObservableObject {
         }
     }
     
-    /// Sanitize a filename received from the network to prevent path traversal.
-    private static func sanitizeFilename(_ raw: String) -> String? {
-        let name = URL(fileURLWithPath: raw).lastPathComponent
-        if name.isEmpty || name == "." || name == ".." { return nil }
-        if name.hasPrefix(".") { return nil }
+    /// Sanitize a filename received from the network. Anything that is not a
+    /// single plain path component is rejected outright rather than repaired:
+    /// `URL.lastPathComponent` returns "/" for the input "/", which used to
+    /// pass every check and resolve to the drop folder itself.
+    static func sanitizeFilename(_ raw: String) -> String? {
+        let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, name.count <= 255,
+              name != ".", name != "..", !name.hasPrefix("."),
+              !name.contains("/"), !name.contains(":"), !name.contains("\0") else { return nil }
         return name
+    }
+
+    /// Largest transfer the receiver will accept. The size comes from an
+    /// unauthenticated peer, so without a ceiling one connection could fill
+    /// the disk.
+    private static let maxIncomingFileSize: Int64 = 64 << 30
+
+    /// The drop listener has no authentication, so only peers on the local
+    /// network (private IPv4, IPv6 link-local/ULA, loopback for tests) may
+    /// push files.
+    static func isAcceptableSender(_ ip: String) -> Bool {
+        NetworkUtils.isLocalPeerAddress(ip)
+    }
+
+    /// A destination that does not clobber anything already in the folder.
+    /// The sender is unauthenticated, so an incoming name must never delete
+    /// an existing file; collisions get " (n)" appended before the extension.
+    static func uniqueDestination(in folder: URL, for name: String) -> URL {
+        let first = folder.appendingPathComponent(name)
+        guard FileManager.default.fileExists(atPath: first.path) else { return first }
+        let base = (name as NSString).deletingPathExtension
+        let ext = (name as NSString).pathExtension
+        for n in 1... {
+            let candidate = ext.isEmpty ? "\(base) (\(n))" : "\(base) (\(n)).\(ext)"
+            let url = folder.appendingPathComponent(candidate)
+            if !FileManager.default.fileExists(atPath: url.path) { return url }
+        }
+        fatalError("unreachable")
     }
     
     private func setupIncomingTransfer(_ connection: NWConnection, metadata: FileMetadata, remoteIP: String) {
@@ -545,8 +584,10 @@ class TidalDropService: ObservableObject {
         let destinationFolder = AppState.shared.settings.tidalDropFolder
         let didStartDestinationAccess = destinationFolder.startAccessingSecurityScopedResource()
         
-        guard let safeName = Self.sanitizeFilename(metadata.fileName) else {
-            print("❌ TidalDrop: Rejected unsafe filename: \(metadata.fileName)")
+        guard let safeName = Self.sanitizeFilename(metadata.fileName),
+              metadata.fileSize > 0, metadata.fileSize <= Self.maxIncomingFileSize,
+              Self.isAcceptableSender(remoteIP) else {
+            print("❌ TidalDrop: Rejected transfer (name/size/sender check failed) from \(remoteIP)")
             if didStartDestinationAccess {
                 destinationFolder.stopAccessingSecurityScopedResource()
             }
@@ -565,7 +606,15 @@ class TidalDropService: ObservableObject {
             print("❌ TidalDrop: Failed to create destination folder: \(error)")
         }
         
-        let fileURL = destinationFolder.appendingPathComponent(safeName)
+        let fileURL = Self.uniqueDestination(in: destinationFolder, for: safeName)
+        guard fileURL.deletingLastPathComponent().standardizedFileURL.path == destinationFolder.standardizedFileURL.path else {
+            print("❌ TidalDrop: Destination escaped the drop folder; rejecting")
+            if didStartDestinationAccess {
+                destinationFolder.stopAccessingSecurityScopedResource()
+            }
+            connection.cancel()
+            return
+        }
         print("   File will be saved to: \(fileURL.path)")
         
         let transfer = DropTransfer(
@@ -586,25 +635,27 @@ class TidalDropService: ObservableObject {
             NSSound.beep()
         }
         
-        // Remove existing file if present
-        if FileManager.default.fileExists(atPath: fileURL.path) {
-            do {
-                try FileManager.default.removeItem(at: fileURL)
-                print("🌊 TidalDrop: Removed existing file")
-            } catch {
-                print("⚠️ TidalDrop: Could not remove existing file: \(error)")
-            }
-        }
-        
         // Create empty file
         let created = FileManager.default.createFile(atPath: fileURL.path, contents: nil)
         print("🌊 TidalDrop: Created empty file: \(created)")
+
+        // One handle for the whole transfer. Reopening the file for every
+        // 64 KB chunk cost an open/seek/close per chunk (16k of them per GB).
+        guard let handle = try? FileHandle(forWritingTo: fileURL) else {
+            print("❌ TidalDrop: Could not open destination for writing")
+            if didStartDestinationAccess {
+                destinationFolder.stopAccessingSecurityScopedResource()
+            }
+            connection.cancel()
+            return
+        }
         
         print("🌊 TidalDrop: Starting to receive file data...")
         receiveFileData(
             connection,
             transferId: transferId,
             fileURL: fileURL,
+            handle: handle,
             fileSize: metadata.fileSize,
             receivedSoFar: 0,
             securityScopedDestination: didStartDestinationAccess ? destinationFolder : nil
@@ -615,15 +666,17 @@ class TidalDropService: ObservableObject {
         _ connection: NWConnection,
         transferId: UUID,
         fileURL: URL,
+        handle: FileHandle,
         fileSize: Int64,
         receivedSoFar: Int64,
         securityScopedDestination: URL?
     ) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 1 << 20) { [weak self] data, _, isComplete, error in
             guard let self = self else { return }
             
             if let e = error {
                 print("❌ TidalDrop: Error receiving file data: \(e)")
+                try? handle.close()
                 securityScopedDestination?.stopAccessingSecurityScopedResource()
                 DispatchQueue.main.async {
                     self.activeTransfers[transferId]?.status = .failed(e.localizedDescription)
@@ -632,14 +685,15 @@ class TidalDropService: ObservableObject {
             }
             
             if let d = data {
-                // Write data to file
+                // Never write past the declared size: the sender is untrusted
+                // and the size cap was enforced against the declared value.
+                let remaining = fileSize - receivedSoFar
+                let chunk = Int64(d.count) > remaining ? d.prefix(Int(remaining)) : d
                 do {
-                    let handle = try FileHandle(forWritingTo: fileURL)
-                    handle.seekToEndOfFile()
-                    handle.write(d)
-                    try handle.close()
+                    try handle.write(contentsOf: chunk)
                 } catch {
                     print("❌ TidalDrop: Error writing to file: \(error)")
+                    try? handle.close()
                     securityScopedDestination?.stopAccessingSecurityScopedResource()
                     DispatchQueue.main.async {
                         self.activeTransfers[transferId]?.status = .failed("Write error: \(error.localizedDescription)")
@@ -647,7 +701,7 @@ class TidalDropService: ObservableObject {
                     return
                 }
                 
-                let newReceived = receivedSoFar + Int64(d.count)
+                let newReceived = receivedSoFar + Int64(chunk.count)
                 let progress = Double(newReceived) / Double(fileSize)
                 
                 // Log progress every 10%
@@ -666,19 +720,25 @@ class TidalDropService: ObservableObject {
                         connection,
                         transferId: transferId,
                         fileURL: fileURL,
+                        handle: handle,
                         fileSize: fileSize,
                         receivedSoFar: newReceived,
                         securityScopedDestination: securityScopedDestination
                     )
                 } else {
                     print("✅ TidalDrop: File received completely! Saved to: \(fileURL.path)")
+                    try? handle.close()
                     securityScopedDestination?.stopAccessingSecurityScopedResource()
                     self.completeTransfer(transferId: transferId, fileName: fileURL.lastPathComponent, isIncoming: true)
                     connection.cancel()
                 }
             } else if isComplete {
                 print("⚠️ TidalDrop: Connection completed but only received \(receivedSoFar)/\(fileSize) bytes")
+                try? handle.close()
                 securityScopedDestination?.stopAccessingSecurityScopedResource()
+                DispatchQueue.main.async {
+                    self.activeTransfers[transferId]?.status = .failed("Sender disconnected early")
+                }
             }
         }
     }
