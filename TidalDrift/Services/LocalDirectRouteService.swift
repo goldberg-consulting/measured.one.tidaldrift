@@ -18,7 +18,14 @@ final class LocalDirectRouteService {
     private let logger = Logger(subsystem: "com.tidaldrift", category: "DirectRoute")
 
     static let label = "com.tidaldrift.direct-route"
-    private let binPath = "/usr/local/bin/tidaldrift-direct-route.sh"
+    /// Root-owned home for the daemon script. /usr/local/bin is admin-user
+    /// writable on Homebrew Macs, so a script there that root runs every 15 s
+    /// is a promptless root escalation for any process running as that user.
+    /// /Library/PrivilegedHelperTools is root:wheel 755 by convention.
+    private let binDirectory = "/Library/PrivilegedHelperTools"
+    private var binPath: String { "\(binDirectory)/tidaldrift-direct-route.sh" }
+    /// Location used by earlier builds; removed on disable and on re-enable.
+    private let legacyBinPath = "/usr/local/bin/tidaldrift-direct-route.sh"
     private var plistPath: String { "/Library/LaunchDaemons/\(Self.label).plist" }
 
     private let subnetKey = "directRouteSubnet"
@@ -136,7 +143,8 @@ final class LocalDirectRouteService {
         // executable is run as root), then loads the daemon. base64 contains
         // only [A-Za-z0-9+/=], so there are no quotes to escape.
         let command = [
-            "mkdir -p /usr/local/bin",
+            "install -d -o root -g wheel -m 755 \(binDirectory)",
+            "rm -f \(legacyBinPath)",
             "printf %s '\(scriptB64)' | base64 -D > \(binPath)",
             "chmod 755 \(binPath)",
             "chown root:wheel \(binPath)",
@@ -158,7 +166,7 @@ final class LocalDirectRouteService {
 
     @discardableResult
     func disable() async -> Bool {
-        var parts = ["launchctl bootout system/\(Self.label) 2>/dev/null; rm -f \(plistPath) \(binPath)"]
+        var parts = ["launchctl bootout system/\(Self.label) 2>/dev/null; rm -f \(plistPath) \(binPath) \(legacyBinPath)"]
         // The stored subnet is interpolated into a root shell command, and
         // UserDefaults is writable by any process running as this user, so it
         // is re-validated as a plain a.b.c.d/nn before use.
@@ -180,6 +188,7 @@ final class LocalDirectRouteService {
         # Managed by TidalDrift. Pins the home subnet to the physical interface
         # so local traffic bypasses a full-tunnel VPN, only while on this network.
         set -u
+        export PATH=/usr/sbin:/sbin:/usr/bin:/bin
 
         DESTS=( "\(home.subnetCIDR)" )
         HOME_SUBNET_PREFIX="\(home.subnetPrefix)"
