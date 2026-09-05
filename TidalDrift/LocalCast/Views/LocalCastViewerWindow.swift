@@ -51,7 +51,8 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
         let contentView = LocalCastContentView(
             mtkView: mtkView,
             session: session,
-            tuning: LocalCastService.shared.streamingTuning
+            tuning: LocalCastService.shared.streamingTuning,
+            overlayFrames: overlayFrameStore
         )
         window.contentView = NSHostingView(rootView: contentView)
         
@@ -116,8 +117,11 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
         }
     }
     
-    private let toolbarRegionHeight: CGFloat = 55
-    private let bottomBarRegionHeight: CGFloat = 32
+    /// Frames of the viewer's own overlay controls, in content-view
+    /// coordinates, reported by SwiftUI via preference so the mouse monitor
+    /// can pass clicks through to them instead of forwarding to the host.
+    private let overlayFrameStore = ViewerOverlayFrames()
+    private var overlayFrames: [CGRect] { overlayFrameStore.frames }
     
     private var diagCount = 0
     
@@ -140,13 +144,16 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
             if self.clientSession.isOverlayActive { return event }
             
             guard let contentView = window.contentView else { return event }
-            let contentHeight = contentView.frame.height
-            let y = event.locationInWindow.y
             
-            let isInToolbar = y > (contentHeight - 24)
-            let isInBottomBar = y < self.bottomBarRegionHeight
-            if isInToolbar || isInBottomBar {
-                if self.diagCount <= 20 { lcDebug("🖱️ PASS-THROUGH: toolbar=\(isInToolbar) bottomBar=\(isInBottomBar) y=\(Int(y)) h=\(Int(contentHeight))") }
+            // Let clicks on the viewer's own controls (top chevron, bottom
+            // status capsule) reach them; everything else on the surface is
+            // remote input. Hit-testing the reported control frames rather
+            // than fixed top/bottom bands matters in full screen, where a
+            // band would swallow clicks meant for the remote menu bar and Dock.
+            let pointInContent = contentView.convert(event.locationInWindow, from: nil)
+            if event.type != .scrollWheel,
+               self.overlayFrames.contains(where: { $0.insetBy(dx: -4, dy: -4).contains(pointInContent) }) {
+                if self.diagCount <= 20 { lcDebug("🖱️ PASS-THROUGH: viewer control at \(NSStringFromPoint(pointInContent))") }
                 return event
             }
             
@@ -474,10 +481,39 @@ extension LocalCastViewerWindowController: NSWindowDelegate {
     }
 }
 
+/// Main-thread mailbox for overlay control frames. SwiftUI writes it from
+/// `onPreferenceChange`; the window controller's mouse monitor reads it.
+final class ViewerOverlayFrames {
+    var frames: [CGRect] = []
+}
+
+private struct OverlayFramePreferenceKey: PreferenceKey {
+    static var defaultValue: [CGRect] = []
+    static func reduce(value: inout [CGRect], nextValue: () -> [CGRect]) {
+        value.append(contentsOf: nextValue())
+    }
+}
+
+private extension View {
+    /// Reports this view's frame (hosting-view coordinates) as a pass-through
+    /// region for the viewer's mouse monitor.
+    func reportOverlayFrame() -> some View {
+        background(
+            GeometryReader { proxy in
+                Color.clear.preference(
+                    key: OverlayFramePreferenceKey.self,
+                    value: [proxy.frame(in: .global)]
+                )
+            }
+        )
+    }
+}
+
 struct LocalCastContentView: View {
     let mtkView: MTKView
     @ObservedObject var session: ClientSession
     @ObservedObject var tuning: StreamingTuning
+    let overlayFrames: ViewerOverlayFrames
     @State private var showControlsPanel = false
     @State private var controlsTab: LocalCastControlsPanel.Tab = .quality
     
@@ -511,6 +547,7 @@ struct LocalCastContentView: View {
                     .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
+                .reportOverlayFrame()
                 .padding(.bottom, 4)
                 .help("Stream controls (quality, apps, info)")
                 
@@ -534,6 +571,9 @@ struct LocalCastContentView: View {
                 Spacer()
                 bottomStatusBar
             }
+        }
+        .onPreferenceChange(OverlayFramePreferenceKey.self) { frames in
+            overlayFrames.frames = frames
         }
         .onChange(of: showControlsPanel) { _ in syncOverlayState() }
         .onReceive(tuning.objectWillChange.debounce(for: .milliseconds(200), scheduler: DispatchQueue.main)) { _ in
@@ -592,6 +632,7 @@ struct LocalCastContentView: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 6)
         .background(.black.opacity(0.55), in: Capsule())
+        .reportOverlayFrame()
         .padding(.bottom, 8)
     }
 }
