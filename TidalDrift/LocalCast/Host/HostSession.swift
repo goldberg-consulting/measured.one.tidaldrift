@@ -1497,6 +1497,18 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             return
         }
 
+        // Keyless hosts cannot tell a viewer whose socket moved from a
+        // stranger, so newest wins, but not while the current viewer is
+        // demonstrably alive: a live viewer sends heartbeats every second, and
+        // a dead socket stops. This keeps a single stray datagram from
+        // redirecting the stream (and the input slot) mid-session.
+        if hostPassword == nil, let active = clientEndpoint, let last = lastClientPacketAt,
+           Date().timeIntervalSince(last) < Self.keylessTakeoverGrace,
+           String(describing: active) != String(describing: endpoint) {
+            logger.info("🔌 Ignoring new connection from \(String(describing: endpoint)); current viewer is live")
+            return
+        }
+
         // Newest viewer takes over as the single active client.
         setActiveClient(endpoint: endpoint, connection: connection)
 
@@ -1543,6 +1555,11 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     }
 
     static let pongFlagFastLAN: UInt8 = 0x01
+
+    /// How recently the keyless viewer must have sent anything for a new
+    /// source to be refused the active slot. Clients heartbeat every second,
+    /// so three missed beats means the old socket is gone.
+    static let keylessTakeoverGrace: TimeInterval = 3
 
     /// Force an initial keyframe and schedule three follow-ups over the next
     /// ~3 seconds. Called when a client connects without auth, or immediately
@@ -1605,6 +1622,15 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             logger.info("🔐 Authenticated viewer moved to \(String(describing: endpoint)) — following")
             setActiveClient(endpoint: endpoint, connection: nil)
             forceInitialKeyframes()
+        } else if hostPassword == nil, let active = clientEndpoint,
+                  String(describing: active) != String(describing: endpoint) {
+            // Keyless sessions have no cryptographic gate, so the source
+            // address is the only tie to the viewer. Input, control and
+            // clipboard packets from any other endpoint are dropped before
+            // they can count as viewer activity; heartbeats still get a pong
+            // so a second viewer can tell the host is reachable but busy.
+            if packet.type == .heartbeat { sendPong(for: packet, to: endpoint) }
+            return
         }
         lastClientPacketAt = Date()
 

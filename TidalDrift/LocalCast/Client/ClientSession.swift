@@ -914,7 +914,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
                 }
             }
         }
-        engine.isFileSyncAllowed = { [weak self] in
+        engine.isBulkSyncAllowed = { [weak self] in
             self?.transport.sessionKey != nil
         }
         engine.start()

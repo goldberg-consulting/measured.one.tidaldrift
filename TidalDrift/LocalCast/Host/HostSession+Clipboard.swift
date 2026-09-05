@@ -10,9 +10,14 @@ extension HostSession {
     func startClipboardSyncIfEligible() {
         guard isRunning, authState == .authenticated, hasActiveClient, !isLoopbackConnection else { return }
 
-        let key = transport.sessionKey.map(SessionCrypto.deriveClipboardKey)
-        let allowedHost = clientEndpoint.flatMap(ClipboardBulkPeerAddress.hostString(from:))
-        clipboardBulkHost.start(key: key, allowedHost: allowedHost)
+        // The bulk listener only runs on keyed sessions; a keyless session has
+        // no way to tell the viewer from any other LAN host on that port.
+        if let key = transport.sessionKey.map(SessionCrypto.deriveClipboardKey) {
+            let allowedHost = clientEndpoint.flatMap(ClipboardBulkPeerAddress.hostString(from:))
+            clipboardBulkHost.start(key: key, allowedHost: allowedHost)
+        } else {
+            clipboardBulkHost.stop()
+        }
 
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -60,7 +65,7 @@ extension HostSession {
                 }
                 self.sendClipboardPacket(type: .clipboardFetchRequest, payload: offer.token, copies: 3)
             }
-            engine.isFileSyncAllowed = { [weak self] in
+            engine.isBulkSyncAllowed = { [weak self] in
                 self?.transport.sessionKey != nil
             }
             engine.start()
