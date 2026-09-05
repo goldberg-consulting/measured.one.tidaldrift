@@ -23,35 +23,15 @@ class SharingConfigurationService: ObservableObject, @unchecked Sendable {
         }
     }
     
-    /// Run a Process without blocking the Swift concurrency thread pool.
-    /// Uses `terminationHandler` instead of `waitUntilExit()`.
-    private func runProcess(_ executablePath: String, arguments: [String]) async -> (output: String, exitCode: Int32) {
-        await withCheckedContinuation { continuation in
-            let task = Process()
-            task.executableURL = URL(fileURLWithPath: executablePath)
-            task.arguments = arguments
-            
-            let pipe = Pipe()
-            task.standardOutput = pipe
-            task.standardError = pipe
-            
-            let resumed = AtomicFlag(false)
-            task.terminationHandler = { process in
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                let output = String(data: data, encoding: .utf8) ?? ""
-                if resumed.compareAndSwap(expected: false, desired: true) {
-                    continuation.resume(returning: (output, process.terminationStatus))
-                }
-            }
-            
-            do {
-                try task.run()
-            } catch {
-                if resumed.compareAndSwap(expected: false, desired: true) {
-                    continuation.resume(returning: ("", -1))
-                }
-            }
-        }
+    /// Run a Process off the Swift concurrency thread pool. ShellExecutor
+    /// drains stdout as the child writes, so `launchctl list` and
+    /// `socketfilterfw --listapps` cannot deadlock on a full pipe.
+    private func runProcess(
+        _ executablePath: String, arguments: [String], timeout: TimeInterval = ShellExecutor.defaultTimeout
+    ) async -> (output: String, exitCode: Int32) {
+        await Task.detached(priority: .userInitiated) {
+            ShellExecutor.execute(executable: executablePath, arguments: arguments, timeout: timeout)
+        }.value
     }
     
     @MainActor
@@ -322,7 +302,8 @@ class SharingConfigurationService: ObservableObject, @unchecked Sendable {
         // Never log the script body: the account-creation path embeds the new
         // user's password in it, and the unified log is readable by any admin.
         logger.info("Running privileged AppleScript (\(source.count) chars)")
-        let result = await runProcess("/usr/bin/osascript", arguments: ["-e", source])
+        // Admin prompts wait on the user; allow well past the default timeout.
+        let result = await runProcess("/usr/bin/osascript", arguments: ["-e", source], timeout: 180)
         
         logger.info("osascript exit code: \(result.exitCode)")
         if !result.output.isEmpty {

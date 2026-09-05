@@ -526,7 +526,7 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
 
     /// Scan ARP table for additional devices that might not advertise Bonjour services
     private func scanARPTable() async {
-        let result = ShellExecutor.execute("arp -a")
+        let result = ShellExecutor.execute(executable: "/usr/sbin/arp", arguments: ["-a"])
         let lines = result.output.split(separator: "\n")
 
         for line in lines {
