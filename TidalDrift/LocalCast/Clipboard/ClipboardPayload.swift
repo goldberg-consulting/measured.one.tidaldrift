@@ -133,7 +133,11 @@ enum ClipboardPasteboard {
             if let text { pasteboard.setString(text, forType: .string) }
             if let rtf { pasteboard.setData(rtf, forType: .rtf) }
         case .image:
-            if let png {
+            // The PNG came off the wire. Check its declared dimensions from
+            // the header before anything decodes it: a few hundred bytes can
+            // declare a 65535x65535 canvas, and the TIFF conversion below
+            // would try to allocate the whole thing.
+            if let png, let pixels = pngPixelCount(png), pixels <= maxImagePixels {
                 pasteboard.setData(png, forType: .png)
                 // Older apps read only TIFF; write both representations.
                 if let tiff = NSImage(data: png)?.tiffRepresentation {
@@ -175,6 +179,22 @@ enum ClipboardPasteboard {
             .sorted()
             .joined(separator: "|")
         return digest(kind: .files, chunks: [Data(entries.utf8)])
+    }
+
+    /// Largest image accepted from a peer, in pixels (8192 x 8192).
+    static let maxImagePixels = 64 * 1024 * 1024
+
+    /// Pixel count declared by the image header, read via ImageIO metadata
+    /// without decoding the bitmap. Nil if the data is not a parseable image.
+    static func pngPixelCount(_ data: Data) -> Int? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              CGImageSourceGetCount(source) > 0,
+              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = props[kCGImagePropertyPixelWidth] as? Int,
+              let height = props[kCGImagePropertyPixelHeight] as? Int,
+              width > 0, height > 0 else { return nil }
+        let (pixels, overflow) = width.multipliedReportingOverflow(by: height)
+        return overflow ? Int.max : pixels
     }
 
     private static func pngFromTIFF(_ tiff: Data?) -> Data? {
