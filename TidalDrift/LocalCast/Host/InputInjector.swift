@@ -102,59 +102,79 @@ class InputInjector {
     /// Bring the application with the given PID to the foreground.
     /// Uses NSRunningApplication.activate which does not require Accessibility permission.
     func focusApp(pid: pid_t) {
-        guard let app = NSRunningApplication(processIdentifier: pid) else {
-            logger.warning("Cannot focus app — PID \(pid) not found")
-            return
-        }
-        let ok = app.activate(options: [.activateIgnoringOtherApps])
-        if ok {
-            logger.info("✅ Focused app '\(app.localizedName ?? "PID \(pid)")' (PID \(pid))")
-        } else {
-            logger.warning("Failed to activate app PID \(pid)")
+        DispatchQueue.main.async { [logger] in
+            guard let app = NSRunningApplication(processIdentifier: pid) else {
+                logger.warning("Cannot focus app — PID \(pid) not found")
+                return
+            }
+            let ok = app.activate(options: [.activateIgnoringOtherApps])
+            if ok {
+                logger.info("✅ Focused app '\(app.localizedName ?? "PID \(pid)")' (PID \(pid))")
+            } else {
+                logger.warning("Failed to activate app PID \(pid)")
+            }
         }
     }
     
     // MARK: - App Isolation (for VNC single-app view)
+    //
+    // NSWorkspace and NSRunningApplication are main-thread API; the requests
+    // arrive on the transport queue and departure cleanup on the capture
+    // queue, so every entry point hops to main, which also serializes the
+    // hidden-PID bookkeeping.
     
     /// PIDs of apps we hid during isolation, so we can restore them later.
+    /// Main thread only.
     private var isolatedHiddenPIDs: [pid_t] = []
     
-    /// The PID of the currently isolated app, if any.
+    /// The PID of the currently isolated app, if any. Main thread only.
     private(set) var isolatedAppPID: pid_t?
     
     /// Hide every regular (non-target, non-TidalDrift) app and activate the target.
     /// Designed for use with System Screen Sharing (VNC) so only one app is visible.
     func isolateApp(pid: pid_t) {
-        guard let targetApp = NSRunningApplication(processIdentifier: pid) else {
-            logger.warning("Cannot isolate — PID \(pid) not found")
-            return
-        }
-        
-        restoreApps()
-        
-        var hidden: [pid_t] = []
-        let ownBundleID = Bundle.main.bundleIdentifier ?? ""
-        
-        for app in NSWorkspace.shared.runningApplications {
-            guard app.activationPolicy == .regular,
-                  app.processIdentifier != pid,
-                  app.bundleIdentifier != ownBundleID,
-                  !app.isHidden else { continue }
-            
-            if app.hide() {
-                hidden.append(app.processIdentifier)
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            guard let targetApp = NSRunningApplication(processIdentifier: pid) else {
+                self.logger.warning("Cannot isolate — PID \(pid) not found")
+                return
             }
+            
+            self.restoreAppsOnMain()
+            
+            var hidden: [pid_t] = []
+            let ownBundleID = Bundle.main.bundleIdentifier ?? ""
+            
+            for app in NSWorkspace.shared.runningApplications {
+                guard app.activationPolicy == .regular,
+                      app.processIdentifier != pid,
+                      app.bundleIdentifier != ownBundleID,
+                      !app.isHidden else { continue }
+                
+                if app.hide() {
+                    hidden.append(app.processIdentifier)
+                }
+            }
+            
+            self.isolatedHiddenPIDs = hidden
+            self.isolatedAppPID = pid
+            targetApp.activate(options: [.activateIgnoringOtherApps])
+            
+            self.logger.info("🔒 Isolated '\(targetApp.localizedName ?? "PID \(pid)")' — hid \(hidden.count) other apps")
         }
-        
-        isolatedHiddenPIDs = hidden
-        isolatedAppPID = pid
-        targetApp.activate(options: [.activateIgnoringOtherApps])
-        
-        logger.info("🔒 Isolated '\(targetApp.localizedName ?? "PID \(pid)")' — hid \(hidden.count) other apps")
     }
     
-    /// Unhide all apps that were hidden by `isolateApp(pid:)`.
+    /// Unhide all apps that were hidden by `isolateApp(pid:)`. Safe from any
+    /// queue; a no-op when nothing is isolated.
     func restoreApps() {
+        if Thread.isMainThread {
+            restoreAppsOnMain()
+        } else {
+            DispatchQueue.main.async { [weak self] in self?.restoreAppsOnMain() }
+        }
+    }
+
+    private func restoreAppsOnMain() {
         guard !isolatedHiddenPIDs.isEmpty else { return }
         
         var restored = 0

@@ -1302,6 +1302,9 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         // lost with the client already gone. Clear the latch here or the host
         // keyboard stays stuck for whoever is sitting in front of it.
         inputInjector.releaseHeldInput()
+        // A viewer that isolated an app and then left would otherwise leave
+        // every other host app hidden until the whole session stopped.
+        inputInjector.restoreApps()
 
         stopClipboardSync()
     }
@@ -1332,6 +1335,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         // The idle drop bypasses clearActiveClient, so clear the input latch
         // here too; the vanished client can never send its releases.
         inputInjector.releaseHeldInput()
+        inputInjector.restoreApps()
         stopClipboardSync()
         resetAuthForNewClient()
         suspendCaptureForIdleClient()
