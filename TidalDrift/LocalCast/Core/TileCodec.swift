@@ -50,16 +50,27 @@ enum TileCodec {
         return out
     }
 
+    /// Largest tile the decoder will materialize when the caller cannot supply
+    /// the canvas size: 32 Mpx (128 MB of BGRA), above any region the host
+    /// would send as a tile rather than as video. The header alone would
+    /// otherwise let a 10-byte packet demand a 17 GB zero-filled buffer.
+    static let maxTilePixels = 32 * 1024 * 1024
+
     /// Decode a `tileUpdate` payload back into a tile with tightly packed BGRA.
-    static func decode(_ data: Data) -> Tile? {
+    /// When `canvas` is known, a tile that does not fit inside it is rejected
+    /// before any output buffer is allocated.
+    static func decode(_ data: Data, canvas: (width: Int, height: Int)? = nil) -> Tile? {
         guard data.count > headerSize else { return nil }
         let x = Int(readU16(data, 0))
         let y = Int(readU16(data, 2))
         let width = Int(readU16(data, 4))
         let height = Int(readU16(data, 6))
         guard let encoding = TileEncoding(rawValue: data[data.startIndex + 8]) else { return nil }
+        guard width > 0, height > 0, width * height <= maxTilePixels else { return nil }
+        if let canvas {
+            guard x + width <= canvas.width, y + height <= canvas.height else { return nil }
+        }
         let expected = width * height * 4
-        guard width > 0, height > 0 else { return nil }
 
         let body = data.subdata(in: (data.startIndex + headerSize)..<data.endIndex)
         let bgra: Data?

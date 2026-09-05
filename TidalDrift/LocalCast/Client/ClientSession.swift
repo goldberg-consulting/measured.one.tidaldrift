@@ -1278,7 +1278,11 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             let payload = packet.payload
             decodeQueue.async { [weak self] in
                 guard let self else { return }
-                if let tile = TileCodec.decode(payload) {
+                // Bound the tile by the stream size when it is known so a
+                // forged header cannot force a large allocation; the renderer
+                // cannot apply a tile before the first frame anyway.
+                let canvas = self.remoteResolution.map { (width: Int($0.width), height: Int($0.height)) }
+                if let tile = TileCodec.decode(payload, canvas: canvas) {
                     self.noteTileUpdate(bytes: payload.count)
                     self.renderer?.applyTile(x: tile.x, y: tile.y, width: tile.width, height: tile.height, bgra: tile.bgra)
                     if !self.isConnected {

@@ -155,6 +155,32 @@ final class LocalCastPipelineTests: XCTestCase {
         XCTAssertEqual(InputInjector.clampNormalized(-.infinity), 0)
     }
 
+    // MARK: - Tile codec bounds (#147)
+
+    func test_tileCodec_rejectsOversizedHeaderBeforeAllocating() {
+        // 65535 x 65535 LZFSE tile with a 1-byte body: must return nil without
+        // materializing the 17 GB output buffer.
+        var header = Data()
+        for v: UInt16 in [0, 0, 0xFFFF, 0xFFFF] {
+            header.append(UInt8(v >> 8)); header.append(UInt8(v & 0xFF))
+        }
+        header.append(TileEncoding.lzfse.rawValue)
+        header.append(0x00)
+        XCTAssertNil(TileCodec.decode(header))
+    }
+
+    func test_tileCodec_roundTripAndCanvasBounds() {
+        let w = 8, h = 4
+        var pixels = Data(count: w * h * 4)
+        for i in 0..<pixels.count { pixels[i] = UInt8(truncatingIfNeeded: i * 7) }
+        let payload = TileCodec.encode(x: 10, y: 20, width: w, height: h, bgra: pixels)!
+        let tile = TileCodec.decode(payload)
+        XCTAssertEqual(tile?.bgra, pixels)
+        XCTAssertNotNil(TileCodec.decode(payload, canvas: (width: 18, height: 24)))
+        XCTAssertNil(TileCodec.decode(payload, canvas: (width: 17, height: 24)), "tile past the right edge")
+        XCTAssertNil(TileCodec.decode(payload, canvas: (width: 18, height: 23)), "tile past the bottom edge")
+    }
+
     // MARK: - Pairing handshake
 
     func test_authRequestPayload_roundTripsVersionAndStaysV1Compatible() {
