@@ -253,9 +253,14 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
 
     /// True while Bonjour browsing should be running. Gates the failed-browser
     /// restart path so an intentional stop is not resurrected.
+    /// Main-confined along with `browsers`: every lifecycle entry point
+    /// (start/stop/refresh, the failed-browser retry, the path-change restart)
+    /// runs on main. The dns-sd child state below is the part that crosses
+    /// queues and is lock-guarded instead.
     private var isBrowsingActive = false
 
     func startBrowsing() {
+        dispatchPrecondition(condition: .onQueue(.main))
         guard browsers.isEmpty else { return }
         isBrowsingActive = true
 
@@ -343,13 +348,19 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
     }
 
     /// Use dns-sd command for UDP service discovery (more reliable than NWBrowser/NetServiceBrowser for UDP)
+    /// Guarded by `localCastBrowseLock`: launched on `queue`, torn down from
+    /// main (stopBrowsing, refreshScan, path-change restart). Without the
+    /// lock a stop could land between the field assignment and `run()` and
+    /// leave an untracked `dns-sd -B` child behind.
     private var dnsSdBrowseProcess: Process?
 
     /// True while an intentional stop is tearing down the LocalCast browse.
     /// Terminating the process fires the pipe's EOF handler, which would
     /// otherwise relaunch the browse 2s later and quietly resurrect discovery
     /// (with a stray dns-sd child) after stopBrowsing/refreshScan.
+    /// Guarded by `localCastBrowseLock`.
     private var localCastBrowseStopped = false
+    private let localCastBrowseLock = NSLock()
 
     /// Cooldown for LocalCast resolves; the dns-sd browse emits Add events
     /// on every interface change which would otherwise schedule a blocking
@@ -370,10 +381,6 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
     private static let hostnameResolveCooldown: TimeInterval = 60
 
     private func startNetServiceBrowserForLocalCast() {
-        guard dnsSdBrowseProcess == nil else { return }
-        localCastBrowseStopped = false
-        logger.info("🌊 Starting dns-sd browse for _tidaldrift-cast._udp")
-
         // Use dns-sd -B to browse for services
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/dns-sd")
@@ -383,8 +390,6 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         process.standardOutput = pipe
         process.standardError = pipe
 
-        dnsSdBrowseProcess = process
-
         // Read output asynchronously. On EOF (the dns-sd browse exited), the
         // readability handler would otherwise be re-invoked forever with empty
         // data and spin a core at ~100% CPU, so detect EOF, remove the handler,
@@ -393,17 +398,27 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             let data = handle.availableData
             if data.isEmpty {
                 handle.readabilityHandler = nil
-                self?.handleLocalCastBrowseEOF()
+                self?.handleLocalCastBrowseEOF(for: process)
                 return
             }
             guard let output = String(data: data, encoding: .utf8) else { return }
             self?.parseDnsSdBrowseOutput(output)
         }
 
+        // Claim the slot and launch under one lock hold so a concurrent stop
+        // either sees no process (and nothing launches) or a running one it
+        // can terminate.
+        localCastBrowseLock.lock()
+        defer { localCastBrowseLock.unlock() }
+        guard dnsSdBrowseProcess == nil else { return }
+        localCastBrowseStopped = false
+        logger.info("🌊 Starting dns-sd browse for _tidaldrift-cast._udp")
         do {
             try process.run()
+            dnsSdBrowseProcess = process
             logger.info("🌊 dns-sd browse started (PID: \(process.processIdentifier))")
         } catch {
+            pipe.fileHandleForReading.readabilityHandler = nil
             logger.error("🌊 Failed to start dns-sd browse: \(error.localizedDescription)")
         }
     }
@@ -411,14 +426,25 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
     /// Recover the LocalCast browse after its dns-sd helper exits (EOF). Runs on
     /// the serial discovery queue and relaunches after a short backoff so a
     /// repeatedly-dying helper cannot tight-loop.
-    private func handleLocalCastBrowseEOF() {
+    private func handleLocalCastBrowseEOF(for process: Process) {
         queue.async { [weak self] in
             guard let self else { return }
-            guard !self.localCastBrowseStopped else { return }
-            self.logger.warning("🌊 LocalCast browse exited (EOF); relaunching in 2s")
+            self.localCastBrowseLock.lock()
+            // Only the current child's EOF matters; a stale one from a browse
+            // that was already replaced must not clear the live slot.
+            guard !self.localCastBrowseStopped, self.dnsSdBrowseProcess === process else {
+                self.localCastBrowseLock.unlock()
+                return
+            }
             self.dnsSdBrowseProcess = nil
+            self.localCastBrowseLock.unlock()
+            self.logger.warning("🌊 LocalCast browse exited (EOF); relaunching in 2s")
             self.queue.asyncAfter(deadline: .now() + 2) { [weak self] in
-                guard let self, !self.localCastBrowseStopped else { return }
+                guard let self else { return }
+                self.localCastBrowseLock.lock()
+                let stopped = self.localCastBrowseStopped
+                self.localCastBrowseLock.unlock()
+                guard !stopped else { return }
                 self.startNetServiceBrowserForLocalCast()
             }
         }
@@ -560,17 +586,20 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
     }
 
     private func stopServiceBrowsing() {
+        dispatchPrecondition(condition: .onQueue(.main))
         isBrowsingActive = false
         browsers.forEach { $0.cancel() }
         browsers.removeAll()
     }
 
     private func stopLocalCastBrowsing() {
+        localCastBrowseLock.lock()
         localCastBrowseStopped = true
         if let process = dnsSdBrowseProcess, process.isRunning {
             process.terminate()
         }
         dnsSdBrowseProcess = nil
+        localCastBrowseLock.unlock()
 
         netServiceBrowser?.stop()
         netServiceBrowser = nil
