@@ -119,6 +119,85 @@ final class LocalCastPipelineTests: XCTestCase {
         XCTAssertTrue(ModifierKey.isModifier(55))
     }
 
+    // MARK: - Remote input wire format (#146)
+
+    func test_remoteInput_deserialize_rejectsOutOfRangeMouseButton() {
+        var packet = InputInjector.RemoteInput.mouseDown(button: 1, x: 0.5, y: 0.5).serialize()
+        XCTAssertNotNil(InputInjector.RemoteInput.deserialize(packet))
+        packet[1] = 3
+        XCTAssertNil(InputInjector.RemoteInput.deserialize(packet), "button 3 has no CGMouseButton and must be rejected")
+        packet[1] = 255
+        XCTAssertNil(InputInjector.RemoteInput.deserialize(packet))
+        var up = InputInjector.RemoteInput.mouseUp(button: 2, x: 0, y: 0).serialize()
+        XCTAssertNotNil(InputInjector.RemoteInput.deserialize(up))
+        up[1] = 7
+        XCTAssertNil(InputInjector.RemoteInput.deserialize(up))
+    }
+
+    func test_remoteInput_deserialize_worksOnSlices() {
+        let inner = InputInjector.RemoteInput.keyDown(keyCode: 0x24, modifiers: 0x100000).serialize()
+        let framed = Data([0xAA, 0xBB]) + inner
+        let slice = framed[2...]
+        XCTAssertNotEqual(slice.startIndex, 0)
+        guard case .keyDown(let code, let mods)? = InputInjector.RemoteInput.deserialize(slice) else {
+            return XCTFail("slice did not deserialize")
+        }
+        XCTAssertEqual(code, 0x24)
+        XCTAssertEqual(mods, 0x100000)
+    }
+
+    func test_remoteInput_coordinateClamp() {
+        XCTAssertEqual(InputInjector.clampNormalized(0.25), 0.25)
+        XCTAssertEqual(InputInjector.clampNormalized(-3), 0)
+        XCTAssertEqual(InputInjector.clampNormalized(5), 1)
+        XCTAssertEqual(InputInjector.clampNormalized(.nan), 0)
+        XCTAssertEqual(InputInjector.clampNormalized(.infinity), 0)
+        XCTAssertEqual(InputInjector.clampNormalized(-.infinity), 0)
+    }
+
+    // MARK: - Pairing handshake
+
+    func test_authRequestPayload_roundTripsVersionAndStaysV1Compatible() {
+        let nonce = SessionCrypto.generateNonce()
+
+        // A bare 32-byte nonce is what pre-v2 clients send; it must parse as v1.
+        let v1 = SessionCrypto.authRequestPayload(nonce: nonce, version: .v1)
+        XCTAssertEqual(v1, nonce)
+        XCTAssertEqual(SessionCrypto.parseAuthRequest(v1)?.version, .v1)
+        XCTAssertEqual(SessionCrypto.parseAuthRequest(v1)?.nonce, nonce)
+
+        let v2 = SessionCrypto.authRequestPayload(nonce: nonce, version: .v2)
+        XCTAssertEqual(v2.count, nonce.count + 1)
+        XCTAssertEqual(SessionCrypto.parseAuthRequest(v2)?.version, .v2)
+        XCTAssertEqual(SessionCrypto.parseAuthRequest(v2)?.nonce, nonce)
+
+        XCTAssertNil(SessionCrypto.parseAuthRequest(Data(repeating: 1, count: 31)))
+        XCTAssertNil(SessionCrypto.parseAuthRequest(nonce + Data([0xFF])), "unknown version byte must be rejected")
+    }
+
+    func test_derivePairingKey_v2DiffersFromV1AndIsDeterministic() {
+        let clientNonce = SessionCrypto.generateNonce()
+        let hostNonce = SessionCrypto.generateNonce()
+
+        let v1 = SessionCrypto.derivePairingKey(password: "correct horse", clientNonce: clientNonce, hostNonce: hostNonce, version: .v1)
+        let v2a = SessionCrypto.derivePairingKey(password: "correct horse", clientNonce: clientNonce, hostNonce: hostNonce, version: .v2)
+        let v2b = SessionCrypto.derivePairingKey(password: "correct horse", clientNonce: clientNonce, hostNonce: hostNonce, version: .v2)
+        let v2wrong = SessionCrypto.derivePairingKey(password: "correct horsf", clientNonce: clientNonce, hostNonce: hostNonce, version: .v2)
+
+        XCTAssertEqual(v2a.withUnsafeBytes { Data($0) }, v2b.withUnsafeBytes { Data($0) })
+        XCTAssertNotEqual(v1.withUnsafeBytes { Data($0) }, v2a.withUnsafeBytes { Data($0) })
+        XCTAssertNotEqual(v2a.withUnsafeBytes { Data($0) }, v2wrong.withUnsafeBytes { Data($0) })
+
+        // The session key wrapped under a v2 pairing key opens with the same
+        // derivation and with nothing else; this is the challenge step.
+        let sessionKey = SessionCrypto.generateSessionKey().withUnsafeBytes { Data($0) }
+        let wrapped = SessionCrypto.encrypt(sessionKey, using: v2a)
+        XCTAssertNotNil(wrapped)
+        XCTAssertEqual(SessionCrypto.decrypt(wrapped!, using: v2b), sessionKey)
+        XCTAssertNil(SessionCrypto.decrypt(wrapped!, using: v1))
+        XCTAssertNil(SessionCrypto.decrypt(wrapped!, using: v2wrong))
+    }
+
     // Note: the real network round-trip for the Metal pipeline is covered
     // by the in-app Test Suite (`TidalDriftTestRunner`): "LocalCast Bonjour
     // Advertise+Browse" exercises discovery over dns-sd, and "Host Session

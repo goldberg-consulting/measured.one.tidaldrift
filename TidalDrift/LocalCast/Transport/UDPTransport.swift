@@ -148,7 +148,21 @@ class UDPTransport {
         frameDroppable.removeAll()
         parityBuffers.removeAll()
         qParityBuffers.removeAll()
+        bufferedFragmentBytes = 0
         highestFrameId = 0
+    }
+
+    /// Forget every buffer for one frame. Must be called with `fragmentLock` held.
+    private func dropFrameLocked(_ frameId: UInt32) {
+        let freed = (fragmentBuffers[frameId]?.values.reduce(0) { $0 + $1.count } ?? 0)
+            + (parityBuffers[frameId]?.values.reduce(0) { $0 + $1.count } ?? 0)
+            + (qParityBuffers[frameId]?.values.reduce(0) { $0 + $1.count } ?? 0)
+        bufferedFragmentBytes = max(0, bufferedFragmentBytes - freed)
+        fragmentBuffers.removeValue(forKey: frameId)
+        fragmentCounts.removeValue(forKey: frameId)
+        frameDroppable.removeValue(forKey: frameId)
+        parityBuffers.removeValue(forKey: frameId)
+        qParityBuffers.removeValue(forKey: frameId)
     }
     
     private var listener: NWListener?
@@ -199,6 +213,14 @@ class UDPTransport {
     // At 1390 bytes/fragment, a 5 MB frame needs ~3,600 fragments.
     private let maxTotalFragments: UInt16 = 5000  // ~7 MB max per frame
     private let maxBufferedFrames = 120           // Allow more in-flight frames for high-throughput
+    /// Hard ceiling on bytes parked in reassembly across all frames. The
+    /// per-frame and frame-count caps alone still allowed an unauthenticated
+    /// peer to pin ~840 MB (120 frames x 5000 fragments x 1400 B, or several
+    /// GB with jumbo payloads) by spraying fragments with distinct frame ids.
+    /// 64 MB is about ten worst-case keyframes, far more than the in-flight
+    /// window ever holds in practice.
+    private let maxBufferedBytes = 64 << 20
+    private var bufferedFragmentBytes = 0          // guarded by fragmentLock
 
     // Over-capacity signal rate limiting. A droppable frame whose fragment
     // count exceeds maxTotalFragments is rejected wholesale by the receiver, so
@@ -241,6 +263,8 @@ class UDPTransport {
     private var fastLANEnabled: Bool {
         pacingLock.lock(); defer { pacingLock.unlock() }; return _fastLANEnabled
     }
+
+    var isFastLAN: Bool { fastLANEnabled }
 
     /// Apply transport-level Fast LAN behavior. Pacing and the reassembly window
     /// flip live; the jumbo payload size takes effect on the next sent frame.
@@ -612,13 +636,7 @@ class UDPTransport {
             ? sendList.count <= Self.fastLANPacedThreshold
             : totalFragments <= pacingFragmentThreshold
         if pacingBypassed || smallEnoughToBlast {
-            for fragment in sendList {
-                connection.send(content: fragment, completion: .contentProcessed { [weak self] error in
-                    if let error = error {
-                        self?.logger.error("UDP fragment send error: \(error.localizedDescription)")
-                    }
-                })
-            }
+            Self.sendBurst(sendList[...], on: connection)
             return
         }
 
@@ -636,6 +654,21 @@ class UDPTransport {
         // Resilient profile: drain in small bursts so the uplink isn't overrun.
         paceFragments(sendList, on: connection, frameId: frameId,
                       batchSize: pacingBatchSize, gapMicros: currentPacingGapMicros)
+    }
+
+    /// Hand a run of datagrams to Network.framework in one batch. `batch`
+    /// lets the framework coalesce the enqueues into fewer trips through the
+    /// socket layer, and `.idempotent` skips allocating and dispatching a
+    /// completion closure per fragment. At 200+ Mbps that is tens of
+    /// thousands of closures per second saved on the send path; a failed
+    /// datagram is indistinguishable from a lost one anyway, and the receiver
+    /// drives recovery.
+    private static func sendBurst(_ fragments: ArraySlice<Data>, on connection: NWConnection) {
+        connection.batch {
+            for fragment in fragments {
+                connection.send(content: fragment, completion: .idempotent)
+            }
+        }
     }
 
     /// Fast LAN micro-pacing constants. Frames at or below the threshold are
@@ -708,13 +741,7 @@ class UDPTransport {
         
         func drain(from start: Int) {
             let end = min(start + batchSize, total)
-            for i in start..<end {
-                connection.send(content: fragments[i], completion: .contentProcessed { [weak self] error in
-                    if let error = error {
-                        self?.logger.error("UDP fragment send error: \(error.localizedDescription)")
-                    }
-                })
-            }
+            Self.sendBurst(fragments[start..<end], on: connection)
             if end < total {
                 paceQueue.asyncAfter(deadline: .now() + gap) { drain(from: end) }
             } else {
@@ -832,6 +859,72 @@ class UDPTransport {
         }
     }
     
+    /// Decrypt, parse and hand a complete (unfragmented) datagram to the delegate.
+    private func deliverUnfragmented(_ data: Data, count: Int, from endpoint: NWEndpoint) {
+        guard let (packet, wasAuthenticated) = decryptAndParse(data) else {
+            lcDebug("⚠️ UDPTransport: Could not parse packet (\(data.count) bytes)")
+            return
+        }
+        if packet.type != .videoFrame {
+            lcDebug("📨 UDPTransport: Received \(packet.type) packet #\(count), payload: \(packet.payload.count) bytes")
+        }
+        if packet.type == .inputEvent {
+            lcDebug("🎮 UDPTransport: *** INPUT EVENT RECEIVED *** from \(describeEndpoint(endpoint))")
+        }
+        delegate?.udpTransport(self, didReceivePacket: packet, wasAuthenticated: wasAuthenticated, from: endpoint)
+    }
+
+    /// Validate one fragment against its frame and park it in the reassembly
+    /// buffers, attempting FEC recovery on its block. Returns false when the
+    /// fragment is rejected. Must be called with `fragmentLock` held.
+    ///
+    /// A fragment must index inside the frame it claims to belong to: a data
+    /// index at or past totalFragments would still count toward completion, so
+    /// a frame could "complete" with a real fragment missing and hand the
+    /// decoder (keyless sessions) a corrupted access unit. A fragment whose
+    /// totalFragments disagrees with the frame as first seen is stale or forged.
+    private func storeFragmentLocked(_ header: FragmentHeader, payload: Data.SubSequence,
+                                     realFrameId: UInt32, droppable: Bool) -> Bool {
+        let isParity = (header.fragmentIndex & Self.fecParityFlag) != 0
+        let blockCount = (Int(header.totalFragments) + fecBlockSize - 1) / fecBlockSize
+        let blockIndex = header.fragmentIndex & ~(Self.fecParityFlag | Self.fecQParityFlag)
+        if isParity ? Int(blockIndex) >= blockCount : header.fragmentIndex >= header.totalFragments {
+            return false
+        }
+
+        // header.totalFragments is the data fragment count, carried on both
+        // data and parity fragments.
+        if fragmentBuffers[realFrameId] == nil {
+            fragmentBuffers[realFrameId] = [:]
+            fragmentCounts[realFrameId] = header.totalFragments
+            frameDroppable[realFrameId] = droppable
+        } else if fragmentCounts[realFrameId] != header.totalFragments {
+            return false
+        }
+
+        // A parity fragment goes into a separate buffer so it never counts
+        // toward frame completion; a data fragment is stored normally. Either
+        // way, FEC recovery on the affected block can fill in missing data.
+        if isParity {
+            let isQParity = (header.fragmentIndex & Self.fecQParityFlag) != 0
+            if isQParity {
+                if qParityBuffers[realFrameId] == nil { qParityBuffers[realFrameId] = [:] }
+                if qParityBuffers[realFrameId]?[blockIndex] == nil { bufferedFragmentBytes += payload.count }
+                qParityBuffers[realFrameId]?[blockIndex] = Data(payload)
+            } else {
+                if parityBuffers[realFrameId] == nil { parityBuffers[realFrameId] = [:] }
+                if parityBuffers[realFrameId]?[blockIndex] == nil { bufferedFragmentBytes += payload.count }
+                parityBuffers[realFrameId]?[blockIndex] = Data(payload)
+            }
+            recoverBlock(realFrameId, blockIndex: blockIndex, totalFragments: Int(header.totalFragments))
+        } else {
+            if fragmentBuffers[realFrameId]?[header.fragmentIndex] == nil { bufferedFragmentBytes += payload.count }
+            fragmentBuffers[realFrameId]?[header.fragmentIndex] = Data(payload)
+            recoverBlock(realFrameId, blockIndex: header.fragmentIndex / UInt16(fecBlockSize), totalFragments: Int(header.totalFragments))
+        }
+        return true
+    }
+
     private func handleReceivedData(_ data: Data, from endpoint: NWEndpoint) {
         statsLock.lock()
         _receiveCount += 1
@@ -842,20 +935,10 @@ class UDPTransport {
             lcDebug("📨 UDPTransport: handleReceivedData #\(count), \(data.count) bytes from \(describeEndpoint(endpoint))")
         }
         
-        // Parse fragment header
+        // Parse fragment header. A payload without one is a raw packet from an
+        // older build.
         guard let header = FragmentHeader.deserialize(data) else {
-            // Try parsing as raw packet (for backwards compatibility)
-            if let (packet, wasAuthenticated) = decryptAndParse(data) {
-                if packet.type != .videoFrame {
-                    lcDebug("📨 UDPTransport: Received \(packet.type) packet (raw, no fragment header)")
-                }
-                if packet.type == .inputEvent {
-                    lcDebug("🎮 UDPTransport: *** INPUT EVENT RECEIVED *** from \(describeEndpoint(endpoint))")
-                }
-                delegate?.udpTransport(self, didReceivePacket: packet, wasAuthenticated: wasAuthenticated, from: endpoint)
-            } else {
-                lcDebug("⚠️ UDPTransport: Could not parse received data (\(data.count) bytes)")
-            }
+            deliverUnfragmented(data, count: count, from: endpoint)
             return
         }
         
@@ -863,18 +946,7 @@ class UDPTransport {
         
         // Single fragment (no reassembly needed)
         if header.totalFragments == 1 {
-            if let (packet, wasAuthenticated) = decryptAndParse(Data(payload)) {
-                // Log non-video packets
-                if packet.type != .videoFrame {
-                    lcDebug("📨 UDPTransport: Received \(packet.type) packet #\(count), payload: \(packet.payload.count) bytes")
-                }
-                if packet.type == .inputEvent {
-                    lcDebug("🎮 UDPTransport: *** INPUT EVENT RECEIVED *** from \(describeEndpoint(endpoint))")
-                }
-                delegate?.udpTransport(self, didReceivePacket: packet, wasAuthenticated: wasAuthenticated, from: endpoint)
-            } else {
-                lcDebug("⚠️ UDPTransport: Could not parse packet from payload (\(payload.count) bytes)")
-            }
+            deliverUnfragmented(Data(payload), count: count, from: endpoint)
             return
         }
         
@@ -920,36 +992,13 @@ class UDPTransport {
             return
         }
 
-        // Initialize buffers for this frame if needed (header.totalFragments is
-        // the data fragment count, carried on both data and parity fragments).
-        if fragmentBuffers[realFrameId] == nil {
-            fragmentBuffers[realFrameId] = [:]
-            fragmentCounts[realFrameId] = header.totalFragments
-            frameDroppable[realFrameId] = droppable
+        guard storeFragmentLocked(header, payload: payload, realFrameId: realFrameId, droppable: droppable) else {
+            fragmentLock.unlock()
+            return
         }
 
         if droppable, realFrameId > highestFrameId {
             highestFrameId = realFrameId
-        }
-
-        // A parity fragment (high bit of fragmentIndex set) goes into a separate
-        // buffer so it never counts toward frame completion; a data fragment is
-        // stored normally. Either way, attempt FEC recovery on the affected
-        // block, which can fill in a single missing data fragment.
-        if (header.fragmentIndex & Self.fecParityFlag) != 0 {
-            let isQParity = (header.fragmentIndex & Self.fecQParityFlag) != 0
-            let blockIndex = header.fragmentIndex & ~(Self.fecParityFlag | Self.fecQParityFlag)
-            if isQParity {
-                if qParityBuffers[realFrameId] == nil { qParityBuffers[realFrameId] = [:] }
-                qParityBuffers[realFrameId]?[blockIndex] = Data(payload)
-            } else {
-                if parityBuffers[realFrameId] == nil { parityBuffers[realFrameId] = [:] }
-                parityBuffers[realFrameId]?[blockIndex] = Data(payload)
-            }
-            recoverBlock(realFrameId, blockIndex: blockIndex, totalFragments: Int(header.totalFragments))
-        } else {
-            fragmentBuffers[realFrameId]?[header.fragmentIndex] = Data(payload)
-            recoverBlock(realFrameId, blockIndex: header.fragmentIndex / UInt16(fecBlockSize), totalFragments: Int(header.totalFragments))
         }
 
         // Prune droppable frames that fell behind the newest. A pruned-but-
@@ -960,22 +1009,16 @@ class UDPTransport {
             let cutoff = highestFrameId - inFlightFrameWindow
             for (fid, frags) in fragmentBuffers where fid < cutoff && (frameDroppable[fid] ?? true) {
                 if frags.count < Int(fragmentCounts[fid] ?? 0) { lostIncomplete = true }
-                fragmentBuffers.removeValue(forKey: fid)
-                fragmentCounts.removeValue(forKey: fid)
-                frameDroppable.removeValue(forKey: fid)
-                parityBuffers.removeValue(forKey: fid)
-                qParityBuffers.removeValue(forKey: fid)
+                dropFrameLocked(fid)
             }
         }
 
         // Memory backstop (covers never-completing tiles and the drop-to-newest
-        // off case): evict the oldest buffered frame if we exceed the cap.
-        while fragmentBuffers.count > maxBufferedFrames, let oldest = fragmentBuffers.keys.min() {
-            fragmentBuffers.removeValue(forKey: oldest)
-            fragmentCounts.removeValue(forKey: oldest)
-            frameDroppable.removeValue(forKey: oldest)
-            parityBuffers.removeValue(forKey: oldest)
-            qParityBuffers.removeValue(forKey: oldest)
+        // off case): evict the oldest buffered frame while over either cap.
+        // Never evict the frame we are about to test for completion.
+        while fragmentBuffers.count > maxBufferedFrames || bufferedFragmentBytes > maxBufferedBytes,
+              let oldest = fragmentBuffers.keys.filter({ $0 != realFrameId }).min() {
+            dropFrameLocked(oldest)
         }
         
         // Check if we have all fragments
@@ -987,11 +1030,8 @@ class UDPTransport {
             // concatenation after releasing it. Growing an unreserved Data by
             // repeated append while holding fragmentLock stalled every other
             // incoming fragment for the duration of a keyframe reassembly.
-            let fragments = fragmentBuffers.removeValue(forKey: realFrameId) ?? [:]
-            fragmentCounts.removeValue(forKey: realFrameId)
-            frameDroppable.removeValue(forKey: realFrameId)
-            parityBuffers.removeValue(forKey: realFrameId)
-            qParityBuffers.removeValue(forKey: realFrameId)
+            let fragments = fragmentBuffers[realFrameId] ?? [:]
+            dropFrameLocked(realFrameId)
             fragmentLock.unlock()
 
             var fullData = Data(capacity: fragments.values.reduce(0) { $0 + $1.count })
@@ -1053,6 +1093,7 @@ class UDPTransport {
             }
             frags[UInt16(missing[0])] = Data(recovered)
             fragmentBuffers[frameId] = frags
+            bufferedFragmentBytes += payloadSize
             _fecRecovered += 1
             return
         }
@@ -1099,6 +1140,7 @@ class UDPTransport {
         frags[UInt16(missingA)] = Data(recoveredA)
         frags[UInt16(missingB)] = Data(recoveredB)
         fragmentBuffers[frameId] = frags
+        bufferedFragmentBytes += 2 * payloadSize
         _fecRecovered += 2
     }
 

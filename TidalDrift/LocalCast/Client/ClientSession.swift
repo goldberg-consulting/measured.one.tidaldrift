@@ -363,14 +363,20 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
     }
 
     private func transmitAuthRequest(nonce: Data, to endpoint: NWEndpoint, attempt: Int) {
+        // The first two attempts ask for the current (stretched) pairing
+        // version. A host that predates it drops the 33-byte payload without
+        // replying, so the tail of the chain falls back to the bare v1 nonce.
+        // handleAuthChallenge tries both derivations, so it does not matter
+        // which request the host finally answers.
+        let version: SessionCrypto.PairingVersion = attempt <= 2 ? .current : .v1
         let packet = LocalCastPacket(
             type: .authRequest,
             sequenceNumber: 0,
             timestamp: CFAbsoluteTimeGetCurrent() + kCFAbsoluteTimeIntervalSince1970,
-            payload: nonce
+            payload: SessionCrypto.authRequestPayload(nonce: nonce, version: version)
         )
         transport.send(packet: packet, to: endpoint)
-        logger.info("🔐 Sent authRequest with 32-byte nonce (attempt \(attempt))")
+        logger.info("🔐 Sent authRequest (attempt \(attempt), pairing v\(version.rawValue))")
 
         guard attempt < 4 else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
@@ -411,11 +417,19 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         let hostNonce = payload.prefix(32)
         let encryptedSessionKey = Data(payload.dropFirst(32))
 
-        // Derive pairingKey from password + nonces
-        let pairingKey = SessionCrypto.derivePairingKey(password: password, clientNonce: clientNonce, hostNonce: Data(hostNonce))
+        // The challenge does not say which request version the host answered,
+        // so try the current derivation first and fall back to v1. Only the
+        // v2 derivation is expensive (PBKDF2), and a wrong password costs one
+        // extra AES-GCM open.
+        let sessionKeyData = [SessionCrypto.PairingVersion.current, .v1].lazy.compactMap { version -> Data? in
+            let pairingKey = SessionCrypto.derivePairingKey(
+                password: password, clientNonce: clientNonce, hostNonce: Data(hostNonce), version: version
+            )
+            return SessionCrypto.decrypt(encryptedSessionKey, using: pairingKey)
+        }.first
 
         // Decrypt the session key
-        guard let sessionKeyData = SessionCrypto.decrypt(encryptedSessionKey, using: pairingKey) else {
+        guard let sessionKeyData else {
             logger.warning("🔐 Failed to decrypt session key — wrong password?")
             DispatchQueue.main.async { [weak self] in
                 self?.authError = "Authentication failed — wrong password"
@@ -1283,7 +1297,19 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         case .heartbeat:
             // Pong received - record round-trip latency for the HUD.
             recordHeartbeatResponse(Date())
-            if let sent = lastHeartbeatSent {
+            if let flags = packet.payload.first {
+                // Current hosts echo the ping's own send timestamp, so the RTT
+                // is measured against the exact packet that came back rather
+                // than whichever ping happened to go out last.
+                let sentAt = packet.timestamp - kCFAbsoluteTimeIntervalSince1970
+                let rtt = (CFAbsoluteTimeGetCurrent() - sentAt) * 1000
+                if rtt >= 0, rtt < 10_000 { lastRTTms = rtt }
+                let hostFastLAN = flags & HostSession.pongFlagFastLAN != 0
+                if hostFastLAN != transport.isFastLAN {
+                    transport.setFastLAN(hostFastLAN, jumbo: false)
+                    logger.info("⚡️ Host Fast LAN \(hostFastLAN ? "on" : "off"); widened reassembly window to match")
+                }
+            } else if let sent = lastHeartbeatSent {
                 lastRTTms = Date().timeIntervalSince(sent) * 1000
             }
             heartbeatsReceived += 1
