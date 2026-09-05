@@ -155,6 +155,32 @@ final class LocalCastPipelineTests: XCTestCase {
         XCTAssertEqual(InputInjector.clampNormalized(-.infinity), 0)
     }
 
+    // MARK: - Scoped keyboard policy (#150)
+
+    func test_keystrokeFlags_scopedBlocksDangerousCommandChords() {
+        let cmd = CGEventFlags.maskCommand.rawValue
+        let ctrlCmd = cmd | CGEventFlags.maskControl.rawValue
+        let shiftCmd = cmd | CGEventFlags.maskShift.rawValue
+        // Q, Tab, Space, Esc, 3 (screenshot)
+        for key: UInt16 in [12, 48, 49, 53, 20] {
+            XCTAssertNil(InputInjector.keystrokeFlags(keyCode: key, modifiers: cmd, scoped: true), "Cmd+\(key)")
+        }
+        XCTAssertNil(InputInjector.keystrokeFlags(keyCode: 12, modifiers: ctrlCmd, scoped: true), "Ctrl+Cmd+Q locks the host")
+        XCTAssertNil(InputInjector.keystrokeFlags(keyCode: 12, modifiers: shiftCmd, scoped: true), "Cmd+Shift+Q logs out")
+        // Allowed editing chords and bare modifiers still pass.
+        XCTAssertEqual(InputInjector.keystrokeFlags(keyCode: 8, modifiers: cmd, scoped: true), .maskCommand)
+        XCTAssertEqual(InputInjector.keystrokeFlags(keyCode: 6, modifiers: shiftCmd, scoped: true), [.maskCommand, .maskShift])
+        XCTAssertEqual(InputInjector.keystrokeFlags(keyCode: 55, modifiers: cmd, scoped: true), .maskCommand, "Command key itself")
+        XCTAssertEqual(InputInjector.keystrokeFlags(keyCode: 12, modifiers: 0, scoped: true), [], "plain Q")
+        // Full-display mode passes everything through.
+        XCTAssertEqual(InputInjector.keystrokeFlags(keyCode: 12, modifiers: cmd, scoped: false), .maskCommand)
+    }
+
+    func test_keystrokeFlags_stripsNonStandardBits() {
+        let junk: UInt64 = 0xFFFF_0000_0000_0001 | CGEventFlags.maskShift.rawValue
+        XCTAssertEqual(InputInjector.keystrokeFlags(keyCode: 0, modifiers: junk, scoped: false), .maskShift)
+    }
+
     // MARK: - Tile codec bounds (#147)
 
     func test_tileCodec_rejectsOversizedHeaderBeforeAllocating() {

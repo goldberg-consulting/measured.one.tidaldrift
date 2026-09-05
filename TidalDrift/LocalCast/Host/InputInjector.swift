@@ -228,6 +228,33 @@ class InputInjector {
     ///
     /// The client sends normalized coordinates where x=0,y=0 is the top-left of
     /// the captured content and (1,1) is the bottom-right.
+    /// The modifier bits a remote keystroke may carry. Everything else in the
+    /// 64-bit flag word (device-dependent and reserved bits) is stripped.
+    static let allowedModifierMask: UInt64 = CGEventFlags([
+        .maskShift, .maskControl, .maskAlternate, .maskCommand,
+        .maskAlphaShift, .maskSecondaryFn, .maskNumericPad, .maskHelp,
+    ]).rawValue
+
+    /// Command chords that still make sense when a single window or app is
+    /// shared: select all, save, find, undo/redo, cut, copy, paste, and
+    /// Command+arrow navigation. Anything else with Command held (Cmd+Q,
+    /// Cmd+Tab, Cmd+Space, Ctrl+Cmd+Q, Cmd+Shift+Q, Cmd+Option+Esc, the
+    /// screenshot chords) acts on the host as a whole, not the shared window.
+    static let scopedCommandAllowlist: Set<UInt16> = [
+        0, 1, 3, 6, 7, 8, 9,      // A S F Z X C V
+        123, 124, 125, 126,       // left right down up
+    ]
+
+    /// Flags to inject for a remote keystroke, or nil when the keystroke must
+    /// be dropped. In scoped (window/app) mode Command chords are limited to
+    /// `scopedCommandAllowlist`; bare modifier presses always pass so the
+    /// allowed chords can be formed. Full-display mode only masks the flags.
+    static func keystrokeFlags(keyCode: UInt16, modifiers: UInt64, scoped: Bool) -> CGEventFlags? {
+        let flags = CGEventFlags(rawValue: modifiers & allowedModifierMask)
+        guard scoped, !ModifierKey.isModifier(keyCode), flags.contains(.maskCommand) else { return flags }
+        return scopedCommandAllowlist.contains(keyCode) ? flags : nil
+    }
+
     /// Clamp a wire coordinate into the unit interval. NaN and infinities
     /// (raw bit patterns off the network) map to 0.
     static func clampNormalized(_ value: Double) -> Double {
@@ -349,11 +376,15 @@ class InputInjector {
             event.post(tap: .cghidEventTap)
             
         case .keyDown(let keyCode, let modifiers):
+            guard let flags = Self.keystrokeFlags(keyCode: keyCode, modifiers: modifiers, scoped: captureBounds != nil) else {
+                lcDebug("[INPUT-DIAG] 🚫 keyDown keyCode=\(keyCode) blocked in single-window mode")
+                return
+            }
             guard let event = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: true) else {
                 lcDebug("[INPUT-DIAG] ❌ INJECT FAILED: could not create keyDown CGEvent for keyCode \(keyCode)")
                 return
             }
-            event.flags = CGEventFlags(rawValue: modifiers)
+            event.flags = flags
             if ModifierKey.isModifier(keyCode) {
                 heldStateLock.lock()
                 heldModifierKeyCodes.insert(keyCode)
@@ -363,11 +394,14 @@ class InputInjector {
             event.post(tap: .cghidEventTap)
             
         case .keyUp(let keyCode, let modifiers):
+            guard let flags = Self.keystrokeFlags(keyCode: keyCode, modifiers: modifiers, scoped: captureBounds != nil) else {
+                return
+            }
             guard let event = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false) else {
                 lcDebug("[INPUT-DIAG] ❌ INJECT FAILED: could not create keyUp CGEvent for keyCode \(keyCode)")
                 return
             }
-            event.flags = CGEventFlags(rawValue: modifiers)
+            event.flags = flags
             heldStateLock.lock()
             heldModifierKeyCodes.remove(keyCode)
             heldStateLock.unlock()
