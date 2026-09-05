@@ -539,14 +539,47 @@ class TidalDropService: ObservableObject {
         if name.hasPrefix(".") { return nil }
         return name
     }
+
+    /// Largest transfer the receiver will accept. The size comes from an
+    /// unauthenticated peer, so without a ceiling one connection could fill
+    /// the disk.
+    private static let maxIncomingFileSize: Int64 = 64 << 30
+
+    /// The drop listener has no authentication, so only peers on the local
+    /// network (private IPv4, IPv6 link-local/ULA, loopback for tests) may
+    /// push files.
+    private static func isAcceptableSender(_ ip: String) -> Bool {
+        if ip == "127.0.0.1" || ip == "::1" { return true }
+        if NetworkUtils.isLocalNetworkAddress(ip) { return true }
+        let lower = ip.lowercased()
+        return lower.hasPrefix("fe80:") || lower.hasPrefix("fd") || lower.hasPrefix("fc")
+    }
+
+    /// A destination that does not clobber anything already in the folder.
+    /// The sender is unauthenticated, so an incoming name must never delete
+    /// an existing file; collisions get " (n)" appended before the extension.
+    private static func uniqueDestination(in folder: URL, for name: String) -> URL {
+        let first = folder.appendingPathComponent(name)
+        guard FileManager.default.fileExists(atPath: first.path) else { return first }
+        let base = (name as NSString).deletingPathExtension
+        let ext = (name as NSString).pathExtension
+        for n in 1... {
+            let candidate = ext.isEmpty ? "\(base) (\(n))" : "\(base) (\(n)).\(ext)"
+            let url = folder.appendingPathComponent(candidate)
+            if !FileManager.default.fileExists(atPath: url.path) { return url }
+        }
+        fatalError("unreachable")
+    }
     
     private func setupIncomingTransfer(_ connection: NWConnection, metadata: FileMetadata, remoteIP: String) {
         let transferId = UUID()
         let destinationFolder = AppState.shared.settings.tidalDropFolder
         let didStartDestinationAccess = destinationFolder.startAccessingSecurityScopedResource()
         
-        guard let safeName = Self.sanitizeFilename(metadata.fileName) else {
-            print("❌ TidalDrop: Rejected unsafe filename: \(metadata.fileName)")
+        guard let safeName = Self.sanitizeFilename(metadata.fileName),
+              metadata.fileSize > 0, metadata.fileSize <= Self.maxIncomingFileSize,
+              Self.isAcceptableSender(remoteIP) else {
+            print("❌ TidalDrop: Rejected transfer (name/size/sender check failed) from \(remoteIP)")
             if didStartDestinationAccess {
                 destinationFolder.stopAccessingSecurityScopedResource()
             }
@@ -565,7 +598,7 @@ class TidalDropService: ObservableObject {
             print("❌ TidalDrop: Failed to create destination folder: \(error)")
         }
         
-        let fileURL = destinationFolder.appendingPathComponent(safeName)
+        let fileURL = Self.uniqueDestination(in: destinationFolder, for: safeName)
         print("   File will be saved to: \(fileURL.path)")
         
         let transfer = DropTransfer(
@@ -586,25 +619,27 @@ class TidalDropService: ObservableObject {
             NSSound.beep()
         }
         
-        // Remove existing file if present
-        if FileManager.default.fileExists(atPath: fileURL.path) {
-            do {
-                try FileManager.default.removeItem(at: fileURL)
-                print("🌊 TidalDrop: Removed existing file")
-            } catch {
-                print("⚠️ TidalDrop: Could not remove existing file: \(error)")
-            }
-        }
-        
         // Create empty file
         let created = FileManager.default.createFile(atPath: fileURL.path, contents: nil)
         print("🌊 TidalDrop: Created empty file: \(created)")
+
+        // One handle for the whole transfer. Reopening the file for every
+        // 64 KB chunk cost an open/seek/close per chunk (16k of them per GB).
+        guard let handle = try? FileHandle(forWritingTo: fileURL) else {
+            print("❌ TidalDrop: Could not open destination for writing")
+            if didStartDestinationAccess {
+                destinationFolder.stopAccessingSecurityScopedResource()
+            }
+            connection.cancel()
+            return
+        }
         
         print("🌊 TidalDrop: Starting to receive file data...")
         receiveFileData(
             connection,
             transferId: transferId,
             fileURL: fileURL,
+            handle: handle,
             fileSize: metadata.fileSize,
             receivedSoFar: 0,
             securityScopedDestination: didStartDestinationAccess ? destinationFolder : nil
@@ -615,15 +650,17 @@ class TidalDropService: ObservableObject {
         _ connection: NWConnection,
         transferId: UUID,
         fileURL: URL,
+        handle: FileHandle,
         fileSize: Int64,
         receivedSoFar: Int64,
         securityScopedDestination: URL?
     ) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 1 << 20) { [weak self] data, _, isComplete, error in
             guard let self = self else { return }
             
             if let e = error {
                 print("❌ TidalDrop: Error receiving file data: \(e)")
+                try? handle.close()
                 securityScopedDestination?.stopAccessingSecurityScopedResource()
                 DispatchQueue.main.async {
                     self.activeTransfers[transferId]?.status = .failed(e.localizedDescription)
@@ -632,14 +669,15 @@ class TidalDropService: ObservableObject {
             }
             
             if let d = data {
-                // Write data to file
+                // Never write past the declared size: the sender is untrusted
+                // and the size cap was enforced against the declared value.
+                let remaining = fileSize - receivedSoFar
+                let chunk = Int64(d.count) > remaining ? d.prefix(Int(remaining)) : d
                 do {
-                    let handle = try FileHandle(forWritingTo: fileURL)
-                    handle.seekToEndOfFile()
-                    handle.write(d)
-                    try handle.close()
+                    try handle.write(contentsOf: chunk)
                 } catch {
                     print("❌ TidalDrop: Error writing to file: \(error)")
+                    try? handle.close()
                     securityScopedDestination?.stopAccessingSecurityScopedResource()
                     DispatchQueue.main.async {
                         self.activeTransfers[transferId]?.status = .failed("Write error: \(error.localizedDescription)")
@@ -647,7 +685,7 @@ class TidalDropService: ObservableObject {
                     return
                 }
                 
-                let newReceived = receivedSoFar + Int64(d.count)
+                let newReceived = receivedSoFar + Int64(chunk.count)
                 let progress = Double(newReceived) / Double(fileSize)
                 
                 // Log progress every 10%
@@ -666,19 +704,25 @@ class TidalDropService: ObservableObject {
                         connection,
                         transferId: transferId,
                         fileURL: fileURL,
+                        handle: handle,
                         fileSize: fileSize,
                         receivedSoFar: newReceived,
                         securityScopedDestination: securityScopedDestination
                     )
                 } else {
                     print("✅ TidalDrop: File received completely! Saved to: \(fileURL.path)")
+                    try? handle.close()
                     securityScopedDestination?.stopAccessingSecurityScopedResource()
                     self.completeTransfer(transferId: transferId, fileName: fileURL.lastPathComponent, isIncoming: true)
                     connection.cancel()
                 }
             } else if isComplete {
                 print("⚠️ TidalDrop: Connection completed but only received \(receivedSoFar)/\(fileSize) bytes")
+                try? handle.close()
                 securityScopedDestination?.stopAccessingSecurityScopedResource()
+                DispatchQueue.main.async {
+                    self.activeTransfers[transferId]?.status = .failed("Sender disconnected early")
+                }
             }
         }
     }
