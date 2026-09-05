@@ -370,15 +370,9 @@ class PermissionDiagnosticService: ObservableObject {
         return result.exitCode == 0
     }
     
-    /// Kickstart the Screen Sharing service
+    /// Kickstart the Screen Sharing service via the admin-prompted path.
     func kickstartScreenSharing() async -> Bool {
-        // Restart the launchd service
-        let result = ShellExecutor.execute("""
-            sudo launchctl kickstart -k system/com.apple.screensharing 2>&1 || \
-            sudo launchctl enable system/com.apple.screensharing 2>&1
-        """)
-        
-        return result.exitCode == 0
+        await SharingConfigurationService.shared.restartScreenSharing()
     }
     
     /// Open Screen Recording settings directly
