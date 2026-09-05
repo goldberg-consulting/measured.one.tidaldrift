@@ -491,17 +491,21 @@ class TidalDropService: ObservableObject {
         
         // 1. Receive metadata size (4 bytes)
         print("🌊 TidalDrop: Waiting for metadata size (4 bytes)...")
-        connection.receive(minimumIncompleteLength: 4, maximumLength: 4) { [weak self] data, _, isComplete, error in
+        // Every early exit cancels the connection; otherwise a peer that sends
+        // a short or malformed header pins the socket open indefinitely.
+        connection.receive(minimumIncompleteLength: 4, maximumLength: 4) { [weak self] data, _, _, error in
             if let error = error {
                 print("❌ TidalDrop: Error receiving metadata size: \(error)")
+                connection.cancel()
                 return
             }
-            guard let self = self, let d = data else {
+            guard let self = self, let d = data, d.count == 4 else {
                 print("❌ TidalDrop: No data received for metadata size")
+                connection.cancel()
                 return
             }
             
-            let metadataSize = Int(d.withUnsafeBytes { $0.load(as: UInt32.self).bigEndian })
+            let metadataSize = Int(d.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self).bigEndian })
             
             guard metadataSize > 0 && metadataSize <= 1_048_576 else {
                 print("❌ TidalDrop: Metadata size out of bounds: \(metadataSize)")
@@ -514,15 +518,18 @@ class TidalDropService: ObservableObject {
             connection.receive(minimumIncompleteLength: metadataSize, maximumLength: metadataSize) { [weak self] data, _, _, error in
                 if let error = error {
                     print("❌ TidalDrop: Error receiving metadata: \(error)")
+                    connection.cancel()
                     return
                 }
                 guard let self = self, let d = data else {
                     print("❌ TidalDrop: No data received for metadata")
+                    connection.cancel()
                     return
                 }
                 
                 guard let metadata = try? JSONDecoder().decode(FileMetadata.self, from: d) else {
                     print("❌ TidalDrop: Failed to decode metadata JSON")
+                    connection.cancel()
                     return
                 }
                 
@@ -532,11 +539,15 @@ class TidalDropService: ObservableObject {
         }
     }
     
-    /// Sanitize a filename received from the network to prevent path traversal.
-    private static func sanitizeFilename(_ raw: String) -> String? {
-        let name = URL(fileURLWithPath: raw).lastPathComponent
-        if name.isEmpty || name == "." || name == ".." { return nil }
-        if name.hasPrefix(".") { return nil }
+    /// Sanitize a filename received from the network. Anything that is not a
+    /// single plain path component is rejected outright rather than repaired:
+    /// `URL.lastPathComponent` returns "/" for the input "/", which used to
+    /// pass every check and resolve to the drop folder itself.
+    static func sanitizeFilename(_ raw: String) -> String? {
+        let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, name.count <= 255,
+              name != ".", name != "..", !name.hasPrefix("."),
+              !name.contains("/"), !name.contains(":"), !name.contains("\0") else { return nil }
         return name
     }
 
@@ -548,7 +559,7 @@ class TidalDropService: ObservableObject {
     /// The drop listener has no authentication, so only peers on the local
     /// network (private IPv4, IPv6 link-local/ULA, loopback for tests) may
     /// push files.
-    private static func isAcceptableSender(_ ip: String) -> Bool {
+    static func isAcceptableSender(_ ip: String) -> Bool {
         if ip == "127.0.0.1" || ip == "::1" { return true }
         if NetworkUtils.isLocalNetworkAddress(ip) { return true }
         let lower = ip.lowercased()
@@ -558,7 +569,7 @@ class TidalDropService: ObservableObject {
     /// A destination that does not clobber anything already in the folder.
     /// The sender is unauthenticated, so an incoming name must never delete
     /// an existing file; collisions get " (n)" appended before the extension.
-    private static func uniqueDestination(in folder: URL, for name: String) -> URL {
+    static func uniqueDestination(in folder: URL, for name: String) -> URL {
         let first = folder.appendingPathComponent(name)
         guard FileManager.default.fileExists(atPath: first.path) else { return first }
         let base = (name as NSString).deletingPathExtension
@@ -599,6 +610,14 @@ class TidalDropService: ObservableObject {
         }
         
         let fileURL = Self.uniqueDestination(in: destinationFolder, for: safeName)
+        guard fileURL.deletingLastPathComponent().standardizedFileURL.path == destinationFolder.standardizedFileURL.path else {
+            print("❌ TidalDrop: Destination escaped the drop folder; rejecting")
+            if didStartDestinationAccess {
+                destinationFolder.stopAccessingSecurityScopedResource()
+            }
+            connection.cancel()
+            return
+        }
         print("   File will be saved to: \(fileURL.path)")
         
         let transfer = DropTransfer(
