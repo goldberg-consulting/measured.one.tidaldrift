@@ -8,6 +8,12 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
     private var localMonitors: [Any] = []
     private let keyboardTap = RemoteKeyboardTap()
     private var keyboardTapActive = false
+    /// Modifiers forwarded as pressed by the NSEvent fallback path and not yet
+    /// forwarded as released. The monitor only sees events for this window, so
+    /// a release after Cmd+Tab or after capture is toggled off never arrives;
+    /// these are released explicitly at those points.
+    private var fallbackHeldModifiers: Set<UInt16> = []
+    private var cancellables = Set<AnyCancellable>()
     private var remoteResolution: CGSize = CGSize(width: 1280, height: 720)
     private var hasSizedToRemote = false
     private var didCleanup = false
@@ -200,6 +206,16 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
             }
         }
         keyboardTapActive = keyboardTap.start()
+
+        // Capture toggled off (hotkey or HUD button): whatever is held on the
+        // host would otherwise stay latched until the session ends.
+        clientSession.$inputCaptureEnabled
+            .dropFirst()
+            .removeDuplicates()
+            .filter { !$0 }
+            .sink { [weak self] _ in self?.releaseHeldModifiers() }
+            .store(in: &cancellables)
+
         guard !keyboardTapActive else { return }
 
         let keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged]) { [weak self] event in
@@ -296,12 +312,25 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
             let flags = CGEventFlags(rawValue: UInt64(modifiers))
             guard let isDown = ModifierKey.isPress(keyCode: keyCode, flags: flags) else { break }
             if isDown {
+                fallbackHeldModifiers.insert(keyCode)
                 clientSession.sendInput(.keyDown(keyCode: keyCode, modifiers: UInt64(modifiers)))
             } else {
+                fallbackHeldModifiers.remove(keyCode)
                 clientSession.sendInput(.keyUp(keyCode: keyCode, modifiers: UInt64(modifiers)))
             }
         default:
             break
+        }
+    }
+
+    /// Send a release for every modifier either keyboard path reported as
+    /// pressed. Called when capture disengages for any reason.
+    private func releaseHeldModifiers() {
+        keyboardTap.releaseHeldModifiers()
+        let stuck = fallbackHeldModifiers
+        fallbackHeldModifiers.removeAll()
+        for keyCode in stuck {
+            clientSession.sendInput(.keyUp(keyCode: keyCode, modifiers: 0))
         }
     }
     
@@ -313,6 +342,8 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
         guard !didCleanup else { return }
         didCleanup = true
 
+        cancellables.removeAll()
+        releaseHeldModifiers()
         keyboardTap.stop()
         keyboardTapActive = false
         pendingViewerSizeSend?.cancel()
@@ -322,6 +353,9 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
         }
         localMonitors.removeAll()
         clientSession.disconnect()
+        // The renderer owns the MTKView, its CAMetalLayer, the texture cache
+        // and the last decoded frames; the session outlives this window.
+        clientSession.renderer = nil
         onClose?(self)
         onClose = nil
     }
@@ -401,7 +435,17 @@ extension LocalCastViewerWindowController: NSWindowDelegate {
     }
 
     func windowDidBecomeKey(_ notification: Notification) {
+        keyboardTap.setEnabled(true)
         syncRenderPause()
+    }
+
+    /// Losing key (Cmd+Tab, clicking another window) means no release for a
+    /// held modifier will reach either keyboard path. Let the host go, and
+    /// stop the session-wide tap from touching every keystroke meant for
+    /// other apps.
+    func windowDidResignKey(_ notification: Notification) {
+        releaseHeldModifiers()
+        keyboardTap.setEnabled(false)
     }
 
     func windowDidBecomeMain(_ notification: Notification) {
