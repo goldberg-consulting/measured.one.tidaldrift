@@ -717,12 +717,15 @@ struct SharingUserSetupView: View {
         isCreatingUser = true
         creationResult = nil
         
-        // Username is already validated by isValidUsername regex, but escape for extra safety
-        let safeUsername = escapeForShell(username)
-        
-        // Use AppleScript to create user with admin privileges
+        // The command is an AppleScript string literal wrapping a shell
+        // command, so each value is escaped for both layers: shell quoting
+        // first, then AppleScript's backslash/double-quote escaping. Doing
+        // only the shell layer let a password containing `"` terminate the
+        // AppleScript literal (and fail account creation).
+        let command = "sysadminctl -addUser \(SharingConfigurationService.shellEscaped(username)) "
+            + "-password \(SharingConfigurationService.shellEscaped(password)) -hint 'Screen sharing account'"
         let script = """
-        do shell script "sysadminctl -addUser '\(safeUsername)' -password '\(escapeForShell(password))' -hint 'Screen sharing account'" with administrator privileges
+        do shell script "\(SharingConfigurationService.appleScriptEscaped(command))" with administrator privileges
         """
         
         Task {
@@ -739,12 +742,6 @@ struct SharingUserSetupView: View {
                 }
             }
         }
-    }
-    
-    private func escapeForShell(_ string: String) -> String {
-        return string
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "'", with: "'\\''")
     }
 }
 

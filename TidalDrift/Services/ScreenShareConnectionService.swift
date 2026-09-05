@@ -162,9 +162,19 @@ class ScreenShareConnectionService: @unchecked Sendable {
             throw ConnectionError.invalidAddress
         }
         
-        // Escape special characters for AppleScript string
-        let escapedUsername = escapeForAppleScript(username)
-        let escapedPassword = escapeForAppleScript(password)
+        // The credentials sit in the userinfo part of a URL that is itself an
+        // AppleScript string literal, so encode for both layers in order: URL
+        // percent-encoding first (a password containing "@", "/", ":" or "#"
+        // otherwise re-splits the URL and the connect goes to the wrong host),
+        // then AppleScript escaping. Percent-encoded output has no quotes or
+        // backslashes, so the second step is a no-op in practice but stays
+        // for safety.
+        let escapedUsername = escapeForAppleScript(
+            username.addingPercentEncoding(withAllowedCharacters: .urlUserAllowed) ?? username
+        )
+        let escapedPassword = escapeForAppleScript(
+            password.addingPercentEncoding(withAllowedCharacters: .urlPasswordAllowed) ?? password
+        )
         
         // Build VNC URL with properly escaped credentials
         let vncURL = "vnc://\(escapedUsername):\(escapedPassword)@\(address):\(port)"

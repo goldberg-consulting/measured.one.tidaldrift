@@ -323,12 +323,14 @@ class SharingConfigurationService: ObservableObject, @unchecked Sendable {
     }
     
     private func runAppleScript(_ source: String) async -> Bool {
-        logger.info("Running AppleScript: \(source.prefix(150))...")
+        // Never log the script body: the account-creation path embeds the new
+        // user's password in it, and the unified log is readable by any admin.
+        logger.info("Running privileged AppleScript (\(source.count) chars)")
         let result = await runProcess("/usr/bin/osascript", arguments: ["-e", source])
         
         logger.info("osascript exit code: \(result.exitCode)")
         if !result.output.isEmpty {
-            logger.info("osascript output: \(result.output, privacy: .public)")
+            logger.info("osascript output: \(result.output, privacy: .private)")
         }
         
         return result.exitCode == 0
@@ -403,11 +405,14 @@ class SharingConfigurationService: ObservableObject, @unchecked Sendable {
         return addresses
     }
 
-    private static func shellEscaped(_ value: String) -> String {
+    /// Single-quote a value for POSIX sh. Callers embedding the result inside
+    /// an AppleScript string literal must also pass it through
+    /// `appleScriptEscaped`, in that order (shell first, then AppleScript).
+    static func shellEscaped(_ value: String) -> String {
         "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
     }
 
-    private static func appleScriptEscaped(_ value: String) -> String {
+    static func appleScriptEscaped(_ value: String) -> String {
         value
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
