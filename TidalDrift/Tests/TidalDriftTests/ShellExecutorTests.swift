@@ -44,4 +44,15 @@ final class ShellExecutorTests: XCTestCase {
         let result = ShellExecutor.execute(executable: "/bin/echo", arguments: ["a b", "$HOME", "; rm -rf /"])
         XCTAssertEqual(result.output, "a b $HOME ; rm -rf /")
     }
+
+    // #167: an SSH target that starts with "-" would be parsed as an option.
+    func test_isSafeSSHComponent_rejectsLeadingDashAndShellChars() {
+        XCTAssertTrue(ScreenShareConnectionService.isSafeSSHComponent("eli"))
+        XCTAssertTrue(ScreenShareConnectionService.isSafeSSHComponent("mac-mini.local"))
+        XCTAssertTrue(ScreenShareConnectionService.isSafeSSHComponent("192.168.1.10"))
+        XCTAssertFalse(ScreenShareConnectionService.isSafeSSHComponent("-Gfoo"))
+        XCTAssertFalse(ScreenShareConnectionService.isSafeSSHComponent("-oProxyCommand=id"))
+        XCTAssertFalse(ScreenShareConnectionService.isSafeSSHComponent("host;id"))
+        XCTAssertFalse(ScreenShareConnectionService.isSafeSSHComponent(""))
+    }
 }

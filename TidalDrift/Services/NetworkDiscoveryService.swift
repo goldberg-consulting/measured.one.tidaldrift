@@ -806,14 +806,14 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         var result: UnsafeMutablePointer<addrinfo>?
         let status = getaddrinfo(cleanHostname, nil, &hints, &result)
 
-        defer { if result != nil { freeaddrinfo(result) } }
+        defer { if let result { freeaddrinfo(result) } }
 
-        guard status == 0, let addrInfo = result else {
+        guard status == 0, let addrInfo = result, let sockaddr = addrInfo.pointee.ai_addr else {
             logger.warning("🌊 LocalCast: Failed to resolve hostname \(hostname)")
             return
         }
 
-        var addr = addrInfo.pointee.ai_addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
+        var addr = sockaddr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
         var ipBuffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
         inet_ntop(AF_INET, &addr.sin_addr, &ipBuffer, socklen_t(INET_ADDRSTRLEN))
         let ipAddress = String(cString: ipBuffer)
@@ -1069,11 +1069,11 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         var result: UnsafeMutablePointer<addrinfo>?
         let status = getaddrinfo(cleanHostname, nil, &hints, &result)
 
-        defer { freeaddrinfo(result) }
+        defer { if let result { freeaddrinfo(result) } }
 
-        guard status == 0, let addrInfo = result else { return }
+        guard status == 0, let addrInfo = result, let sockaddr = addrInfo.pointee.ai_addr else { return }
 
-        var addr = addrInfo.pointee.ai_addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
+        var addr = sockaddr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
         var ipBuffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
         inet_ntop(AF_INET, &addr.sin_addr, &ipBuffer, socklen_t(INET_ADDRSTRLEN))
         let ipAddress = String(cString: ipBuffer)

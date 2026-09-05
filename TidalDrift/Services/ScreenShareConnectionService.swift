@@ -565,8 +565,11 @@ class ScreenShareConnectionService: @unchecked Sendable {
         }
     }
 
-    private static func isSafeSSHComponent(_ value: String) -> Bool {
-        let pattern = #"^[A-Za-z0-9._%+\-@]+$"#
+    /// Alphanumerics plus a few host/user punctuation marks, and never a
+    /// leading `-`: `user@host` is passed to ssh as a positional argument,
+    /// so `-Gfoo@host` would be parsed as an option.
+    static func isSafeSSHComponent(_ value: String) -> Bool {
+        let pattern = #"^[A-Za-z0-9._%+@][A-Za-z0-9._%+\-@]*$"#
         return value.range(of: pattern, options: .regularExpression) != nil
     }
 
