@@ -17,6 +17,25 @@ final class ClipboardSyncTests: XCTestCase {
         NSPasteboard(name: NSPasteboard.Name("com.tidaldrift.tests.\(UUID().uuidString)"))
     }
 
+    // MARK: - Manifest validation (#148)
+
+    func test_declaredTotal_rejectsOverflowNegativeAndOversized() {
+        let cap = LocalCastConfiguration.clipboardMaxTransferBytes
+        XCTAssertEqual(ClipboardBulkTransfer.declaredTotal(of: []), 0)
+        XCTAssertEqual(ClipboardBulkTransfer.declaredTotal(of: [
+            ClipboardFileStub(name: "a", size: 10), ClipboardFileStub(name: "b", size: 32),
+        ]), 42)
+        XCTAssertNil(ClipboardBulkTransfer.declaredTotal(of: [
+            ClipboardFileStub(name: "a", size: Int64.max), ClipboardFileStub(name: "b", size: 1),
+        ]), "Int64.max + 1 must not trap")
+        XCTAssertNil(ClipboardBulkTransfer.declaredTotal(of: [ClipboardFileStub(name: "a", size: -1)]))
+        XCTAssertNil(ClipboardBulkTransfer.declaredTotal(of: [ClipboardFileStub(name: "a", size: cap + 1)]))
+        XCTAssertNil(ClipboardBulkTransfer.declaredTotal(of: [
+            ClipboardFileStub(name: "a", size: cap), ClipboardFileStub(name: "b", size: 1),
+        ]), "sum over the cap")
+        XCTAssertEqual(ClipboardBulkTransfer.declaredTotal(of: [ClipboardFileStub(name: "a", size: cap)]), cap)
+    }
+
     // MARK: - Framing
 
     func test_framing_roundTrip_keyed() throws {
