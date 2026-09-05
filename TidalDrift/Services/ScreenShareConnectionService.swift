@@ -700,8 +700,7 @@ class ScreenShareConnectionService: @unchecked Sendable {
                     let data = Data(command.utf8)
                     
                     connection.send(content: data, completion: .contentProcessed { error in
-                        guard !didResume.value else { return }
-                        didResume.value = true
+                        guard didResume.compareAndSwap(expected: false, desired: true) else { return }
                         self?.cleanupConnection(id: connectionId)
                         
                         if error == nil {
@@ -712,8 +711,7 @@ class ScreenShareConnectionService: @unchecked Sendable {
                     })
                     
                 case .failed:
-                    guard !didResume.value else { return }
-                    didResume.value = true
+                    guard didResume.compareAndSwap(expected: false, desired: true) else { return }
                     self?.cleanupConnection(id: connectionId)
                     continuation.resume(returning: false)
                     
@@ -722,8 +720,7 @@ class ScreenShareConnectionService: @unchecked Sendable {
                     self?.activeConnections.removeValue(forKey: connectionId)
                     self?.connectionsLock.unlock()
                     
-                    guard !didResume.value else { return }
-                    didResume.value = true
+                    guard didResume.compareAndSwap(expected: false, desired: true) else { return }
                     continuation.resume(returning: false)
                     
                 default:
@@ -735,8 +732,7 @@ class ScreenShareConnectionService: @unchecked Sendable {
             
             // Timeout
             DispatchQueue.global().asyncAfter(deadline: .now() + 5) { [weak self] in
-                guard !didResume.value else { return }
-                didResume.value = true
+                guard didResume.compareAndSwap(expected: false, desired: true) else { return }
                 self?.cleanupConnection(id: connectionId)
                 continuation.resume(returning: false)
             }

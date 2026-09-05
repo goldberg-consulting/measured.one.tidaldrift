@@ -85,13 +85,11 @@ class SharingConfigurationService: ObservableObject, @unchecked Sendable {
             connection.stateUpdateHandler = { [weak self] state in
                 switch state {
                 case .ready:
-                    guard !didResume.value else { return }
-                    didResume.value = true
+                    guard didResume.compareAndSwap(expected: false, desired: true) else { return }
                     self?.cleanupConnection(id: connectionId)
                     continuation.resume(returning: true)
                 case .failed:
-                    guard !didResume.value else { return }
-                    didResume.value = true
+                    guard didResume.compareAndSwap(expected: false, desired: true) else { return }
                     self?.cleanupConnection(id: connectionId)
                     continuation.resume(returning: false)
                 case .cancelled:
@@ -99,8 +97,7 @@ class SharingConfigurationService: ObservableObject, @unchecked Sendable {
                     self?.activeConnections.removeValue(forKey: connectionId)
                     self?.connectionsLock.unlock()
                     
-                    guard !didResume.value else { return }
-                    didResume.value = true
+                    guard didResume.compareAndSwap(expected: false, desired: true) else { return }
                     continuation.resume(returning: false)
                 default:
                     break
@@ -111,8 +108,7 @@ class SharingConfigurationService: ObservableObject, @unchecked Sendable {
             
             // Timeout for localhost
             DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { [weak self] in
-                guard !didResume.value else { return }
-                didResume.value = true
+                guard didResume.compareAndSwap(expected: false, desired: true) else { return }
                 self?.cleanupConnection(id: connectionId)
                 continuation.resume(returning: false)
             }
