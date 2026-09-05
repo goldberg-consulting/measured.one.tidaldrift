@@ -82,11 +82,15 @@ final class LocalDirectRouteService {
 
         // Gateway MAC (best effort), captured in the same format `arp` prints so
         // the daemon's comparison against live `arp` output matches.
+        // Only a well-formed MAC is accepted: the value is interpolated into a
+        // script that runs as root, and an unresolved entry prints
+        // "(incomplete)" here.
         var mac = ""
         if let arp = run("/usr/sbin/arp", ["-n", gateway])?.out,
-           let at = arp.range(of: " at ") {
-            mac = arp[at.upperBound...]
-                .split(separator: " ").first.map(String.init) ?? ""
+           let at = arp.range(of: " at "),
+           let candidate = arp[at.upperBound...].split(separator: " ").first.map(String.init),
+           candidate.range(of: #"^[0-9a-fA-F]{1,2}(:[0-9a-fA-F]{1,2}){5}$"#, options: .regularExpression) != nil {
+            mac = candidate
         }
 
         return HomeNetwork(interface: iface, ipv4: ip, subnetCIDR: cidr,
@@ -155,7 +159,11 @@ final class LocalDirectRouteService {
     @discardableResult
     func disable() async -> Bool {
         var parts = ["launchctl bootout system/\(Self.label) 2>/dev/null; rm -f \(plistPath) \(binPath)"]
-        if let subnet = UserDefaults.standard.string(forKey: subnetKey) {
+        // The stored subnet is interpolated into a root shell command, and
+        // UserDefaults is writable by any process running as this user, so it
+        // is re-validated as a plain a.b.c.d/nn before use.
+        if let subnet = UserDefaults.standard.string(forKey: subnetKey),
+           subnet.range(of: #"^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$"#, options: .regularExpression) != nil {
             parts.append("route -n delete -net \(subnet) 2>/dev/null")
         }
         parts.append("true")
