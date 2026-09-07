@@ -125,7 +125,26 @@ final class ClipboardSyncEngine {
         broadcast(snapshot)
     }
 
-    private func broadcast(_ snapshot: ClipboardSnapshot) {
+    /// Explicit user gesture; does not replace or expose the sender's clipboard.
+    func receiveDrop(from source: NSPasteboard) -> Bool {
+        // Reject a mixed file/folder drop as a whole rather than silently
+        // transferring only some items (or sending a folder's name as text).
+        if let urls = source.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL],
+           !urls.isEmpty,
+           !urls.allSatisfy({ (try? $0.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])).map {
+               $0.isRegularFile == true && $0.isSymbolicLink != true
+           } == true }) { return false }
+        guard isRunning, isSyncEnabled(), isBulkSyncAllowed?() == true,
+              let snapshot = ClipboardPasteboard.capture(from: source),
+              snapshot.totalContentBytes <= LocalCastConfiguration.clipboardMaxTransferBytes else { return false }
+        if snapshot.kind == .files,
+           makeOutbound(updateId: UUID(), snapshot: snapshot) == nil { return false }
+        lastChangeCount = pasteboard.changeCount
+        broadcast(snapshot, eagerFiles: snapshot.kind == .files)
+        return true
+    }
+
+    private func broadcast(_ snapshot: ClipboardSnapshot, eagerFiles: Bool = false) {
         // A newer copy supersedes whatever was offered or in flight.
         supersedePendingContent()
         // The local pasteboard has moved on, so the receive-side duplicate
@@ -162,7 +181,7 @@ final class ClipboardSyncEngine {
         send(ClipboardUpdatePayload(
             updateId: updateId, kind: snapshot.kind,
             text: nil, rtf: nil, png: nil,
-            bulk: offer, digest: snapshot.digest
+            bulk: offer, digest: snapshot.digest, eagerFiles: eagerFiles ? true : nil
         ))
     }
 
@@ -232,7 +251,7 @@ final class ClipboardSyncEngine {
         recentUpdateIds.append(payload.updateId)
         if recentUpdateIds.count > 16 { recentUpdateIds.removeFirst() }
 
-        guard payload.digest != lastAppliedDigest else { return }
+        guard payload.eagerFiles == true || payload.digest != lastAppliedDigest else { return }
         supersedePendingContent()
         pendingRemoteUpdateID = payload.updateId
         let expectedChangeCount = pasteboard.changeCount
@@ -249,6 +268,24 @@ final class ClipboardSyncEngine {
         guard isBulkSyncAllowed?() == true else { return }
         switch payload.kind {
         case .files:
+            if payload.eagerFiles == true {
+                fetchFilesForPaste?(bulk) { [weak self] result in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.isRunning, self.isSyncEnabled(),
+                              self.pendingRemoteUpdateID == payload.updateId,
+                              self.pasteboard.changeCount == expectedChangeCount else { return }
+                        switch result {
+                        case .success(let urls):
+                            self.pasteboard.clearContents()
+                            self.pasteboard.writeObjects(urls as [NSURL])
+                            self.recordApplied(changeCount: self.pasteboard.changeCount, digest: payload.digest)
+                        case .failure(let error):
+                            self.logger.error("LocalCast drop failed: \(error.localizedDescription)")
+                        }
+                    }
+                }
+                return
+            }
             applyFileOffer(bulk, digest: payload.digest)
         case .text, .image:
             guard bulk.totalBytes <= LocalCastConfiguration.clipboardMaxTransferBytes else { return }

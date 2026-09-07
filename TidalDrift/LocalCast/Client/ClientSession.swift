@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import Network
 import CryptoKit
 import OSLog
@@ -37,6 +38,9 @@ extension ClientSessionDelegate {
     }
 
 class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegate {
+    @Published var remoteAccessibilityGranted: Bool?
+    @Published var remoteSupportsDrops = false
+    @Published var dropStatus: String?
     private let logger = Logger(subsystem: "com.tidaldrift", category: "ClientSession")
 
     private let transport = UDPTransport()
@@ -174,6 +178,19 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
     @Published var authError: String?
 
     // MARK: - Clipboard sync
+
+    @MainActor
+    func receiveDrop(from pasteboard: NSPasteboard) -> Bool {
+        guard isConnected, remoteSupportsDrops, clipboardEngine?.receiveDrop(from: pasteboard) == true else {
+            let alert = NSAlert()
+            alert.messageText = "LocalCast could not accept this drop"
+            alert.informativeText = "Both Macs need a version supporting LocalCast drops. Connect with a password and enable clipboard sync on both Macs. Drop regular files, text or images within the clipboard transfer limit; folders are not supported."
+            alert.runModal()
+            return false
+        }
+        dropStatus = "Drop offered — paste on the host after transfer"
+        return true
+    }
 
     /// Created and driven on the main actor once the session is post-auth.
     private var clipboardEngine: ClipboardSyncEngine?
@@ -1306,6 +1323,11 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             }
 
         case .heartbeat:
+            let capabilities = packet.payload.count >= 2 ? packet.payload[packet.payload.startIndex + 1] : nil
+            DispatchQueue.main.async { [weak self] in
+                self?.remoteAccessibilityGranted = capabilities.map { $0 & 0x01 != 0 }
+                self?.remoteSupportsDrops = capabilities.map { $0 & 0x02 != 0 } ?? false
+            }
             // Pong received - record round-trip latency for the HUD.
             recordHeartbeatResponse(Date())
             if let flags = packet.payload.first {
@@ -1458,4 +1480,3 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         self.renderer?.update(with: imageBuffer)
     }
 }
-

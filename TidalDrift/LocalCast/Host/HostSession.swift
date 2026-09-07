@@ -1652,7 +1652,9 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             type: .heartbeat,
             sequenceNumber: ping.sequenceNumber,
             timestamp: ping.timestamp,
-            payload: Data([flags])
+            // Second byte advertises input permission and eager-drop support.
+            // Old viewers only read byte zero and remain compatible.
+            payload: Data([flags, (inputInjector.hasAccessibilityPermission ? 0x01 : 0) | 0x02])
         )
         transport.send(packet: pong, to: endpoint)
     }

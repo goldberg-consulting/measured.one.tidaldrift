@@ -9,6 +9,114 @@ import CryptoKit
 /// where Local Network entitlements are granted.
 final class ClipboardSyncTests: XCTestCase {
 
+    @MainActor
+    func test_keyboardCapturePreservesLocalCloseAndAppSwitching() throws {
+        let tap = RemoteKeyboardTap()
+        tap.shouldCapture = { true }
+        var closed = false
+        var forwarded: [UInt16] = []
+        tap.onCloseViewer = { closed = true }
+        tap.onKey = { key, _, _ in forwarded.append(key) }
+        let close = try XCTUnwrap(CGEvent(keyboardEventSource: nil, virtualKey: 13, keyDown: true))
+        close.flags = .maskCommand
+        XCTAssertNil(tap.handle(type: .keyDown, event: close))
+        XCTAssertTrue(closed)
+        XCTAssertTrue(forwarded.isEmpty)
+        let tab = try XCTUnwrap(CGEvent(keyboardEventSource: nil, virtualKey: 48, keyDown: true))
+        tab.flags = .maskCommand
+        XCTAssertNotNil(tap.handle(type: .keyDown, event: tab))
+        XCTAssertTrue(forwarded.isEmpty)
+        let text = try XCTUnwrap(CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true))
+        text.flags = []
+        XCTAssertNil(tap.handle(type: .keyDown, event: text))
+        XCTAssertEqual(forwarded, [0])
+        tap.shouldCapture = { false }
+        XCTAssertNotNil(tap.handle(type: .keyDown, event: text))
+        XCTAssertEqual(forwarded, [0])
+    }
+
+    @MainActor
+    func test_explicitTextDropPreservesLocalClipboardAndRequiresEncryption() {
+        let local = privatePasteboard()
+        let drop = privatePasteboard()
+        defer { local.releaseGlobally(); drop.releaseGlobally() }
+        local.setString("private local copy", forType: .string)
+        drop.setString("dropped text", forType: .string)
+        let engine = ClipboardSyncEngine(pasteboard: local, isSyncEnabled: { true })
+        engine.start()
+        defer { engine.stop() }
+        var sent: ClipboardUpdatePayload?
+        engine.sendUpdate = { sent = $0 }
+        engine.isBulkSyncAllowed = { false }
+        XCTAssertFalse(engine.receiveDrop(from: drop))
+        XCTAssertNil(sent)
+        engine.isBulkSyncAllowed = { true }
+        XCTAssertTrue(engine.receiveDrop(from: drop))
+        XCTAssertEqual(sent?.text, "dropped text")
+        XCTAssertEqual(local.string(forType: .string), "private local copy")
+    }
+
+    @MainActor
+    func test_explicitDropRejectsDirectoriesAndDisabledSync() {
+        let drop = privatePasteboard()
+        let local = privatePasteboard()
+        defer { local.releaseGlobally(); drop.releaseGlobally() }
+        drop.writeObjects([FileManager.default.temporaryDirectory as NSURL])
+        let engine = ClipboardSyncEngine(pasteboard: local, isSyncEnabled: { true })
+        engine.isBulkSyncAllowed = { true }
+        engine.start()
+        defer { engine.stop() }
+        XCTAssertFalse(engine.receiveDrop(from: drop))
+        let disabled = ClipboardSyncEngine(pasteboard: local, isSyncEnabled: { false })
+        disabled.isBulkSyncAllowed = { true }
+        disabled.start()
+        defer { disabled.stop() }
+        drop.clearContents()
+        drop.setString("text", forType: .string)
+        XCTAssertFalse(disabled.receiveDrop(from: drop))
+    }
+
+    @MainActor
+    func test_eagerFileDropFetchesImmediatelyWithoutReplacingNewerCopy() async {
+        let board = privatePasteboard()
+        defer { board.releaseGlobally() }
+        let engine = ClipboardSyncEngine(pasteboard: board, isSyncEnabled: { true })
+        engine.isBulkSyncAllowed = { true }
+        engine.start()
+        defer { engine.stop() }
+        var complete: ((Result<[URL], Error>) -> Void)?
+        engine.fetchFilesForPaste = { _, callback in complete = callback }
+        let offer = ClipboardBulkOffer(token: SessionCrypto.generateNonce(), totalBytes: 1,
+                                       files: [ClipboardFileStub(name: "document.txt", size: 1)])
+        let payload = ClipboardUpdatePayload(updateId: UUID(), kind: .files, text: nil, rtf: nil,
+            png: nil, bulk: offer, digest: Data(repeating: 1, count: 32), eagerFiles: true)
+        engine.handleRemoteUpdate(payload)
+        XCTAssertNotNil(complete, "Drop must fetch before the user presses Paste")
+        board.clearContents()
+        board.setString("newer private copy", forType: .string)
+        complete?(.success([URL(fileURLWithPath: "/tmp/document.txt")]))
+        await Task.yield()
+        XCTAssertEqual(board.string(forType: .string), "newer private copy")
+    }
+
+    @MainActor
+    func test_eagerFileDropPlacesDownloadedURLsOnClipboard() async {
+        let board = privatePasteboard()
+        defer { board.releaseGlobally() }
+        let engine = ClipboardSyncEngine(pasteboard: board, isSyncEnabled: { true })
+        engine.isBulkSyncAllowed = { true }
+        engine.start()
+        defer { engine.stop() }
+        let url = URL(fileURLWithPath: "/tmp/downloaded-document.txt")
+        engine.fetchFilesForPaste = { _, callback in callback(.success([url])) }
+        let offer = ClipboardBulkOffer(token: SessionCrypto.generateNonce(), totalBytes: 1,
+                                       files: [ClipboardFileStub(name: url.lastPathComponent, size: 1)])
+        engine.handleRemoteUpdate(ClipboardUpdatePayload(updateId: UUID(), kind: .files, text: nil,
+            rtf: nil, png: nil, bulk: offer, digest: Data(repeating: 2, count: 32), eagerFiles: true))
+        for _ in 0..<10 { await Task.yield() }
+        XCTAssertEqual(board.readObjects(forClasses: [NSURL.self]) as? [URL], [url])
+    }
+
     private func testKey() -> SymmetricKey {
         SessionCrypto.deriveClipboardKey(from: SessionCrypto.generateSessionKey())
     }

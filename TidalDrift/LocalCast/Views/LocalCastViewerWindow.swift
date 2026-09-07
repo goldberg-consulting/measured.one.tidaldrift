@@ -2,7 +2,18 @@ import SwiftUI
 import MetalKit
 import Combine
 
+private final class LocalCastDropView<Content: View>: NSHostingView<Content> {
+    var receiveDrop: ((NSPasteboard) -> Bool)?
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { .copy }
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        receiveDrop?(sender.draggingPasteboard) ?? false
+    }
+}
+
 class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate {
+    private static var openViewerCount = 0
+    private static var previousActivationPolicy: NSApplication.ActivationPolicy = .accessory
+    private var registeredViewer = false
     private let device: DiscoveredDevice
     private let clientSession: ClientSession
     private var localMonitors: [Any] = []
@@ -29,7 +40,7 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
         
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1280, height: 720),
-            styleMask: [.titled, .closable, .resizable, .miniaturizable, .fullSizeContentView],
+            styleMask: [.titled, .closable, .resizable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
@@ -54,7 +65,13 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
             tuning: LocalCastService.shared.streamingTuning,
             overlayFrames: overlayFrameStore
         )
-        window.contentView = NSHostingView(rootView: contentView)
+        let hostingView = LocalCastDropView(rootView: contentView)
+        hostingView.registerForDraggedTypes([.fileURL, .string, .rtf, .html, .png, .tiff])
+        hostingView.receiveDrop = { [weak session] pasteboard in
+            guard let session else { return false }
+            return session.receiveDrop(from: pasteboard)
+        }
+        window.contentView = hostingView
         
         super.init(window: window)
         
@@ -137,6 +154,13 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
     private var diagCount = 0
     
     private func setupInputCapture() {
+        if Self.openViewerCount == 0 {
+            Self.previousActivationPolicy = NSApp.activationPolicy()
+            NSApp.setActivationPolicy(.regular)
+        }
+        Self.openViewerCount += 1
+        registeredViewer = true
+        NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
         window?.makeFirstResponder(window?.contentView)
         
@@ -151,6 +175,16 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
             }
             
             guard isOurs else { return event }
+            // AppKit owns the title bar, traffic lights and activation click.
+            // Swallowing these events prevents both closing and gaining focus.
+            guard window.contentLayoutRect.contains(event.locationInWindow) else { return event }
+            guard window.isKeyWindow else {
+                if event.type == .leftMouseDown {
+                    NSApp.activate(ignoringOtherApps: true)
+                    window.makeKeyAndOrderFront(nil)
+                }
+                return event
+            }
             guard self.clientSession.inputCaptureEnabled else { return event }
             if self.clientSession.isOverlayActive { return event }
             
@@ -215,6 +249,7 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
         keyboardTap.onToggleCapture = { [weak self] in
             DispatchQueue.main.async { self?.clientSession.inputCaptureEnabled.toggle() }
         }
+        keyboardTap.onCloseViewer = { [weak self] in self?.window?.performClose(nil) }
         keyboardTap.onKey = { [weak self] keyCode, modifiers, down in
             guard let self else { return }
             if down {
@@ -234,12 +269,17 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
             .sink { [weak self] _ in self?.releaseHeldModifiers() }
             .store(in: &cancellables)
 
-        guard !keyboardTapActive else { return }
-
+        // Keep local escape/toggle shortcuts installed even when the tap exists.
+        // A tap passes events through while capture is off; without this monitor
+        // Cmd+Shift+I could disable capture but never re-enable it.
         let keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged]) { [weak self] event in
                 guard let self = self else { return event }
                 guard let window = self.window else { return event }
                 guard event.window == window else { return event }
+                if event.keyCode == 13, event.modifierFlags.contains(.command) {
+                    if event.type == .keyDown { window.performClose(nil) }
+                    return nil
+                }
 
                 // Cmd+Shift+I toggles input capture
                 if event.type == .keyDown,
@@ -255,6 +295,7 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
                 guard self.clientSession.inputCaptureEnabled else { return event }
                 if self.clientSession.isOverlayActive { return event }
 
+                guard !self.keyboardTapActive else { return event }
                 self.handleKeyEvent(event)
                 return nil
             }
@@ -359,6 +400,11 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
     private func cleanup() {
         guard !didCleanup else { return }
         didCleanup = true
+        if registeredViewer {
+            registeredViewer = false
+            Self.openViewerCount -= 1
+            if Self.openViewerCount == 0 { NSApp.setActivationPolicy(Self.previousActivationPolicy) }
+        }
 
         cancellables.removeAll()
         releaseHeldModifiers()
@@ -381,6 +427,14 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
     override func close() {
         cleanup()
         super.close()
+    }
+
+    override func showWindow(_ sender: Any?) {
+        super.showWindow(sender)
+        // Connecting is asynchronous: another window can become key between
+        // construction and presentation. Ordering front alone does not activate.
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(sender)
     }
     
     // MARK: - Viewer → Remote Window Resize
@@ -580,6 +634,16 @@ struct LocalCastContentView: View {
             // Bottom status bar
             VStack {
                 Spacer()
+                if session.remoteAccessibilityGranted == false {
+                    Text("View only: enable TidalDrift in Accessibility settings on the host Mac")
+                        .font(.caption).padding(8).background(.black.opacity(0.8))
+                        .foregroundStyle(.yellow).allowsHitTesting(false)
+                }
+                if let status = session.dropStatus {
+                    Text(status).font(.caption).padding(6)
+                        .background(.black.opacity(0.8)).foregroundStyle(.white)
+                        .allowsHitTesting(false)
+                }
                 bottomStatusBar
             }
         }
@@ -1030,4 +1094,3 @@ struct LocalCastStatsOverlay: View {
         }
     }
 }
-
