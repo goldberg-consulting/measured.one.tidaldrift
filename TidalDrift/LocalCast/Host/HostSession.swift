@@ -1648,11 +1648,15 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         profileLock.lock()
         let flags: UInt8 = _fastLANActive ? Self.pongFlagFastLAN : 0
         profileLock.unlock()
+        let inputPermission: UInt8 = inputInjector.hasAccessibilityPermission ? 0x01 : 0
+        let capabilities: UInt8 = inputPermission | 0x02
         let pong = LocalCastPacket(
             type: .heartbeat,
             sequenceNumber: ping.sequenceNumber,
             timestamp: ping.timestamp,
-            payload: Data([flags])
+            // Second byte advertises input permission and eager-drop support.
+            // Old viewers only read byte zero and remain compatible.
+            payload: Data([flags, capabilities])
         )
         transport.send(packet: pong, to: endpoint)
     }

@@ -23,6 +23,9 @@ struct ClipboardUpdatePayload: Codable {
     /// SHA-256 of the canonical content, so the receiver can skip an apply
     /// that would recreate what its pasteboard already holds.
     let digest: Data
+    /// Explicit drop: download files immediately instead of waiting for Paste.
+    /// Optional for compatibility with older peers.
+    var eagerFiles: Bool? = nil
 }
 
 /// Announces content too large for the inline path. The receiver fetches it

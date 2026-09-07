@@ -169,3 +169,28 @@ Do not substitute a throughput benchmark or ping for video measurements.
 Automated tests cover deterministic contracts; the matrix above remains a
 release gate requiring two Macs and real displays. No measurements from this
 matrix have been collected as part of this source review.
+
+### Viewer interaction regression checks
+
+The viewer uses a normal title bar and makes TidalDrift a regular application
+while any viewer is open. Closing the last viewer restores the prior menu-bar
+activation policy. Cmd+W closes locally; Cmd+Tab and Cmd+Option+Escape remain
+local escape routes. Cmd+Shift+I must toggle capture both off and on.
+
+New hosts report Accessibility permission in their heartbeat. A viewer shows
+a warning when the host cannot inject input; grant permission on the host Mac.
+
+Drops require updated peers, a password-protected session, and clipboard sync
+enabled on both Macs. Regular files are fetched immediately through the encrypted
+clipboard channel into the host's clipboard cache, then placed on its clipboard.
+Text/images also populate the remote clipboard. Paste into the desired remote
+application after transfer. This is not native drag-and-drop into the remote
+application, and folders/file promises are not supported. The viewer's "offered"
+message is not a delivery acknowledgement. Existing clipboard size/count limits
+apply; disabling sync or copying newer content can cancel an in-flight offer.
+
+Before releasing these changes, test two Macs: select the viewer from another
+app, close via traffic light and Cmd+W, minimize/restore/full-screen, toggle capture
+twice, type, copy/paste both directions, and drop text and multiple documents.
+Verify a host without Accessibility shows the warning, an old host rejects drops
+clearly, and newer clipboard content is preserved if it changes during transfer.
