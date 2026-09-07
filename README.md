@@ -2,9 +2,9 @@
 
 A menu-bar Mac utility for discovering, connecting to, and streaming between Macs on your local network. Built entirely with Apple frameworks; no external dependencies.
 
-TidalDrift replaces the manual workflow of opening System Settings, toggling sharing services, remembering IP addresses, and launching Screen Sharing.app. It lives in your menu bar, discovers every Mac on your LAN via Bonjour, and provides one-click access to screen sharing (VNC), file sharing (SMB), SSH, and its own low-latency streaming engine, LocalCast.
+TidalDrift replaces the manual workflow of opening System Settings, toggling sharing services, remembering IP addresses, and launching Screen Sharing.app. It lives in your menu bar, discovers advertising Macs on your LAN via Bonjour, and provides one-click access to screen sharing (VNC), file sharing (SMB), SSH, and its own low-latency streaming engine, LocalCast.
 
-> **Development status:** The custom LocalCast pipeline (ScreenCaptureKit capture, VideoToolbox HEVC/H.264 encoding, NV12 end to end, Metal rendering, UDP transport with FEC and adaptive bitrate) is functional: capture, encode, transport, decode, and render run end to end, and a two-stage viewer watchdog recovers from a host settings restart instead of freezing. Remaining limitations are honest ones: the client-driven in-viewer app picker is currently dormant (host-initiated sharing via the menu-bar picker is the active path), the password key derivation is not yet a brute-force-resistant hash, and on a lossy uplink UDP's lack of retransmit can still break frames. Full-desktop VNC streaming, network discovery, file transfer, clipboard sync, and all other features are functional. See [TidalDrift/LocalCast/README.md](TidalDrift/LocalCast/README.md) for details.
+> **Development status:** LocalCast provides desktop and app/window streaming using hardware VideoToolbox encoding/decoding and Metal rendering. Codec and resolution edits rebuild capture while retaining the authenticated session. Performance superiority and full capability parity with Apple's Screen Sharing have not been established. See [LocalCast's current contract and validation procedure](docs/LOCALCAST.md) for settings behavior, clipboard limits, and remaining work.
 
 ## Features
 
@@ -16,14 +16,14 @@ TidalDrift replaces the manual workflow of opening System Settings, toggling sha
 
 **LocalCast: Low-Latency Screen Streaming**
 - Custom streaming engine: ScreenCaptureKit capture, VideoToolbox HEVC/H.264 encoding, NV12 end to end, Metal rendering, raw UDP transport
-- Sub-frame latency on gigabit LAN
+- Low-latency capture, encoding, and presentation; performance depends on the host, viewer, content, and network
 - Stream full display or a single app/window
 - Auto/Resilient/Fast LAN transport profiles, adaptive bitrate, forward error correction, and an adaptive jitter buffer
-- AES-256-GCM session encryption with per-packet authentication once keyed (pairing key via HKDF-SHA256; password never sent over the wire)
-- Retina-quality with adaptive resolution (720p to 4K)
+- AES-256-GCM session encryption with per-packet authentication once keyed (v2 pairing uses PBKDF2-HMAC-SHA256 then HKDF; password never sent over the wire; legacy v1 compatibility remains)
+- Aspect-preserving resolution controls, including native capture and automatic reduction when frames exceed transport capacity
 - Remote mouse and keyboard input with configurable rate limiting
-- Live quality tuning slider synced between client and host
-- Clipboard sync during sessions: text, rich text, images, and files paste across machines in both directions, encrypted with the session key; password-manager copies are never synced
+- Viewer-to-host live tuning; requested values survive capture rebuilds
+- Clipboard sync during sessions: text, rich text, images, and files paste across machines in both directions, encrypted with the session key; copies marked confidential or transient are excluded
 
 **Network Discovery**
 - Bonjour/mDNS service browsing for `_rfb._tcp`, `_smb._tcp`, `_ssh._tcp`, and TidalDrift peers

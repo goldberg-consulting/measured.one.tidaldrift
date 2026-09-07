@@ -2,16 +2,12 @@ import Foundation
 import Network
 import OSLog
 
-/// Provides robust network address resolution for device connections.
-/// Prefers mDNS hostname resolution over cached IPs for reliability.
-///
-/// The key insight is that Bonjour/mDNS maintains current hostname-to-IP mappings
-/// via multicast DNS, so `hostname.local` always resolves to the current IP,
-/// whereas cached IPs can become stale due to DHCP lease changes.
+/// Resolves device addresses with bounded, cancellable DNS and connectivity checks.
 actor ConnectionResolver {
     static let shared = ConnectionResolver()
     
     private let logger = Logger(subsystem: "com.tidaldrift", category: "ConnectionResolver")
+    private let lookup: @Sendable (String, Int) -> ResolvedAddress?
     
     /// Resolution strategy - determines the order of resolution attempts
     enum ResolutionStrategy {
@@ -30,26 +26,21 @@ actor ConnectionResolver {
         
         /// Construct a VNC URL for this resolved address
         var vncURL: URL? {
-            URL(string: "vnc://\(address):\(port)")
+            vncURL(username: nil, password: nil)
         }
         
         /// Construct a VNC URL with credentials
         func vncURL(username: String?, password: String?) -> URL? {
-            var urlString = "vnc://"
-            
-            if let username = username, !username.isEmpty {
-                let escapedUser = username.addingPercentEncoding(withAllowedCharacters: .urlUserAllowed) ?? username
-                urlString += escapedUser
-                
-                if let password = password, !password.isEmpty {
-                    let escapedPass = password.addingPercentEncoding(withAllowedCharacters: .urlPasswordAllowed) ?? password
-                    urlString += ":\(escapedPass)"
-                }
-                urlString += "@"
+            guard (1...65535).contains(port), !address.isEmpty else { return nil }
+            var components = URLComponents()
+            components.scheme = "vnc"
+            components.host = address.contains(":") && !address.hasPrefix("[") ? "[\(address)]" : address
+            components.port = port
+            if let username, !username.isEmpty {
+                components.user = username
+                if let password, !password.isEmpty { components.password = password }
             }
-            
-            urlString += "\(address):\(port)"
-            return URL(string: urlString)
+            return components.url
         }
     }
     
@@ -76,7 +67,11 @@ actor ConnectionResolver {
         }
     }
     
-    private init() {}
+    init(lookup: @escaping @Sendable (String, Int) -> ResolvedAddress? = { hostname, port in
+        ConnectionResolver.blockingGetaddrinfo(hostname: hostname, port: port)
+    }) {
+        self.lookup = lookup
+    }
     
     // MARK: - Public API
     
@@ -91,6 +86,10 @@ actor ConnectionResolver {
         strategy: ResolutionStrategy = .hostnameFirst,
         timeout: TimeInterval = 10.0
     ) async throws -> ResolvedAddress {
+        try Task.checkCancellation()
+        guard (1...65535).contains(device.port), timeout.isFinite, timeout > 0 else {
+            throw ResolutionError.invalidDevice
+        }
         logger.info("🔍 Resolving address for '\(device.name)' using strategy: \(String(describing: strategy))")
         logger.info("🔍 Device info - hostname: \(device.hostname), ip: \(device.ipAddress), port: \(device.port)")
         
@@ -140,44 +139,43 @@ actor ConnectionResolver {
             failedAttempts.append("Cached IP (only method)")
         }
         
+        try Task.checkCancellation()
         logger.error("❌ All resolution methods failed for '\(device.name)'")
         throw ResolutionError.allMethodsFailed(attempts: failedAttempts)
     }
     
     /// Quick connection test to verify an address is reachable
     func testConnection(address: String, port: Int, timeout: TimeInterval = 3.0) async -> Bool {
-        return await withCheckedContinuation { continuation in
-            let host = NWEndpoint.Host(address)
-            let portEndpoint = NWEndpoint.Port(rawValue: UInt16(port))!
-            let connection = NWConnection(host: host, port: portEndpoint, using: .tcp)
-            
-            let didResume = AtomicFlag()
-            
-            // compareAndSwap is the only safe gate here: the state handler and
-            // the timeout run on different queues, and a read-then-write check
-            // lets both pass and resume the continuation twice (a crash).
+        guard !Task.isCancelled, !address.isEmpty, timeout.isFinite, timeout > 0,
+              let rawPort = UInt16(exactly: port), rawPort > 0,
+              let endpointPort = NWEndpoint.Port(rawValue: rawPort) else { return false }
+        let result = AsyncCallbackResult<Bool>()
+        let connection = NWConnection(host: NWEndpoint.Host(address), port: endpointPort, using: .tcp)
+        return await withTaskCancellationHandler {
             connection.stateUpdateHandler = { state in
                 switch state {
                 case .ready:
-                    guard didResume.compareAndSwap(expected: false, desired: true) else { return }
-                    connection.cancel()
-                    continuation.resume(returning: true)
+                    Task { await result.finish(true) }
                 case .failed, .cancelled:
-                    guard didResume.compareAndSwap(expected: false, desired: true) else { return }
-                    continuation.resume(returning: false)
+                    Task { await result.finish(false) }
                 default:
                     break
                 }
             }
             
             connection.start(queue: .global(qos: .userInitiated))
-            
-            // Timeout
-            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
-                guard didResume.compareAndSwap(expected: false, desired: true) else { return }
-                connection.cancel()
-                continuation.resume(returning: false)
+            let deadline = Task {
+                do { try await Task.sleep(for: .seconds(timeout)) } catch { return }
+                await result.finish(false)
             }
+            let reachable = await result.wait() ?? false
+            deadline.cancel()
+            connection.stateUpdateHandler = nil
+            connection.cancel()
+            return !Task.isCancelled && reachable
+        } onCancel: {
+            connection.cancel()
+            Task { await result.finish(false) }
         }
     }
     
@@ -212,7 +210,7 @@ actor ConnectionResolver {
         let hostname = cleanHostname(device.hostname)
         guard !hostname.isEmpty else { return nil }
         
-        let localHostname = hostname.hasSuffix(".local") ? hostname : "\(hostname).local"
+        let localHostname = hostname.contains(".") ? hostname : "\(hostname).local"
         logger.debug("🔍 Trying mDNS resolution: \(localHostname)")
         
         // Use getaddrinfo which respects mDNS
@@ -275,7 +273,7 @@ actor ConnectionResolver {
                 .resolved(await self.performGetaddrinfo(hostname: hostname, port: port))
             }
             group.addTask {
-                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                try? await Task.sleep(for: .seconds(timeout))
                 return .timedOut
             }
 
@@ -296,16 +294,23 @@ actor ConnectionResolver {
     
     /// Bridge the blocking getaddrinfo onto the dedicated queue.
     private func performGetaddrinfo(hostname: String, port: Int) async -> ResolvedAddress? {
-        let logger = self.logger
-        return await withCheckedContinuation { continuation in
+        let result = AsyncCallbackResult<ResolvedAddress>()
+        let lookup = self.lookup
+        return await withTaskCancellationHandler {
+            guard !Task.isCancelled else { return nil }
             Self.getaddrinfoQueue.async {
-                continuation.resume(returning: Self.blockingGetaddrinfo(hostname: hostname, port: port, logger: logger))
+                let address = lookup(hostname, port)
+                Task { await result.finish(address) }
             }
+            return await result.wait()
+        } onCancel: {
+            Task { await result.finish(nil) }
         }
     }
 
     /// Actual getaddrinfo call. Blocking; must only run on `getaddrinfoQueue`.
-    private static func blockingGetaddrinfo(hostname: String, port: Int, logger: Logger) -> ResolvedAddress? {
+    private static func blockingGetaddrinfo(hostname: String, port: Int) -> ResolvedAddress? {
+        let logger = Logger(subsystem: "com.tidaldrift", category: "ConnectionResolver")
         var hints = addrinfo()
         hints.ai_family = AF_INET // IPv4
         hints.ai_socktype = SOCK_STREAM
@@ -360,16 +365,12 @@ actor ConnectionResolver {
     /// Clean up hostname for resolution
     private func cleanHostname(_ hostname: String) -> String {
         // Remove trailing periods and normalize
-        var clean = hostname.trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        let clean = hostname.trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "."))
         
         // Handle cases where hostname might be an IP
         if NetworkUtils.isValidIPAddress(clean) {
             return ""
-        }
-        
-        // Remove .local. suffix variations
-        if clean.hasSuffix(".local.") {
-            clean = String(clean.dropLast(7)) + ".local"
         }
         
         return clean

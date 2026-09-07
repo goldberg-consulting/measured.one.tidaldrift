@@ -195,6 +195,13 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         self.device = device
         transport.delegate = self
         decoder.delegate = self
+        decoder.onError = { [weak self] message in
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.connectionStatus = message
+                self.requestKeyFrame()
+            }
+        }
     }
 
     func connect(password: String? = nil) async throws {
@@ -1415,6 +1422,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.delegate?.clientSession(self, didReceiveStreamResponse: response)
+                if !response.success { self.connectionStatus = response.message ?? "The host could not start this stream." }
                 if response.success {
                     self.streamingTargetName = response.streamingTarget ?? "Full Display"
                     self.connectionStatus = "Streaming: \(self.streamingTargetName)"

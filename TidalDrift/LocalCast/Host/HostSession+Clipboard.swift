@@ -41,7 +41,7 @@ extension HostSession {
             // connect and push.
             engine.fetchEager = { [weak self] offer, kind, completion in
                 guard let self else { return }
-                self.clipboardBulkHost.expectPush(token: offer.token, kind: kind, cacheDir: nil) { result in
+                self.clipboardBulkHost.expectPush(token: offer.token, kind: kind, offer: offer, cacheDir: nil) { result in
                     completion(result)
                 }
                 self.sendClipboardPacket(type: .clipboardFetchRequest, payload: offer.token, copies: 3)
@@ -53,7 +53,7 @@ extension HostSession {
                 }
                 let cacheDir = FileManager.default.temporaryDirectory
                     .appendingPathComponent("TidalDriftClipboard", isDirectory: true)
-                self.clipboardBulkHost.expectPush(token: offer.token, kind: .files, cacheDir: cacheDir) { result in
+                self.clipboardBulkHost.expectPush(token: offer.token, kind: .files, offer: offer, cacheDir: cacheDir) { result in
                     switch result {
                     case .success(.files(let urls)):
                         completion(.success(urls))

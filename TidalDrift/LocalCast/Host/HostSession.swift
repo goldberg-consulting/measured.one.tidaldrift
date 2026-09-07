@@ -30,26 +30,28 @@ final class CaptureTransitionQueue {
     private let lock = NSLock()
 
     func run(_ op: @escaping () async -> Void) async {
-        lock.lock()
-        let previous = lastTask
-        let task = Task {
-            await previous?.value
-            await op()
+        let task = lock.withLock {
+            let previous = lastTask
+            let task = Task {
+                await previous?.value
+                await op()
+            }
+            lastTask = task
+            return task
         }
-        lastTask = task
-        lock.unlock()
         await task.value
     }
 
     func runThrowing<T>(_ op: @escaping () async throws -> T) async throws -> T {
-        lock.lock()
-        let previous = lastTask
-        let task = Task { () throws -> T in
-            await previous?.value
-            return try await op()
+        let task = lock.withLock {
+            let previous = lastTask
+            let task = Task { () throws -> T in
+                await previous?.value
+                return try await op()
+            }
+            lastTask = Task { _ = try? await task.value }
+            return task
         }
-        lastTask = Task { _ = try? await task.value }
-        lock.unlock()
         return try await task.value
     }
 }
@@ -70,14 +72,37 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     let clipboardBulkHost = ClipboardBulkHost()
     var clipboardEngine: ClipboardSyncEngine?
     let captureTransitions = CaptureTransitionQueue()
+    let settingsRecovery = CaptureSettingsRecovery()
+    var onSettingsApplyFailed: ((String) -> Void)?
 
     /// Software display for lid-closed / headless hosting. Created on demand
     /// by `startFullDisplayCapture` when no physical display is capturable;
     /// torn down when the session stops or the viewer goes idle.
     let virtualDisplay = VirtualDisplayController()
 
-    var configuration: LocalCastConfiguration
-    var isRunning = false
+    private var storedConfiguration: LocalCastConfiguration
+    var configuration: LocalCastConfiguration {
+        get { sessionStateLock.lock(); defer { sessionStateLock.unlock() }; return storedConfiguration }
+        set { sessionStateLock.lock(); storedConfiguration = newValue; sessionStateLock.unlock() }
+    }
+    private var running = false
+    var isRunning: Bool {
+        get { sessionStateLock.lock(); defer { sessionStateLock.unlock() }; return running }
+        set { sessionStateLock.lock(); running = newValue; sessionStateLock.unlock() }
+    }
+    private var storedStreamingParameters: StreamingParameters?
+    var streamingParameters: StreamingParameters? {
+        sessionStateLock.lock()
+        defer { sessionStateLock.unlock() }
+        return storedStreamingParameters
+    }
+    private var dimensionUpdateTask: Task<Void, Never>?
+
+    private func storeStreamingParameters(_ parameters: StreamingParameters?) {
+        sessionStateLock.lock()
+        storedStreamingParameters = parameters
+        sessionStateLock.unlock()
+    }
 
     // MARK: - Cross-queue session state
     //
@@ -399,7 +424,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     /// and capture. Safe to call from any thread. `force` re-applies the current
     /// caps even when unchanged; a capture restart resets the stream to the
     /// configured fps, so the cap must be pushed again.
-    private func refreshThermalPolicy(force: Bool = false) {
+    func refreshThermalPolicy(force: Bool = false) {
         let state = configuration.thermalThrottle ? ProcessInfo.processInfo.thermalState : .nominal
         let cap: Int
         let scale: Double
@@ -436,39 +461,35 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         }
     }
 
-    /// Apply host-side runtime settings that do not require rebuilding the
-    /// capture or encoder session. Codec/resolution still require a restart.
-    func updateRuntimeConfiguration(_ newConfig: LocalCastConfiguration) {
-        let regionAwareChanged = configuration.regionAware != newConfig.regionAware
-        let profileChanged = configuration.transportProfile != newConfig.transportProfile
-        let thermalChanged = configuration.thermalThrottle != newConfig.thermalThrottle
-        configuration.adaptiveQuality = newConfig.adaptiveQuality
-        configuration.regionAware = newConfig.regionAware
-        configuration.forwardErrorCorrection = newConfig.forwardErrorCorrection
-        configuration.captureCursor = newConfig.captureCursor
-        configuration.transportProfile = newConfig.transportProfile
-        configuration.thermalThrottle = newConfig.thermalThrottle
+    /// Rebuild capture when needed while preserving the authenticated transport
+    /// and clipboard channel. Security changes take effect on the next host start.
+    func updateRuntimeConfiguration(_ newConfig: LocalCastConfiguration) async {
+        let previous = configuration
+        let rebuild = previous.codec != newConfig.codec
+            || previous.maxDimensionOverride != newConfig.maxDimensionOverride
+            || previous.qualityPreset != newConfig.qualityPreset
+            || previous.regionAware != newConfig.regionAware
+        if rebuild, isCaptureActive {
+            settingsRecovery.remember(configuration: previous, parameters: streamingParameters)
+        }
+        var updated = newConfig
+        updated.requireAuthentication = previous.requireAuthentication
+        updated.inputRateLimit = previous.inputRateLimit
+        configuration = updated
         transport.fecEnabled = newConfig.forwardErrorCorrection
-        if profileChanged {
+        if previous.transportProfile != newConfig.transportProfile {
             applyConfiguredTransportProfile()
         }
-        if thermalChanged {
+        if previous.thermalThrottle != newConfig.thermalThrottle {
             refreshThermalPolicy()
         }
-        Task {
-            // Toggling region-aware changes the capture pixel format (BGRA tiles
-            // vs NV12 video), which is fixed at stream creation. Restart the live
-            // capture so the format matches the new mode; the restart also applies
-            // the latest cursor setting, so updateCursorCapture is only needed
-            // when the capture is not being rebuilt.
-            if regionAwareChanged, self.withCaptureState({ self.captureActive }) {
-                self.captureManager.captureCursor = newConfig.captureCursor
-                await self.retarget(to: self.captureTarget)
-            } else {
-                await self.captureManager.updateCursorCapture(newConfig.captureCursor)
-            }
+        captureManager.captureCursor = newConfig.captureCursor
+        if rebuild {
+            resetCaptureRestartAttempts()
+            await retarget(to: captureTarget)
+        } else {
+            await captureManager.updateCursorCapture(newConfig.captureCursor)
         }
-        logger.info("Runtime LocalCast settings: adaptive=\(newConfig.adaptiveQuality), regionAware=\(newConfig.regionAware), FEC=\(newConfig.forwardErrorCorrection), remoteCursor=\(newConfig.captureCursor), transport=\(newConfig.transportProfile.rawValue)")
     }
 
     // MARK: - Transport profile (Fast LAN vs Resilient)
@@ -496,7 +517,8 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     /// Effective encoder bitrate target for the active profile.
     var effectiveBitrateMbps: Int {
         profileLock.lock(); defer { profileLock.unlock() }
-        return _fastLANActive ? configuration.fastLANBitrateMbps : configuration.bitrateMbps
+        return streamingParameters?.bitrateMbps
+            ?? (_fastLANActive ? configuration.fastLANBitrateMbps : configuration.bitrateMbps)
     }
 
     /// Push the current `_fastLANActive` decision to the transport and encoder.
@@ -512,7 +534,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         let ceiling = active ? transport.keyframeByteCeiling() : nil
         encoder.setFastLAN(keyframeCeilingBytes: ceiling)
         if withCaptureState({ captureActive }) {
-            encoder.updateLiveParameters(bitrateMbps: active ? configuration.fastLANBitrateMbps : configuration.bitrateMbps)
+            adaptiveQueue.async { [weak self] in self?.applyAdaptiveBitrate() }
         }
     }
 
@@ -734,12 +756,16 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     }
 
     init(configuration: LocalCastConfiguration, password: String? = nil) {
-        self.configuration = configuration
+        self.storedConfiguration = configuration
         self.lastRequestedFps = configuration.targetFrameRate
         captureManager.delegate = self
         captureManager.captureCursor = configuration.captureCursor
         captureManager.regionAwareCapture = configuration.regionAware
         encoder.delegate = self
+        encoder.onError = { [weak self] message in
+            guard let self, self.isRunning else { return }
+            self.screenCaptureManager(self.captureManager, didFailWithError: LocalCastError.connectionFailed(message))
+        }
         transport.delegate = self
         transport.onListenerFailed = { [weak self] in
             guard let self, self.isRunning else { return }
@@ -785,6 +811,9 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             return
         }
 
+        if configuration.requireAuthentication && hostPassword == nil {
+            throw LocalCastError.connectionFailed("Set a host password before enabling authenticated hosting.")
+        }
         self.captureTarget = target
         logger.info("Starting host session with target: \(String(describing: target))")
         transport.fecEnabled = configuration.forwardErrorCorrection
@@ -836,6 +865,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
 
     /// Start ScreenCaptureKit once a client is connected and authenticated.
     func beginCaptureForClient() {
+        guard isRunning, hasActiveClient, authState == .authenticated else { return }
         // Claim the capture slot synchronously. ScreenCaptureKit setup happens
         // in the async task below, so without claiming up front a burst of
         // client packets (heartbeat + keyframe request arriving together) would
@@ -850,7 +880,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
 
         Task {
             await captureTransitions.run { [weak self] in
-                guard let self else { return }
+                guard let self, self.isRunning, self.hasActiveClient, self.authState == .authenticated else { return }
                 do {
                     // Region-aware tiles need tightly-packed BGRA; the default video
                     // path captures NV12. Choose the capture format from the current
@@ -871,12 +901,24 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
                     self.resetCaptureRestartAttempts()
                     // A fresh capture/encoder starts at the configured fps/bitrate;
                     // re-impose any active thermal caps on the new session.
+                    self.settingsRecovery.captureStarted()
+                    self.restoreStreamingParameters()
                     self.refreshThermalPolicy(force: true)
+                    self.forceInitialKeyframes()
                     self.logger.info("✅ Capture started for connected client")
                 } catch {
                     self.logger.error("❌ Failed to start capture for client: \(error.localizedDescription)")
                     self.withCaptureState { self.captureActive = false }
                     self.endStreamActivity()
+                    if self.restorePreviousCaptureSettings(after: error) {
+                        await self.captureManager.stopCapture()
+                        self.encoder.invalidate()
+                        self.beginCaptureForClient()
+                        return
+                    }
+                    if let endpoint = self.clientEndpoint {
+                        self.sendStreamError(error.localizedDescription, to: endpoint)
+                    }
                     self.recoverFromCaptureStartFailure(error)
                 }
             }
@@ -918,12 +960,19 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             return
         }
 
-        let fps = tuning.effectiveFps
-        let bitrate = tuning.effectiveBitrateMbps
-        let quality = tuning.effectiveEncoderQuality
-        let kfi = tuning.effectiveKeyframeInterval
-
-        logger.info("Applying live quality: \(bitrate)Mbps, \(fps)fps, q=\(quality), kfi=\(kfi)s")
+        let oldDimension = effectiveMaxCaptureDimension
+        let parameters = StreamingParameters(tuning)
+        if oldDimension != parameters.captureDimension(configuration: configuration), isCaptureActive {
+            settingsRecovery.remember(configuration: configuration, parameters: streamingParameters)
+        }
+        storeStreamingParameters(parameters)
+        let fps = parameters.fps
+        let bitrate = parameters.bitrateMbps
+        let quality = parameters.quality
+        let kfi = parameters.keyframeInterval
+        if oldDimension != effectiveMaxCaptureDimension {
+            scheduleDimensionUpdate()
+        }
 
         // Apply encoder property changes on the same serial queue the adaptive
         // controller uses, never on the caller's (often main) thread. A
@@ -935,7 +984,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
 
             self.lastRequestedFps = fps
             let cappedFps = min(fps, self.thermalFpsCap)
-            let cappedBitrate = max(Int(Double(bitrate) * self.thermalBitrateScale), 5)
+            let cappedBitrate = max(Int(Double(bitrate) * self.adaptiveScale * self.thermalBitrateScale), 5)
 
             self.encoder.updateLiveParameters(
                 bitrateMbps: cappedBitrate,
@@ -943,10 +992,6 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
                 quality: quality,
                 keyframeIntervalSeconds: kfi
             )
-
-            // Emit a fresh keyframe so the viewer resyncs immediately after the
-            // parameter change instead of waiting for the next scheduled keyframe.
-            self.encoder.forceKeyFrame()
 
             guard self.withCaptureState({ self.captureActive }) else { return }
 
@@ -956,8 +1001,59 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         }
     }
 
+    private func restorePreviousCaptureSettings(after error: Error) -> Bool {
+        guard let previous = settingsRecovery.takeFallback() else { return false }
+        var restored = configuration
+        restored.codec = previous.configuration.codec
+        restored.maxDimensionOverride = previous.configuration.maxDimensionOverride
+        restored.qualityPreset = previous.configuration.qualityPreset
+        restored.regionAware = previous.configuration.regionAware
+        configuration = restored
+        storeStreamingParameters(previous.parameters)
+        let message = "Could not apply streaming settings. Restoring the previous working settings: \(error.localizedDescription)"
+        onSettingsApplyFailed?(message)
+        if let endpoint = clientEndpoint { sendStreamError(message, to: endpoint) }
+        return true
+    }
+
+    /// Reapply the last requested values after any encoder or display rebuild.
+    func restoreStreamingParameters() {
+        guard let parameters = streamingParameters else { return }
+        adaptiveQueue.async { [weak self] in
+            guard let self, self.isRunning else { return }
+            self.lastRequestedFps = parameters.fps
+            self.encoder.updateLiveParameters(
+                fps: min(parameters.fps, self.thermalFpsCap),
+                quality: parameters.quality,
+                keyframeIntervalSeconds: parameters.keyframeInterval
+            )
+            self.applyAdaptiveBitrate()
+            Task { await self.captureManager.updateFrameRate(min(parameters.fps, self.thermalFpsCap)) }
+        }
+    }
+
+    private func cancelDimensionUpdate() {
+        sessionStateLock.lock()
+        dimensionUpdateTask?.cancel()
+        dimensionUpdateTask = nil
+        sessionStateLock.unlock()
+    }
+
+    private func scheduleDimensionUpdate() {
+        sessionStateLock.lock()
+        dimensionUpdateTask?.cancel()
+        dimensionUpdateTask = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: 600_000_000) } catch { return }
+            guard let self, self.isRunning else { return }
+            await self.retarget(to: self.captureTarget)
+        }
+        sessionStateLock.unlock()
+    }
+
     func stop() async {
         guard isRunning else { return }
+        isRunning = false
+        cancelDimensionUpdate()
 
         clientIdleTimer?.cancel()
         clientIdleTimer = nil
@@ -1170,6 +1266,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             return had
         }
         guard wasActive, hasActiveClient else { return }
+        _ = restorePreviousCaptureSettings(after: error)
 
         captureRestartLock.lock()
         captureRestartAttempts += 1
@@ -1187,7 +1284,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
                 // Brief backoff so a display reconfiguration can settle first.
                 try? await Task.sleep(nanoseconds: 800_000_000)
             }
-            guard self.hasActiveClient else { return }
+            guard self.isRunning, self.hasActiveClient else { return }
             self.logger.info("🔄 Restarting capture after failure (attempt \(attempt))")
             self.beginCaptureForClient()
             self.encoder.forceKeyFrame()
@@ -1197,6 +1294,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     // MARK: - VideoEncoderDelegate
 
     func videoEncoder(_ encoder: VideoEncoder, didOutput packet: Data, isKeyFrame: Bool, timestamp: CMTime) {
+        if isCaptureActive { settingsRecovery.encodedFrame() }
         // Prefer using the stored connection for reliable delivery
         guard hasActiveClient else { return }
 
@@ -1457,7 +1555,8 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     /// further reduced by any transport-capacity cap imposed when keyframes were
     /// too large to deliver. Read on the capture-setup path.
     var effectiveMaxCaptureDimension: Int {
-        let configured = configuration.maxCaptureDimension
+        let configured = streamingParameters?.captureDimension(configuration: configuration)
+            ?? configuration.maxCaptureDimension
         let cap = capacityDimensionCap
         return cap > 0 ? min(configured, cap) : configured
     }
@@ -1818,7 +1917,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         }
 
         await captureTransitions.run { [weak self] in
-            guard let self else { return }
+            guard let self, self.isRunning else { return }
             let hadCapture = self.withCaptureState { () -> Bool in
                 let had = self.captureActive
                 self.captureActive = false

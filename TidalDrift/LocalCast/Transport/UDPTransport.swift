@@ -154,9 +154,10 @@ class UDPTransport {
 
     /// Forget every buffer for one frame. Must be called with `fragmentLock` held.
     private func dropFrameLocked(_ frameId: UInt32) {
-        let freed = (fragmentBuffers[frameId]?.values.reduce(0) { $0 + $1.count } ?? 0)
-            + (parityBuffers[frameId]?.values.reduce(0) { $0 + $1.count } ?? 0)
-            + (qParityBuffers[frameId]?.values.reduce(0) { $0 + $1.count } ?? 0)
+        let dataBytes = fragmentBuffers[frameId]?.values.reduce(0) { $0 + $1.count } ?? 0
+        let parityBytes = parityBuffers[frameId]?.values.reduce(0) { $0 + $1.count } ?? 0
+        let qParityBytes = qParityBuffers[frameId]?.values.reduce(0) { $0 + $1.count } ?? 0
+        let freed = dataBytes + parityBytes + qParityBytes
         bufferedFragmentBytes = max(0, bufferedFragmentBytes - freed)
         fragmentBuffers.removeValue(forKey: frameId)
         fragmentCounts.removeValue(forKey: frameId)
@@ -267,10 +268,10 @@ class UDPTransport {
     var isFastLAN: Bool { fastLANEnabled }
 
     /// Apply transport-level Fast LAN behavior. Pacing and the reassembly window
-    /// flip live; the jumbo payload size takes effect on the next sent frame.
-    /// `jumbo` is gated by the caller (explicit Fast LAN only) because it only
-    /// works when the path supports a 9000-byte MTU.
-    func setFastLAN(_ enabled: Bool, jumbo: Bool) {
+    /// flip live. Jumbo datagrams additionally require an independently
+    /// validated end-to-end MTU; selecting Fast LAN is not MTU evidence.
+    /// Until path probing supplies that value, every profile stays MTU-safe.
+    func setFastLAN(_ enabled: Bool, jumbo: Bool, validatedPathMTU: Int? = nil) {
         pacingLock.lock()
         _fastLANEnabled = enabled
         // Enabling Fast LAN drops pacing, so clear any widened gap from a prior
@@ -284,8 +285,16 @@ class UDPTransport {
 
         fragmentLock.lock()
         inFlightFrameWindow = enabled ? Self.fastLANInFlightFrameWindow : Self.defaultInFlightFrameWindow
-        _maxPayloadSize = (enabled && jumbo) ? Self.jumboPayloadSize : Self.defaultPayloadSize
+        _maxPayloadSize = Self.payloadSize(fastLAN: enabled, jumbo: jumbo, validatedPathMTU: validatedPathMTU)
         fragmentLock.unlock()
+    }
+
+    /// An explicit profile choice cannot establish the MTU of every hop.
+    static func payloadSize(fastLAN: Bool, jumbo: Bool, validatedPathMTU: Int?) -> Int {
+        guard fastLAN, jumbo, let validatedPathMTU, validatedPathMTU >= 9000 else {
+            return defaultPayloadSize
+        }
+        return jumboPayloadSize
     }
 
     /// Largest keyframe, in bytes, that fits under the receiver fragment cap at
@@ -511,7 +520,7 @@ class UDPTransport {
         // Check if we need to fragment. Only video frames are "droppable" by the
         // receiver's drop-to-newest reassembly; tiles and control packets must
         // be delivered whole (a lost tile is healed by periodic refresh instead).
-        if data.count > maxPayloadSize {
+        if data.count + FragmentHeader.size > maxPayloadSize {
             sendFragmented(data: data, on: connection, droppable: packet.type == .videoFrame)
         } else {
             // Small packet, send directly with a "no fragment" header
@@ -539,7 +548,7 @@ class UDPTransport {
 
     private func sendFragmented(data: Data, on connection: NWConnection, droppable: Bool) {
         fragmentLock.lock()
-        frameCounter += 1
+        frameCounter &+= 1
         let frameId = (frameCounter & ~Self.droppableFrameFlag) | (droppable ? Self.droppableFrameFlag : 0)
         let currentMaxPayload = _maxPayloadSize
         fragmentLock.unlock()
@@ -555,8 +564,10 @@ class UDPTransport {
         // it here and signal the host to reduce encode load so the next keyframe
         // fits. Computed from the current payload size, so the threshold is
         // correct under both default and jumbo MTUs.
-        if droppable && totalFragmentCount > Int(maxTotalFragments) {
-            signalOverCapacity(fragments: totalFragmentCount, limit: Int(maxTotalFragments))
+        guard totalFragmentCount <= Int(maxTotalFragments) else {
+            if droppable {
+                signalOverCapacity(fragments: totalFragmentCount, limit: Int(maxTotalFragments))
+            }
             return
         }
 
@@ -898,7 +909,7 @@ class UDPTransport {
             fragmentBuffers[realFrameId] = [:]
             fragmentCounts[realFrameId] = header.totalFragments
             frameDroppable[realFrameId] = droppable
-        } else if fragmentCounts[realFrameId] != header.totalFragments {
+        } else if fragmentCounts[realFrameId] != header.totalFragments || frameDroppable[realFrameId] != droppable {
             return false
         }
 
@@ -909,16 +920,19 @@ class UDPTransport {
             let isQParity = (header.fragmentIndex & Self.fecQParityFlag) != 0
             if isQParity {
                 if qParityBuffers[realFrameId] == nil { qParityBuffers[realFrameId] = [:] }
-                if qParityBuffers[realFrameId]?[blockIndex] == nil { bufferedFragmentBytes += payload.count }
+                if let existing = qParityBuffers[realFrameId]?[blockIndex] { return existing == payload }
+                bufferedFragmentBytes += payload.count
                 qParityBuffers[realFrameId]?[blockIndex] = Data(payload)
             } else {
                 if parityBuffers[realFrameId] == nil { parityBuffers[realFrameId] = [:] }
-                if parityBuffers[realFrameId]?[blockIndex] == nil { bufferedFragmentBytes += payload.count }
+                if let existing = parityBuffers[realFrameId]?[blockIndex] { return existing == payload }
+                bufferedFragmentBytes += payload.count
                 parityBuffers[realFrameId]?[blockIndex] = Data(payload)
             }
             recoverBlock(realFrameId, blockIndex: blockIndex, totalFragments: Int(header.totalFragments))
         } else {
-            if fragmentBuffers[realFrameId]?[header.fragmentIndex] == nil { bufferedFragmentBytes += payload.count }
+            if let existing = fragmentBuffers[realFrameId]?[header.fragmentIndex] { return existing == payload }
+            bufferedFragmentBytes += payload.count
             fragmentBuffers[realFrameId]?[header.fragmentIndex] = Data(payload)
             recoverBlock(realFrameId, blockIndex: header.fragmentIndex / UInt16(fecBlockSize), totalFragments: Int(header.totalFragments))
         }
@@ -943,9 +957,12 @@ class UDPTransport {
         }
         
         let payload = data.dropFirst(FragmentHeader.size)
-        
+        guard !payload.isEmpty, payload.count == Int(header.payloadLength),
+              payload.count <= Self.jumboPayloadSize - FragmentHeader.size else { return }
+
         // Single fragment (no reassembly needed)
         if header.totalFragments == 1 {
+            guard header.fragmentIndex == 0 else { return }
             deliverUnfragmented(Data(payload), count: count, from: endpoint)
             return
         }
@@ -1234,4 +1251,3 @@ class UDPTransport {
         }
     }
 }
-

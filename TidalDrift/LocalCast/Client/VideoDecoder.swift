@@ -8,566 +8,203 @@ protocol VideoDecoderDelegate: AnyObject {
     func videoDecoder(_ decoder: VideoDecoder, didDecode imageBuffer: CVImageBuffer)
 }
 
-class VideoDecoder {
+/// Decodes complete access units with mandatory hardware acceleration.
+/// Session operations are serialized with teardown; output callbacks do not take
+/// the session lock because VideoToolbox may invoke them on another thread.
+final class VideoDecoder {
     private let logger = Logger(subsystem: "com.tidaldrift", category: "VideoDecoder")
     weak var delegate: VideoDecoderDelegate?
-    
+    /// Called on the decode worker. The owner must move UI updates to MainActor.
+    var onError: ((String) -> Void)?
+
+    private let sessionLock = NSRecursiveLock()
     private var decompressionSession: VTDecompressionSession?
     private var formatDescription: CMVideoFormatDescription?
-    
-    // Store parameter sets for session creation
-    private var sps: Data?
-    private var pps: Data?
-    private var vps: Data? // For HEVC
-    
-    private var isHEVC = false
-    private var frameCount = 0
-    private var hasLoggedFirstFrame = false
+    private var parameterSets: [Int: Data] = [:]
+    private var codec: LocalCastConfiguration.Codec = .h264
+    private var hardwareAccelerated = false
+    private var lastError: String?
+    private var needsKeyFrame = true
 
-    /// Codec currently being decoded, for the stats HUD.
-    var codecName: String { isHEVC ? "HEVC" : "H.264" }
-    
+    var codecName: String {
+        sessionLock.lock(); defer { sessionLock.unlock() }
+        return codec == .hevc ? "HEVC" : "H.264"
+    }
+
+    var isHardwareAccelerated: Bool {
+        sessionLock.lock(); defer { sessionLock.unlock() }
+        return hardwareAccelerated
+    }
+
     deinit {
-        // SAFETY: The VTDecompressionSession callback holds an unretained pointer
-        // to self. Invalidate before deallocation to prevent use-after-free.
-        if let session = decompressionSession {
-            VTDecompressionSessionInvalidate(session)
-        }
+        if let session = decompressionSession { VTDecompressionSessionInvalidate(session) }
     }
-    
+
     func decode(_ data: Data) {
-        // Log incoming data for debugging
-        if frameCount == 0 {
-            let hexPrefix = data.prefix(32).map { String(format: "%02X", $0) }.joined(separator: " ")
-            logger.info("🎬 First packet received! \(data.count) bytes. First 32: \(hexPrefix)")
-        }
-        
-        // Check if data starts with Annex B start code (00 00 00 01 or 00 00 01)
-        let hasAnnexBStartCode = data.withUnsafeBytes { (buf: UnsafeRawBufferPointer) -> Bool in
-            guard let b = buf.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return false }
-            let n = buf.count
-            return (n >= 4 && b[0] == 0 && b[1] == 0 && b[2] == 0 && b[3] == 1) ||
-                   (n >= 3 && b[0] == 0 && b[1] == 0 && b[2] == 1)
-        }
-        
-        if hasAnnexBStartCode {
-            // Parse NAL units from Annex B format
-            let nalUnits = parseNALUnits(from: data)
-            if nalUnits.isEmpty && frameCount < 10 {
-                lcDebug("🎬 VideoDecoder: No NAL units parsed from Annex B data")
-            }
-            for nal in nalUnits {
-                handleNALUnit(nal)
-            }
-        } else {
-            // Assume AVCC format (length-prefixed) - parse accordingly
-            parseAVCCNALUnits(from: data)
-        }
-    }
-    
-    /// Parse NAL units from AVCC format (4-byte length prefix).
-    /// Scans the buffer in place and copies only the NAL payloads, avoiding a
-    /// full-frame `[UInt8]` allocation per frame.
-    private func parseAVCCNALUnits(from data: Data) {
-        var nalUnits: [Data] = []
-        data.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
-            guard let base = buf.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
-            let count = buf.count
-            var offset = 0
-            while offset + 4 < count {
-                let length = Int(base[offset]) << 24 | Int(base[offset+1]) << 16 | Int(base[offset+2]) << 8 | Int(base[offset+3])
-                offset += 4
-                if length <= 0 || offset + length > count {
-                    if frameCount < 10 {
-                        lcDebug("🎬 VideoDecoder: Invalid AVCC NAL length \(length) at offset \(offset-4)")
-                    }
-                    break
-                }
-                nalUnits.append(Data(bytes: base + offset, count: length))
-                offset += length
-            }
-        }
-        for nal in nalUnits {
-            handleNALUnit(nal)
-        }
-    }
-    
-    /// Parse NAL units from Annex B format (start code prefixed).
-    /// Scans for start codes over the raw buffer and copies only the NAL
-    /// payloads, avoiding a full-frame `[UInt8]` allocation per frame.
-    private func parseNALUnits(from data: Data) -> [Data] {
-        var nalUnits: [Data] = []
-        
-        data.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
-            guard let base = buf.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
-            let count = buf.count
-            
-            // Record (position, startCodeLength) for every start code.
-            var starts: [(pos: Int, codeLen: Int)] = []
-            var i = 0
-            while i + 3 < count {
-                if base[i] == 0 && base[i+1] == 0 && base[i+2] == 0 && base[i+3] == 1 {
-                    starts.append((i, 4))
-                    i += 4
-                } else if base[i] == 0 && base[i+1] == 0 && base[i+2] == 1 {
-                    starts.append((i, 3))
-                    i += 3
-                } else {
-                    i += 1
-                }
-            }
-            
-            for j in 0..<starts.count {
-                let nalStart = starts[j].pos + starts[j].codeLen
-                let nalEnd = (j + 1 < starts.count) ? starts[j + 1].pos : count
-                if nalStart < nalEnd {
-                    nalUnits.append(Data(bytes: base + nalStart, count: nalEnd - nalStart))
-                }
-            }
-        }
-        
-        // Log parsing results for debugging
-        if nalUnits.isEmpty {
-            logger.warning("🎬 NAL parser: No NAL units found in \(data.count) bytes")
-        } else if frameCount == 0 {
-            logger.info("🎬 NAL parser: Found \(nalUnits.count) NAL units from \(data.count) bytes")
-            for (idx, nal) in nalUnits.prefix(5).enumerated() {
-                let nalType = nal.first.map { $0 & 0x1F } ?? 0
-                logger.info("🎬   NAL[\(idx)]: type=\(nalType), size=\(nal.count)")
-            }
-        }
-        
-        return nalUnits
-    }
-    
-    private func handleNALUnit(_ nalUnit: Data) {
-        guard !nalUnit.isEmpty else { return }
-        
-        let firstByte = nalUnit[0]
+        guard let accessUnit = VideoAccessUnit(data: data) else { return }
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
 
-        // Once the stream is known to be HEVC, route via HEVC NAL types. H.264
-        // and HEVC type encodings overlap (e.g. HEVC IDR type 19 shares the low
-        // 5 bits with H.264 SEI type 6), so guessing per-NAL silently drops HEVC
-        // keyframes. Param sets (VPS/SPS/PPS) flip isHEVC below.
-        if isHEVC {
-            handleHEVCNAL(nalUnit, firstByte: firstByte)
-            return
+        if let incomingCodec = accessUnit.codecHint, incomingCodec != codec {
+            resetSession()
+            parameterSets.removeAll()
+            codec = incomingCodec
         }
 
-        let h264NalType = firstByte & 0x1F  // H.264 NAL type (lower 5 bits)
-        
-        // Debug first few NAL units
-        if frameCount < 5 {
-            lcDebug("🎬 VideoDecoder: NAL unit - firstByte=0x\(String(format: "%02X", firstByte)), H264Type=\(h264NalType), size=\(nalUnit.count)")
+        let parameterTypes = codec == .hevc ? [32, 33, 34] : [7, 8]
+        var nextSets = parameterSets
+        for nal in accessUnit.nalUnits {
+            let type = codec == .hevc ? Int((nal[0] >> 1) & 0x3F) : Int(nal[0] & 0x1F)
+            if parameterTypes.contains(type) {
+                guard nal.count <= 65_536 else { return }
+                nextSets[type] = nal
+            }
         }
-        
-        // Try H.264 first (default codec)
-        switch h264NalType {
-        case 7:  // SPS (H.264)
-            // SPS should be small (typically < 100 bytes)
-            if nalUnit.count > 500 {
-                logger.warning("🎬 Suspicious SPS size: \(nalUnit.count) bytes (expected < 100)")
-                return
-            }
-            logger.info("🎬 ✅ Received H.264 SPS (\(nalUnit.count) bytes)")
-            // A different SPS means the host changed resolution/params mid-session
-            // (e.g. the capacity ladder reduced capture size) with no client-driven
-            // stream switch. tryCreateSession early-returns while formatDescription
-            // is non-nil, so without tearing down here the new, smaller keyframe is
-            // decoded against the stale (e.g. 4K) session and fails silently. Rebuild
-            // from the new parameter sets. invalidate() clears formatDescription, the
-            // session, and stored SPS/PPS so tryCreateSession rebuilds once the new
-            // PPS arrives in this same keyframe.
-            if let existing = sps, existing != nalUnit {
-                logger.info("🎬 H.264 SPS changed -- rebuilding decode session")
-                invalidate()
-            }
-            sps = nalUnit
-            isHEVC = false
-            tryCreateSession()
-            return
-            
-        case 8:  // PPS (H.264)
-            // PPS should be small (typically < 50 bytes)
-            if nalUnit.count > 500 {
-                logger.warning("🎬 Suspicious PPS size: \(nalUnit.count) bytes (expected < 50)")
-                return
-            }
-            logger.info("🎬 ✅ Received H.264 PPS (\(nalUnit.count) bytes)")
-            pps = nalUnit
-            isHEVC = false
-            tryCreateSession()
-            return
-            
-        case 1:  // Non-IDR slice (H.264)
-            frameCount += 1
-            decodeVideoFrame(nalUnit)
-            return
-            
-        case 5:  // IDR slice (H.264)
-            frameCount += 1
-            if !hasLoggedFirstFrame {
-                lcDebug("🎬 VideoDecoder: ✅ Decoding first H.264 IDR frame!")
-                hasLoggedFirstFrame = true
-            }
-            decodeVideoFrame(nalUnit)
-            return
-            
-        case 6:  // SEI (Supplemental Enhancement Info)
-            // Skip SEI NAL units
-            return
-            
-        case 9:  // Access Unit Delimiter
-            // Skip AUD
-            return
-            
-        default:
-            break
+        // Rebuild for VPS and PPS changes too, after collecting the entire
+        // packet, so new SPS never gets paired with a previous picture's PPS.
+        if nextSets != parameterSets {
+            resetSession()
+            parameterSets = nextSets
         }
-        
-        // Not recognized as H.264: may be an HEVC param set that flips the stream
-        // to HEVC, after which all NALs route through handleHEVCNAL.
-        handleHEVCNAL(nalUnit, firstByte: firstByte)
+        if needsKeyFrame, !accessUnit.isRandomAccess(codec: codec) { return }
+        if decompressionSession == nil {
+            guard parameterTypes.allSatisfy({ parameterSets[$0] != nil }) else { return }
+            guard createSession(parameterTypes: parameterTypes) else { return }
+        }
+        let picture = accessUnit.pictureNALUnits(codec: codec)
+        guard !picture.isEmpty else { return }
+        decodePicture(VideoAccessUnit.lengthPrefixed(picture))
     }
 
-    /// Handle a NAL as HEVC. Param sets (VPS/SPS/PPS) set `isHEVC` and create the
-    /// session; VCL units are decoded.
-    private func handleHEVCNAL(_ nalUnit: Data, firstByte: UInt8) {
-        guard nalUnit.count >= 2 else { return }
-        let hevcNalType = (firstByte >> 1) & 0x3F
-
-        switch hevcNalType {
-        case 32:  // VPS
-            lcDebug("🎬 VideoDecoder: ✅ Received HEVC VPS (\(nalUnit.count) bytes)")
-            vps = nalUnit
-            isHEVC = true
-            return
-
-        case 33:  // SPS
-            lcDebug("🎬 VideoDecoder: ✅ Received HEVC SPS (\(nalUnit.count) bytes)")
-            // A different SPS means the host changed resolution/params mid-session
-            // (e.g. the capacity ladder reduced capture size). Rebuild the decode
-            // session from the new parameter sets, otherwise the new keyframe is
-            // decoded against the stale session and fails silently. The matching
-            // VPS for this keyframe arrived just before this SPS; preserve it across
-            // invalidate() (which clears VPS) so the rebuild keeps the correct VPS.
-            if let existing = sps, existing != nalUnit {
-                lcDebug("🎬 VideoDecoder: HEVC SPS changed -- rebuilding decode session")
-                let freshVPS = vps
-                invalidate()
-                vps = freshVPS
+    private func createSession(parameterTypes: [Int]) -> Bool {
+        let sets = parameterTypes.compactMap { parameterSets[$0] }.map { $0 as NSData }
+        let pointers = sets.map { $0.bytes.assumingMemoryBound(to: UInt8.self) }
+        let sizes = sets.map(\.length)
+        var description: CMFormatDescription?
+        let formatStatus = withExtendedLifetime(sets) {
+            if codec == .hevc {
+                return CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+                    allocator: kCFAllocatorDefault, parameterSetCount: pointers.count,
+                    parameterSetPointers: pointers, parameterSetSizes: sizes,
+                    nalUnitHeaderLength: 4, extensions: nil, formatDescriptionOut: &description)
             }
-            sps = nalUnit
-            isHEVC = true
-            tryCreateSession()
-            return
-
-        case 34:  // PPS
-            lcDebug("🎬 VideoDecoder: ✅ Received HEVC PPS (\(nalUnit.count) bytes)")
-            pps = nalUnit
-            isHEVC = true
-            tryCreateSession()
-            return
-
-        case 0...9, 16...21:  // HEVC VCL NAL units (incl. IDR 19/20, CRA 21)
-            if isHEVC {
-                frameCount += 1
-                if !hasLoggedFirstFrame {
-                    lcDebug("🎬 VideoDecoder: ✅ Decoding first HEVC frame!")
-                    hasLoggedFirstFrame = true
-                }
-                decodeVideoFrame(nalUnit)
-            }
-            return
-
-        default:
-            // Unknown: decode if a session already exists, else ignore.
-            if decompressionSession != nil {
-                frameCount += 1
-                decodeVideoFrame(nalUnit)
-            } else if frameCount < 10 {
-                lcDebug("🎬 VideoDecoder: Unknown NAL (hevcType=\(hevcNalType)), size=\(nalUnit.count)")
-            }
+            return CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                allocator: kCFAllocatorDefault, parameterSetCount: pointers.count,
+                parameterSetPointers: pointers, parameterSetSizes: sizes,
+                nalUnitHeaderLength: 4, formatDescriptionOut: &description)
         }
-    }
-    
-    private func tryCreateSession() {
-        guard sps != nil, pps != nil else { return }
-        guard formatDescription == nil else { return } // Already created
-        
-        if isHEVC {
-            createHEVCSession()
-        } else {
-            createH264Session()
+        guard formatStatus == noErr, let description else {
+            reportError("Invalid compressed video format (\(formatStatus)). Waiting for a fresh keyframe.")
+            return false
         }
-    }
-    
-    private func createH264Session() {
-        guard let spsData = sps, let ppsData = pps else { return }
-        
-        logger.info("🎬 Creating H.264 session with SPS(\(spsData.count) bytes) PPS(\(ppsData.count) bytes)")
-        
-        var formatDesc: CMFormatDescription?
-        
-        // Convert Data to arrays to ensure stable pointers
-        let spsArray = [UInt8](spsData)
-        let ppsArray = [UInt8](ppsData)
-        
-        spsArray.withUnsafeBufferPointer { spsBuffer in
-            ppsArray.withUnsafeBufferPointer { ppsBuffer in
-                var parameterSetPointers: [UnsafePointer<UInt8>] = [
-                    spsBuffer.baseAddress!,
-                    ppsBuffer.baseAddress!
-                ]
-                var parameterSetSizes: [Int] = [spsArray.count, ppsArray.count]
-                
-                let status = CMVideoFormatDescriptionCreateFromH264ParameterSets(
-                    allocator: kCFAllocatorDefault,
-                    parameterSetCount: 2,
-                    parameterSetPointers: &parameterSetPointers,
-                    parameterSetSizes: &parameterSetSizes,
-                    nalUnitHeaderLength: 4,
-                    formatDescriptionOut: &formatDesc
-                )
-                
-                if status != noErr {
-                    lcDebug("🎬 VideoDecoder: ❌ Failed to create H.264 format description: \(status)")
-                } else {
-                    lcDebug("🎬 VideoDecoder: ✅ Created H.264 format description")
-                }
-            }
-        }
-        
-        guard let fd = formatDesc else { return }
-        formatDescription = fd
-        
-        createDecompressionSession(with: fd)
-    }
-    
-    private func createHEVCSession() {
-        guard let sps = sps, let pps = pps else { return }
-        
-        var formatDesc: CMFormatDescription?
-        
-        if let vps = vps {
-            // With VPS
-            let vpsArray = [UInt8](vps)
-            let spsArray = [UInt8](sps)
-            let ppsArray = [UInt8](pps)
-            
-            vpsArray.withUnsafeBufferPointer { vpsBuffer in
-                spsArray.withUnsafeBufferPointer { spsBuffer in
-                    ppsArray.withUnsafeBufferPointer { ppsBuffer in
-                        var pointers: [UnsafePointer<UInt8>] = [
-                            vpsBuffer.baseAddress!,
-                            spsBuffer.baseAddress!,
-                            ppsBuffer.baseAddress!
-                        ]
-                        var sizes: [Int] = [vpsArray.count, spsArray.count, ppsArray.count]
-                        
-                        let status = CMVideoFormatDescriptionCreateFromHEVCParameterSets(
-                            allocator: kCFAllocatorDefault,
-                            parameterSetCount: 3,
-                            parameterSetPointers: &pointers,
-                            parameterSetSizes: &sizes,
-                            nalUnitHeaderLength: 4,
-                            extensions: nil,
-                            formatDescriptionOut: &formatDesc
-                        )
-                        
-                        if status != noErr {
-                            lcDebug("🎬 VideoDecoder: ❌ Failed to create HEVC format description: \(status)")
-                        } else {
-                            lcDebug("🎬 VideoDecoder: ✅ Created HEVC format description")
-                        }
-                    }
-                }
-            }
-        } else {
-            // Without VPS (some streams don't have it)
-            let spsArray = [UInt8](sps)
-            let ppsArray = [UInt8](pps)
-            
-            spsArray.withUnsafeBufferPointer { spsBuffer in
-                ppsArray.withUnsafeBufferPointer { ppsBuffer in
-                    var pointers: [UnsafePointer<UInt8>] = [
-                        spsBuffer.baseAddress!,
-                        ppsBuffer.baseAddress!
-                    ]
-                    var sizes: [Int] = [spsArray.count, ppsArray.count]
-                    
-                    let status = CMVideoFormatDescriptionCreateFromHEVCParameterSets(
-                        allocator: kCFAllocatorDefault,
-                        parameterSetCount: 2,
-                        parameterSetPointers: &pointers,
-                        parameterSetSizes: &sizes,
-                        nalUnitHeaderLength: 4,
-                        extensions: nil,
-                        formatDescriptionOut: &formatDesc
-                    )
-                    
-                    if status != noErr {
-                        lcDebug("🎬 VideoDecoder: ❌ Failed to create HEVC format description (no VPS): \(status)")
-                    } else {
-                        lcDebug("🎬 VideoDecoder: ✅ Created HEVC format description (no VPS)")
-                    }
-                }
-            }
-        }
-        
-        guard let fd = formatDesc else { return }
-        formatDescription = fd
-        
-        createDecompressionSession(with: fd)
-    }
-    
-    private func createDecompressionSession(with formatDescription: CMFormatDescription) {
-        logger.info("🎬 Creating decompression session...")
-        
-        // Destination image buffer attributes. Keep decoded frames as NV12
-        // (4:2:0 biplanar, full range) so the renderer samples the YUV planes
-        // directly; requesting BGRA here would force a per-frame NV12->BGRA
-        // conversion the renderer no longer needs.
-        let destinationAttributes: [CFString: Any] = [
+        let attributes: [CFString: Any] = [
             kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
-            kCVPixelBufferMetalCompatibilityKey: true
+            kCVPixelBufferMetalCompatibilityKey: true,
+            kCVPixelBufferIOSurfacePropertiesKey: [:] as [String: Any]
         ]
-        
+        let specification: [CFString: Any] = [
+            kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: true
+        ]
         var callback = VTDecompressionOutputCallbackRecord(
-            decompressionOutputCallback: decompressionCallback,
-            decompressionOutputRefCon: Unmanaged.passUnretained(self).toOpaque()
-        )
-        
-        var session: VTDecompressionSession?
+            decompressionOutputCallback: Self.decompressionCallback,
+            decompressionOutputRefCon: Unmanaged.passUnretained(self).toOpaque())
+        var createdSession: VTDecompressionSession?
         let status = VTDecompressionSessionCreate(
-            allocator: kCFAllocatorDefault,
-            formatDescription: formatDescription,
-            decoderSpecification: nil,
-            imageBufferAttributes: destinationAttributes as CFDictionary,
-            outputCallback: &callback,
-            decompressionSessionOut: &session
-        )
-        
-        if status == noErr {
-            decompressionSession = session
-            lcDebug("🎬 VideoDecoder: ✅ Created decompression session successfully (HEVC: \(isHEVC))")
+            allocator: kCFAllocatorDefault, formatDescription: description,
+            decoderSpecification: specification as CFDictionary,
+            imageBufferAttributes: attributes as CFDictionary, outputCallback: &callback,
+            decompressionSessionOut: &createdSession)
+        guard status == noErr, let createdSession else {
+            reportError("Hardware video decoding is unavailable (\(status)). Free video resources or try H.264 on the host.")
+            return false
+        }
+        var hardware: CFTypeRef?
+        let hardwareStatus = VTSessionCopyProperty(createdSession,
+            key: kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
+            allocator: kCFAllocatorDefault, valueOut: &hardware)
+        guard hardwareStatus == noErr, hardware as? Bool == true else {
+            VTDecompressionSessionInvalidate(createdSession)
+            reportError("LocalCast could not verify hardware video decoding on this Mac.")
+            return false
+        }
+        VTSessionSetProperty(createdSession, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+        decompressionSession = createdSession
+        formatDescription = description
+        hardwareAccelerated = true
+        lastError = nil
+        logger.info("Hardware \(self.codecName) decoder ready")
+        return true
+    }
+
+    private func decodePicture(_ data: Data) {
+        guard let session = decompressionSession, let formatDescription else { return }
+        // Core Media owns the compressed bytes, including if VideoToolbox retains
+        // the sample beyond DecodeFrame. No borrowed NSData storage escapes.
+        var block: CMBlockBuffer?
+        let blockStatus = CMBlockBufferCreateWithMemoryBlock(
+            allocator: kCFAllocatorDefault, memoryBlock: nil, blockLength: data.count,
+            blockAllocator: kCFAllocatorDefault, customBlockSource: nil,
+            offsetToData: 0, dataLength: data.count, flags: 0, blockBufferOut: &block)
+        guard blockStatus == noErr, let block else { return }
+        let copyStatus = data.withUnsafeBytes { bytes -> OSStatus in
+            guard let base = bytes.baseAddress else { return kCMBlockBufferBadLengthParameterErr }
+            return CMBlockBufferReplaceDataBytes(with: base, blockBuffer: block,
+                                                offsetIntoDestination: 0, dataLength: bytes.count)
+        }
+        guard copyStatus == noErr else { return }
+        var sample: CMSampleBuffer?
+        var timing = CMSampleTimingInfo(duration: .invalid,
+            presentationTimeStamp: CMTime(seconds: CACurrentMediaTime(), preferredTimescale: 1_000_000),
+            decodeTimeStamp: .invalid)
+        var size = data.count
+        let sampleStatus = CMSampleBufferCreateReady(
+            allocator: kCFAllocatorDefault, dataBuffer: block, formatDescription: formatDescription,
+            sampleCount: 1, sampleTimingEntryCount: 1, sampleTimingArray: &timing,
+            sampleSizeEntryCount: 1, sampleSizeArray: &size, sampleBufferOut: &sample)
+        guard sampleStatus == noErr, let sample else { return }
+        // The caller already has a serial decode worker. Synchronous hardware
+        // submission bounds work in flight and preserves ordering with tile heals.
+        let status = VTDecompressionSessionDecodeFrame(session, sampleBuffer: sample,
+            flags: [], frameRefcon: nil, infoFlagsOut: nil)
+        if status != noErr {
+            resetSession()
+            reportError("Video decoder needs a fresh keyframe (\(status)).")
         } else {
-            lcDebug("🎬 VideoDecoder: ❌ Failed to create decompression session: \(status)")
+            needsKeyFrame = false
         }
     }
-    
-    private func decodeVideoFrame(_ nalUnit: Data) {
-        guard let session = decompressionSession, let formatDesc = formatDescription else {
-            // Session not ready yet - might be waiting for SPS/PPS
-            return
-        }
-        
-        // Convert Annex B NAL to AVCC format (length-prefixed)
-        // CRITICAL: We must keep this data alive until the decode completes!
-        let length = UInt32(nalUnit.count).bigEndian
-        var lengthPrefixed = Data(capacity: 4 + nalUnit.count)
-        withUnsafeBytes(of: length) { lengthPrefixed.append(contentsOf: $0) }
-        lengthPrefixed.append(nalUnit)
-        
-        // Make a copy that we can safely reference
-        let frameData = lengthPrefixed as NSData
-        
-        // Create block buffer that properly manages memory
-        var blockBuffer: CMBlockBuffer?
-        let status = CMBlockBufferCreateWithMemoryBlock(
-            allocator: kCFAllocatorDefault,
-            memoryBlock: UnsafeMutableRawPointer(mutating: frameData.bytes),
-            blockLength: frameData.length,
-            blockAllocator: kCFAllocatorNull,  // We manage the memory via NSData
-            customBlockSource: nil,
-            offsetToData: 0,
-            dataLength: frameData.length,
-            flags: 0,
-            blockBufferOut: &blockBuffer
-        )
-        
-        guard status == kCMBlockBufferNoErr, let buffer = blockBuffer else {
-            lcDebug("🎬 VideoDecoder: ❌ Failed to create block buffer: \(status)")
-            return
-        }
-        
-        // Create sample buffer
-        var sampleBuffer: CMSampleBuffer?
-        var timingInfo = CMSampleTimingInfo(
-            duration: CMTime.invalid,
-            presentationTimeStamp: CMTime(value: Int64(CACurrentMediaTime() * 1000), timescale: 1000),
-            decodeTimeStamp: CMTime.invalid
-        )
-        
-        let sampleSizes = [frameData.length]
-        let createStatus = CMSampleBufferCreateReady(
-            allocator: kCFAllocatorDefault,
-            dataBuffer: buffer,
-            formatDescription: formatDesc,
-            sampleCount: 1,
-            sampleTimingEntryCount: 1,
-            sampleTimingArray: &timingInfo,
-            sampleSizeEntryCount: 1,
-            sampleSizeArray: sampleSizes,
-            sampleBufferOut: &sampleBuffer
-        )
-        
-        guard createStatus == noErr, let sample = sampleBuffer else {
-            lcDebug("🎬 VideoDecoder: ❌ Failed to create sample buffer: \(createStatus)")
-            return
-        }
-        
-        // Decode - use synchronous mode so frameData stays alive
-        var flags: VTDecodeFrameFlags = []  // Synchronous
-        var outputFlags = VTDecodeInfoFlags()
-        
-        let decodeStatus = VTDecompressionSessionDecodeFrame(
-            session,
-            sampleBuffer: sample,
-            flags: flags,
-            frameRefcon: nil,
-            infoFlagsOut: &outputFlags
-        )
-        
-        if decodeStatus != noErr && frameCount < 10 {
-            lcDebug("🎬 VideoDecoder: ❌ Decode error: \(decodeStatus)")
-        }
-    }
-    
+
     func invalidate() {
-        if let session = decompressionSession {
-            VTDecompressionSessionInvalidate(session)
-            decompressionSession = nil
-        }
-        formatDescription = nil
-        sps = nil
-        pps = nil
-        vps = nil
-        isHEVC = false
-        frameCount = 0
-        hasLoggedFirstFrame = false
+        sessionLock.lock(); defer { sessionLock.unlock() }
+        resetSession()
+        parameterSets.removeAll()
+        codec = .h264
+        lastError = nil
     }
-    
-    private static var decodedFrameCount = 0
-    
-    private let decompressionCallback: VTDecompressionOutputCallback = { (decompressionOutputRefCon, sourceFrameRefCon, status, infoFlags, imageBuffer, presentationTimeStamp, presentationDuration) in
-        guard status == noErr, let buffer = imageBuffer else {
-            if status != noErr {
-                lcDebug("🎬 VideoDecoder: ❌ Decompression callback error: \(status)")
-            }
+
+    private func resetSession() {
+        if let session = decompressionSession { VTDecompressionSessionInvalidate(session) }
+        decompressionSession = nil
+        formatDescription = nil
+        hardwareAccelerated = false
+        needsKeyFrame = true
+    }
+
+    private func reportError(_ message: String) {
+        guard message != lastError else { return }
+        lastError = message
+        logger.error("\(message)")
+        onError?(message)
+    }
+
+    private static let decompressionCallback: VTDecompressionOutputCallback = {
+        refcon, _, status, _, imageBuffer, _, _ in
+        guard let refcon else { return }
+        let decoder = Unmanaged<VideoDecoder>.fromOpaque(refcon).takeUnretainedValue()
+        guard status == noErr, let imageBuffer else {
+            if status != noErr { decoder.onError?("Hardware video decode failed (\(status)). Waiting for recovery.") }
             return
         }
-        
-        VideoDecoder.decodedFrameCount += 1
-        if VideoDecoder.decodedFrameCount == 1 {
-            let width = CVPixelBufferGetWidth(buffer)
-            let height = CVPixelBufferGetHeight(buffer)
-            lcDebug("🎬 VideoDecoder: ✅✅✅ FIRST DECODED FRAME! \(width)x\(height)")
-        } else if VideoDecoder.decodedFrameCount % 60 == 0 {
-            lcDebug("🎬 VideoDecoder: Decoded \(VideoDecoder.decodedFrameCount) frames")
-        }
-        
-        let decoder = Unmanaged<VideoDecoder>.fromOpaque(decompressionOutputRefCon!).takeUnretainedValue()
-        decoder.delegate?.videoDecoder(decoder, didDecode: buffer)
+        decoder.delegate?.videoDecoder(decoder, didDecode: imageBuffer)
     }
 }

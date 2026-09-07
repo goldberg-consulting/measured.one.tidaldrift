@@ -127,7 +127,12 @@ extension HostSession {
         windowTrackTimer = nil
 
         if case .window(let id, _) = captureTarget, id != windowID { return }
-        guard let fallback = windowLossFallback(afterStartFailure: false) else { return }
+        guard let fallback = windowLossFallback(afterStartFailure: false) else {
+            if let endpoint = clientEndpoint {
+                sendStreamError("The shared window is no longer available. Select a window to resume.", to: endpoint)
+            }
+            return
+        }
         logger.warning("🪟 Streamed window \(windowID) disappeared — falling back to \(fallback.label)")
         applyFallback(fallback)
     }
@@ -148,30 +153,12 @@ extension HostSession {
         applyFallback(fallback)
     }
 
-    /// Where to send the stream when the current window target is no longer
-    /// capturable. A pinned window ID redirects to the owning app, which picks
-    /// up whatever window the app has now (the new one it created on going full
-    /// screen, typically). App capture re-picks its largest window on restart,
-    /// so rebuilding the same target is its own recovery, but only when the
-    /// previous attempt had not already failed to start: retargeting to an app
-    /// that cannot start would retry itself forever, so that case drops
-    /// straight to the display.
-    private func windowLossFallback(afterStartFailure: Bool) -> (target: HostCaptureTarget, label: String)? {
-        let desktop: (HostCaptureTarget, String) = (.fullDisplay, "Entire Desktop")
-        switch captureTarget {
-        case .fullDisplay:
-            return nil
-        case .app(let pid, let name):
-            guard !afterStartFailure, NSRunningApplication(processIdentifier: pid) != nil else {
-                return desktop
-            }
-            return (.app(pid, name: name), name)
-        case .window(_, let title):
-            guard let pid = targetPID, NSRunningApplication(processIdentifier: pid) != nil else {
-                return desktop
-            }
-            return (.app(pid, name: title), title)
-        }
+    /// Recovery can only reselect within an explicitly shared app. Losing a
+    /// single window never authorizes another window or the whole desktop.
+    func windowLossFallback(afterStartFailure: Bool) -> (target: HostCaptureTarget, label: String)? {
+        guard case .app(let pid, let name) = captureTarget,
+              !afterStartFailure, NSRunningApplication(processIdentifier: pid) != nil else { return nil }
+        return (.app(pid, name: name), name)
     }
 
     private func applyFallback(_ fallback: (target: HostCaptureTarget, label: String)) {

@@ -60,7 +60,8 @@ struct LocalCastPacket {
             let tsBits = UInt64(base[5]) << 56 | UInt64(base[6]) << 48 | UInt64(base[7]) << 40 | UInt64(base[8]) << 32
                        | UInt64(base[9]) << 24 | UInt64(base[10]) << 16 | UInt64(base[11]) << 8 | UInt64(base[12])
             let ts = Double(bitPattern: tsBits)
-            
+            guard ts.isFinite else { return nil }
+
             let payload = data.dropFirst(headerSize)
             return LocalCastPacket(type: packetType, sequenceNumber: seq, timestamp: ts, payload: Data(payload))
         }

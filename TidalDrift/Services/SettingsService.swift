@@ -28,14 +28,18 @@ class SettingsService {
     private func applySettings(_ settings: AppSettings) {
         _ = setLaunchAtLogin(settings.launchAtLogin)
         applyTheme(settings.theme)
-        DispatchQueue.main.async {
+        Task { @MainActor in
             (NSApp.delegate as? AppDelegate)?.setMenuBarIconVisible(settings.showMenuBarIcon)
+            NetworkDiscoveryService.shared.applySettings(settings)
         }
     }
     
     @discardableResult
     func setLaunchAtLogin(_ enabled: Bool) -> Bool {
         if #available(macOS 13.0, *) {
+            let status = SMAppService.mainApp.status
+            if enabled && (status == .enabled || status == .requiresApproval) { return true }
+            if !enabled && status == .notRegistered { return true }
             do {
                 if enabled {
                     try SMAppService.mainApp.register()

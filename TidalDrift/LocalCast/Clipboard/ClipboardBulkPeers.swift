@@ -15,6 +15,7 @@ final class ClipboardBulkHost: @unchecked Sendable {
         let id: UUID
         let token: Data
         let kind: ClipboardContentKind
+        let offer: ClipboardBulkOffer?
         let cacheDir: URL?
         let timeout: DispatchWorkItem
         let completion: (Result<ClipboardBulkReceived, Error>) -> Void
@@ -41,6 +42,7 @@ final class ClipboardBulkHost: @unchecked Sendable {
     private var key: SymmetricKey?
     private var allowedHost: String?
     private var busy = false
+    private var activeConnection: NWConnection?
     private var listening = false
     private var rebindFailures = 0
 
@@ -62,11 +64,15 @@ final class ClipboardBulkHost: @unchecked Sendable {
 
     func start(key: SymmetricKey?, allowedHost: String?) {
         lock.lock()
+        let keyChanged = self.key?.withUnsafeBytes { Data($0) } != key?.withUnsafeBytes { Data($0) }
+        let staleConnection = keyChanged ? activeConnection : nil
+        if keyChanged { outbound = nil }
         self.key = key
         self.allowedHost = allowedHost
         let alreadyActive = active
         active = true
         lock.unlock()
+        staleConnection?.cancel()
         guard !alreadyActive else { return }
         bind(attempt: 0)
     }
@@ -77,11 +83,15 @@ final class ClipboardBulkHost: @unchecked Sendable {
         listening = false
         let listener = self.listener
         self.listener = nil
+        let connection = activeConnection
+        activeConnection = nil
+        busy = false
         outbound = nil
         let push = expectedPush
         expectedPush = nil
         lock.unlock()
         listener?.cancel()
+        connection?.cancel()
         if let push {
             push.timeout.cancel()
             push.completion(.failure(ClipboardBulkError.cancelled))
@@ -98,7 +108,15 @@ final class ClipboardBulkHost: @unchecked Sendable {
     func clearOffer() {
         lock.lock()
         outbound = nil
+        let connection = activeConnection
+        let push = expectedPush
+        expectedPush = nil
         lock.unlock()
+        connection?.cancel()
+        if let push {
+            push.timeout.cancel()
+            push.completion(.failure(ClipboardBulkError.cancelled))
+        }
     }
 
     /// Arm the single expected-push slot. An unsolicited push (no armed slot,
@@ -107,6 +125,7 @@ final class ClipboardBulkHost: @unchecked Sendable {
     func expectPush(
         token: Data,
         kind: ClipboardContentKind,
+        offer: ClipboardBulkOffer? = nil,
         cacheDir: URL?,
         timeout: TimeInterval = LocalCastConfiguration.clipboardIdleTimeout,
         completion: @escaping (Result<ClipboardBulkReceived, Error>) -> Void
@@ -126,7 +145,7 @@ final class ClipboardBulkHost: @unchecked Sendable {
         lock.lock()
         let superseded = expectedPush
         expectedPush = ExpectedPush(
-            id: id, token: token, kind: kind, cacheDir: cacheDir,
+            id: id, token: token, kind: kind, offer: offer, cacheDir: cacheDir,
             timeout: timeoutItem, completion: completion
         )
         lock.unlock()
@@ -145,12 +164,19 @@ final class ClipboardBulkHost: @unchecked Sendable {
 
         do {
             let params = NWParameters.tcp
-            let listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: LocalCastConfiguration.clipboardPort)!)
+            guard let port = NWEndpoint.Port(rawValue: LocalCastConfiguration.clipboardPort) else {
+                throw ClipboardBulkError.connectionFailed
+            }
+            let listener = try NWListener(using: params, on: port)
             listener.newConnectionHandler = { [weak self] connection in
                 self?.handle(connection)
             }
-            listener.stateUpdateHandler = { [weak self] state in
-                guard let self else { return }
+            listener.stateUpdateHandler = { [weak self, weak listener] state in
+                guard let self, let listener else { return }
+                self.lock.lock()
+                let isCurrent = self.active && self.listener === listener
+                self.lock.unlock()
+                guard isCurrent else { return }
                 switch state {
                 case .ready:
                     self.lock.lock()
@@ -207,8 +233,11 @@ final class ClipboardBulkHost: @unchecked Sendable {
         lock.lock()
         let key = self.key
         let allowed = self.allowedHost
-        let alreadyBusy = busy
-        if !alreadyBusy { busy = true }
+        let alreadyBusy = busy || !active || key == nil
+        if !alreadyBusy {
+            busy = true
+            activeConnection = connection
+        }
         lock.unlock()
 
         guard !alreadyBusy else {
@@ -224,7 +253,7 @@ final class ClipboardBulkHost: @unchecked Sendable {
             if key == nil {
                 logger.warning("📋 Rejected clipboard connection from \(remote ?? "unknown") (expected \(allowed))")
                 connection.cancel()
-                lock.lock(); busy = false; lock.unlock()
+                markIdle(connection)
                 return
             }
             logger.info("📋 Clipboard connection from \(remote ?? "unknown") differs from session address \(allowed); sealed hello will decide")
@@ -243,7 +272,7 @@ final class ClipboardBulkHost: @unchecked Sendable {
             defer {
                 lifetime.cancel()
                 stream.cancel()
-                self.markIdle()
+                self.markIdle(connection)
             }
             do {
                 try await stream.awaitReady(timeout: 10)
@@ -265,9 +294,12 @@ final class ClipboardBulkHost: @unchecked Sendable {
 
     // Synchronous state helpers, so async code never holds the lock directly.
 
-    private func markIdle() {
+    private func markIdle(_ connection: NWConnection) {
         lock.lock()
-        busy = false
+        if activeConnection === connection {
+            activeConnection = nil
+            busy = false
+        }
         lock.unlock()
     }
 
@@ -317,6 +349,9 @@ final class ClipboardBulkHost: @unchecked Sendable {
         expected.timeout.cancel()
 
         do {
+            if let offer = expected.offer, !manifest.matches(offer, kind: expected.kind) {
+                throw ClipboardBulkError.manifestMismatch
+            }
             let received = try await ClipboardBulkTransfer.receive(
                 manifest: manifest, over: stream, cacheDirectory: expected.cacheDir
             )
@@ -365,9 +400,7 @@ final class ClipboardBulkClient: @unchecked Sendable {
               let manifest = try? JSONDecoder().decode(ClipboardBulkManifest.self, from: frame.body) else {
             throw ClipboardBulkError.tokenRejected
         }
-        guard manifest.kind == expectedKind,
-              manifest.totalBytes == offer.totalBytes,
-              (manifest.files?.map(\.name) ?? []) == (offer.files?.map(\.name) ?? []) else {
+        guard manifest.matches(offer, kind: expectedKind) else {
             throw ClipboardBulkError.manifestMismatch
         }
 
@@ -396,9 +429,13 @@ final class ClipboardBulkClient: @unchecked Sendable {
 
     private func open(host: String, key: SymmetricKey?) async throws -> ClipboardBulkStream {
         cancelActive()
+        guard let key, let port = NWEndpoint.Port(rawValue: LocalCastConfiguration.clipboardPort) else {
+            throw ClipboardBulkError.sealRejected
+        }
+        try Task.checkCancellation()
         let connection = NWConnection(
             host: NWEndpoint.Host(host),
-            port: NWEndpoint.Port(rawValue: LocalCastConfiguration.clipboardPort)!,
+            port: port,
             using: .tcp
         )
         let stream = ClipboardBulkStream(connection: connection, key: key, queue: queue)

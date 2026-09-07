@@ -107,12 +107,13 @@ extension HostSession {
             // Serialize the stop/start with every other capture transition so
             // a concurrent retarget or failure restart cannot interleave.
             try await captureTransitions.runThrowing { [weak self] () throws -> Void in
-                guard let self else { return }
+                guard let self, self.isRunning else { throw CancellationError() }
                 let hadCapture = self.withCaptureState { () -> Bool in
                     let had = self.captureActive
                     self.captureActive = false
                     return had
                 }
+                self.stopWindowTracking()
                 if hadCapture {
                     lcDebug("🎬 HostSession: Stopping existing capture...")
                     await self.captureManager.stopCapture()
@@ -125,38 +126,52 @@ extension HostSession {
                 // switch; init and beginCaptureForClient set this, this path did not.
                 self.captureManager.regionAwareCapture = self.configuration.regionAware
 
-                // Start the requested capture
-                lcDebug("🎬 HostSession: Starting new capture...")
-                switch request.type {
-                case .fullDisplay:
-                    lcDebug("🎬 HostSession: Starting FULL DISPLAY capture")
-                    try await self.startFullDisplayCapture()
-                    self.captureTarget = .fullDisplay
+                do {
+                    // Start the requested capture
+                    lcDebug("🎬 HostSession: Starting new capture...")
+                    switch request.type {
+                    case .fullDisplay:
+                        lcDebug("🎬 HostSession: Starting FULL DISPLAY capture")
+                        self.captureTarget = .fullDisplay
+                        try await self.startFullDisplayCapture()
 
-                case .window:
-                    guard let windowID = request.windowID else {
-                        lcDebug("❌ HostSession: No window ID in request!")
-                        throw LocalCastError.connectionFailed("No window ID provided")
-                    }
-                    let title = request.appName ?? "Window"
-                    lcDebug("🎬 HostSession: Starting WINDOW capture: '\(title)' (ID: \(windowID))")
-                    try await self.startWindowCapture(windowID: CGWindowID(windowID))
-                    self.captureTarget = .window(CGWindowID(windowID), title: title)
+                    case .window:
+                        guard let windowID = request.windowID else {
+                            lcDebug("❌ HostSession: No window ID in request!")
+                            throw LocalCastError.connectionFailed("No window ID provided")
+                        }
+                        let title = request.appName ?? "Window"
+                        lcDebug("🎬 HostSession: Starting WINDOW capture: '\(title)' (ID: \(windowID))")
+                        self.captureTarget = .window(CGWindowID(windowID), title: title)
+                        self.onClientRetarget?(self.captureTarget, title)
+                        try await self.startWindowCapture(windowID: CGWindowID(windowID))
 
-                case .app:
-                    guard let processID = request.processID else {
-                        lcDebug("❌ HostSession: No process ID in request!")
-                        throw LocalCastError.connectionFailed("No process ID provided")
+                    case .app:
+                        guard let processID = request.processID else {
+                            lcDebug("❌ HostSession: No process ID in request!")
+                            throw LocalCastError.connectionFailed("No process ID provided")
+                        }
+                        let name = request.appName ?? "App"
+                        lcDebug("🎬 HostSession: Starting APP capture: '\(name)' (PID: \(processID))")
+                        self.captureTarget = .app(processID, name: name)
+                        self.onClientRetarget?(self.captureTarget, name)
+                        try await self.startAppCapture(processID: processID)
                     }
-                    let name = request.appName ?? "App"
-                    lcDebug("🎬 HostSession: Starting APP capture: '\(name)' (PID: \(processID))")
-                    try await self.startAppCapture(processID: processID)
-                    self.captureTarget = .app(processID, name: name)
+
+                    self.updateInputBounds()
+                    self.startWindowTracking()
+                    self.withCaptureState { self.captureActive = true }
+                    self.settingsRecovery.captureStarted()
+                    self.restoreStreamingParameters()
+                    self.refreshThermalPolicy(force: true)
+                } catch {
+                    // Cleanup belongs to this transition, before a newer request runs.
+                    self.stopWindowTracking()
+                    await self.captureManager.stopCapture()
+                    self.encoder.invalidate()
+                    self.withCaptureState { self.captureActive = false }
+                    throw error
                 }
-
-                self.updateInputBounds()
-                self.startWindowTracking()
-                self.withCaptureState { self.captureActive = true }
             }
 
             // Keep the owning service's restart target in sync so a later
@@ -199,26 +214,6 @@ extension HostSession {
 
         } catch {
             lcDebug("❌ HostSession: Stream request failed: \(error.localizedDescription)")
-
-            // Try to recover by falling back to full display capture
-            lcDebug("🔄 HostSession: Recovering -- falling back to full display capture")
-            do {
-                try await captureTransitions.runThrowing { [weak self] () throws -> Void in
-                    guard let self else { return }
-                    try await self.startFullDisplayCapture()
-                    self.captureTarget = .fullDisplay
-                    self.updateInputBounds()
-                    self.startWindowTracking()
-                    self.isRunning = true
-                    // The start path cleared captureActive; restore it here so
-                    // suspendCaptureForIdleClient is not left a permanent no-op.
-                    self.withCaptureState { self.captureActive = true }
-                }
-                encoder.forceKeyFrame()
-                lcDebug("🔄 HostSession: ✅ Recovered to full display")
-            } catch {
-                lcDebug("❌ HostSession: Recovery also failed: \(error.localizedDescription)")
-            }
 
             sendStreamError(error.localizedDescription, to: endpoint)
         }

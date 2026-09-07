@@ -27,6 +27,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         let cvTextures: [CVMetalTexture]
         let pixelBuffer: CVImageBuffer
         let isNV12: Bool
+        let colorConversion: VideoColorConversion
         let width: Int
         let height: Int
     }
@@ -52,7 +53,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     private var lastArrival: CFTimeInterval = 0
     private var arrivalIntervalEWMA: Double = 1.0 / 60.0  // est. source frame interval
     private var jitterEWMA: Double = 0
-    private var targetDepth = 2
+    private var targetDepth = 1
     private var frameCount = 0
 
     private var _latencyMode: LocalCastConfiguration.LatencyMode =
@@ -60,7 +61,15 @@ class MetalRenderer: NSObject, MTKViewDelegate {
             .flatMap(LocalCastConfiguration.LatencyMode.init(rawValue:))) ?? .low
     var latencyMode: LocalCastConfiguration.LatencyMode {
         get { frameQueueLock.lock(); defer { frameQueueLock.unlock() }; return _latencyMode }
-        set { frameQueueLock.lock(); _latencyMode = newValue; frameQueueLock.unlock() }
+        set {
+            frameQueueLock.lock()
+            _latencyMode = newValue
+            targetDepth = max(1, minDepth(for: newValue))
+            let cap = maxDepth(for: newValue)
+            if frameQueue.count > cap { frameQueue.removeFirst(frameQueue.count - cap) }
+            primed = false
+            frameQueueLock.unlock()
+        }
     }
 
     /// Caller holds `frameQueueLock`.
@@ -104,6 +113,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     /// GPU passes on ticks where nothing changed. Main thread only, like all
     /// canvas mutations.
     private var canvasDirty = false
+    private var presentationDirty = true
 
     // MARK: - Pause control
     //
@@ -120,7 +130,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
 
     /// Add or remove a pause reason; the view is paused while any reason holds.
     func setPaused(_ paused: Bool, reason: PauseReason) {
-        DispatchQueue.main.async { [weak self] in
+        Task { @MainActor [weak self] in
             guard let self else { return }
             if paused {
                 self.pauseReasons.insert(reason)
@@ -179,7 +189,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     /// between panels of different refresh rates left the display link paced
     /// for the old one.
     func refreshDisplayLink() {
-        DispatchQueue.main.async { [weak self] in
+        Task { @MainActor [weak self] in
             guard let self else { return }
             self.mtkView.preferredFramesPerSecond = Self.displayMaxFPS(for: self.mtkView)
         }
@@ -227,14 +237,17 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         }
     }
     
-    init(mtkView: MTKView) {
+    init?(mtkView: MTKView) {
+        guard let device = mtkView.device ?? MTLCreateSystemDefaultDevice(),
+              let commandQueue = device.makeCommandQueue() else { return nil }
         self.mtkView = mtkView
-        self.device = mtkView.device ?? MTLCreateSystemDefaultDevice()!
-        self.commandQueue = device.makeCommandQueue()!
+        self.device = device
+        self.commandQueue = commandQueue
         
         // Create texture cache for converting CVPixelBuffer to MTLTexture
         var cache: CVMetalTextureCache?
-        CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &cache)
+        guard CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &cache) == kCVReturnSuccess,
+              let cache else { return nil }
         self.textureCache = cache
         
         // Create a simple render pipeline for displaying textures
@@ -263,23 +276,21 @@ class MetalRenderer: NSObject, MTKViewDelegate {
             return texture.sample(textureSampler, in.texCoord);
         }
         
-        // Full-range BT.709: Y is sampled from the luma (r8) plane, Cb/Cr from
-        // the chroma (rg8) plane. Capture is kCVPixelFormatType_420Yp...FullRange,
-        // so Y is not scaled (full 0..1) and only the chroma is centred at 0.5.
-        // These coefficients must match the capture range/primaries or output
-        // is washed out (wrong range) or tinted (wrong matrix).
+        struct ColorConversion {
+            float4 red;
+            float4 green;
+            float4 blue;
+        };
         fragment float4 fragmentShaderNV12(VertexOut in [[stage_in]],
                                            texture2d<float> lumaTexture [[texture(0)]],
-                                           texture2d<float> chromaTexture [[texture(1)]]) {
+                                           texture2d<float> chromaTexture [[texture(1)]],
+                                           constant ColorConversion &conversion [[buffer(0)]]) {
             constexpr sampler s(mag_filter::linear, min_filter::linear);
             float y = lumaTexture.sample(s, in.texCoord).r;
             float2 cbcr = chromaTexture.sample(s, in.texCoord).rg;
-            float cb = cbcr.r - 0.5;
-            float cr = cbcr.g - 0.5;
-            float r = y + 1.5748 * cr;
-            float g = y - 0.1873 * cb - 0.4681 * cr;
-            float b = y + 1.8556 * cb;
-            return float4(r, g, b, 1.0);
+            float4 sample = float4(y, cbcr, 1.0);
+            return float4(dot(conversion.red, sample), dot(conversion.green, sample),
+                          dot(conversion.blue, sample), 1.0);
         }
         """
         
@@ -356,6 +367,8 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         ]
         self.identityVertices = device.makeBuffer(bytes: identityData, length: identityData.count * MemoryLayout<Float>.stride, options: [])
         
+        guard pipelineState != nil, nv12PipelineState != nil,
+              vertices != nil, texCoords != nil, identityVertices != nil else { return nil }
         super.init()
         
         mtkView.device = device
@@ -366,7 +379,10 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         mtkView.isPaused = false
         mtkView.enableSetNeedsDisplay = false
         mtkView.preferredFramesPerSecond = Self.displayMaxFPS(for: mtkView)
-        mtkView.framebufferOnly = false  // Allow texture sampling
+        mtkView.framebufferOnly = true
+        // Capture is normalized to sRGB. Mark the presentation surface so Color
+        // Sync maps it correctly on wide-gamut and external displays.
+        (mtkView.layer as? CAMetalLayer)?.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
         
         if pipelineState != nil {
             logger.info("MetalRenderer initialized successfully")
@@ -427,11 +443,13 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         // region-aware heal path also arrives as NV12, and any BGRA buffer falls
         // back to the single-texture pipeline.
         let pixelFormat = CVPixelBufferGetPixelFormatType(imageBuffer)
-        // Only full-range routes to the NV12 pipeline: the shader applies
-        // full-range BT.709 math (no 16-235 expansion). Capture and decode are
-        // both FullRange, so a VideoRange buffer never reaches here; treating one
-        // as full range would wash the image out.
         let isNV12 = pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+            || pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        guard isNV12 || pixelFormat == kCVPixelFormatType_32BGRA
+                || pixelFormat == kCVPixelFormatType_32RGBA else {
+            logger.error("Unsupported decoded pixel format: \(pixelFormat)")
+            return
+        }
 
         guard let frame = isNV12
             ? makeNV12Frame(imageBuffer, width: width, height: height, cache: cache)
@@ -443,8 +461,9 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         // on-request refresh that heals lost tiles). The canvas is BGRA (tiles
         // arrive as BGRA), so an NV12 heal frame is converted to BGRA first. Done
         // on the main thread so it orders correctly with tile blits and present.
+        setPaused(false, reason: .disconnected)
         if canvasMode {
-            DispatchQueue.main.async { [weak self] in
+            Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.ensureCanvas(width: width, height: height, seedFrom: nil)
                 if frame.isNV12 {
@@ -465,7 +484,8 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         frameQueueLock.lock()
         let cap = maxDepth(for: _latencyMode)
         if lastArrival > 0 {
-            let interval = now - lastArrival
+            // An idle desktop or settings transition is not arrival jitter.
+            let interval = min(now - lastArrival, 1.0 / 10.0)
             let a = 0.1
             let dev = abs(interval - arrivalIntervalEWMA)
             arrivalIntervalEWMA = (1 - a) * arrivalIntervalEWMA + a * interval
@@ -486,7 +506,6 @@ class MetalRenderer: NSObject, MTKViewDelegate {
 
         // A live frame means the stream is (back) up; clear any disconnect
         // pause so the display link resumes presenting.
-        setPaused(false, reason: .disconnected)
         if !hasLoggedSuccess {
             logger.info("🖥️ MetalRenderer: First frame received! \(width)x\(height)")
             hasLoggedSuccess = true
@@ -514,8 +533,9 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         view.preferredFramesPerSecond = Self.displayMaxFPS(for: view)
         // Recalculate aspect ratio using the new size (not the possibly-stale drawableSize)
         updateVertexBufferForAspectRatio(viewSize: size)
+        presentationDirty = true
         // Trigger a redraw so the new vertices take effect immediately
-        DispatchQueue.main.async { view.needsDisplay = true }
+        Task { @MainActor in view.needsDisplay = true }
     }
     
     func draw(in view: MTKView) {
@@ -532,9 +552,11 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         // Region-aware: present the persistent canvas only when it changed.
         if canvasMode {
             guard let canvas = canvasTexture else { return }
-            if !canvasDirty && !sizeChanged { return }
-            canvasDirty = false
-            presentTexture(canvas, chroma: nil, srcWidth: canvas.width, srcHeight: canvas.height, in: view, retain: nil)
+            if !canvasDirty && !sizeChanged && !presentationDirty { return }
+            if presentTexture(canvas, chroma: nil, srcWidth: canvas.width, srcHeight: canvas.height, in: view, retain: nil) {
+                canvasDirty = false
+                presentationDirty = false
+            }
             return
         }
 
@@ -542,7 +564,12 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         // priming to the adaptive target depth.
         let now = CACurrentMediaTime()
         frameQueueLock.lock()
-        if !primed, frameQueue.count >= targetDepth {
+        // A static desktop may produce only one frame. Never withhold the
+        // first picture waiting for a second frame that may not arrive.
+        let waitedLongEnough = lastArrival > 0 && now - lastArrival >= 1.0 / 30.0
+        if !primed, !frameQueue.isEmpty,
+           _latencyMode == .low || lastPresentedFrame == nil
+            || frameQueue.count >= targetDepth || waitedLongEnough {
             primed = true
         }
         var dequeuedNewFrame = false
@@ -553,7 +580,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
             // the gate (saves up to a display interval per frame). Pacing still
             // applies in .low when the queue is deeper, and always in the
             // other modes.
-            let bypassPacing = _latencyMode == .low && frameQueue.count <= 1
+            let bypassPacing = _latencyMode == .low
             let due = bypassPacing || (now - lastPresentTime) >= interval * 0.85
             if due {
                 if frameQueue.isEmpty {
@@ -561,7 +588,12 @@ class MetalRenderer: NSObject, MTKViewDelegate {
                         primed = false  // underrun: re-buffer before resuming
                     }
                 } else {
-                    lastPresentedFrame = frameQueue.removeFirst()
+                    if _latencyMode == .low {
+                        lastPresentedFrame = frameQueue.last
+                        frameQueue.removeAll(keepingCapacity: true)
+                    } else {
+                        lastPresentedFrame = frameQueue.removeFirst()
+                    }
                     lastPresentTime = now
                     dequeuedNewFrame = true
                 }
@@ -571,8 +603,11 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         frameQueueLock.unlock()
 
         guard let frame = frame else { return }
-        if !dequeuedNewFrame && !sizeChanged { return }
-        presentTexture(frame.texture, chroma: frame.chromaTexture, srcWidth: frame.width, srcHeight: frame.height, in: view, retain: frame)
+        if dequeuedNewFrame || sizeChanged { presentationDirty = true }
+        guard presentationDirty else { return }
+        if presentTexture(frame.texture, chroma: frame.chromaTexture, srcWidth: frame.width, srcHeight: frame.height, in: view, retain: frame, colorConversion: frame.colorConversion) {
+            presentationDirty = false
+        }
     }
 
     /// Draw a texture to the view's drawable with aspect-ratio letterboxing.
@@ -580,12 +615,12 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     /// (luma at index 0, chroma at index 1); otherwise the BGRA pipeline samples
     /// `texture` directly. `retain` is held until the GPU finishes so a recycled
     /// IOSurface can't be overwritten mid-read.
-    private func presentTexture(_ texture: MTLTexture, chroma: MTLTexture?, srcWidth: Int, srcHeight: Int, in view: MTKView, retain: Any?) {
+    private func presentTexture(_ texture: MTLTexture, chroma: MTLTexture?, srcWidth: Int, srcHeight: Int, in view: MTKView, retain: Any?, colorConversion: VideoColorConversion? = nil) -> Bool {
         let pipeline = chroma != nil ? nv12PipelineState : pipelineState
         guard let pipeline,
               let drawable = view.currentDrawable,
               let renderPassDescriptor = view.currentRenderPassDescriptor else {
-            return
+            return false
         }
 
         if srcWidth != sourceWidth || srcHeight != sourceHeight {
@@ -600,22 +635,26 @@ class MetalRenderer: NSObject, MTKViewDelegate {
             updateVertexBufferForAspectRatio(viewSize: currentSize)
         }
 
-        guard let commandBuffer = commandQueue.makeCommandBuffer() else { return }
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else { return false }
         renderPassDescriptor.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
         renderPassDescriptor.colorAttachments[0].loadAction = .clear
-        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else { return }
+        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else { return false }
 
         renderEncoder.setRenderPipelineState(pipeline)
         renderEncoder.setVertexBuffer(vertices, offset: 0, index: 0)
         renderEncoder.setVertexBuffer(texCoords, offset: 0, index: 1)
         renderEncoder.setFragmentTexture(texture, index: 0)
-        if let chroma { renderEncoder.setFragmentTexture(chroma, index: 1) }
+        if let chroma, var conversion = colorConversion {
+            renderEncoder.setFragmentTexture(chroma, index: 1)
+            renderEncoder.setFragmentBytes(&conversion, length: MemoryLayout<VideoColorConversion>.stride, index: 0)
+        }
         renderEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         renderEncoder.endEncoding()
 
-        if let retain { commandBuffer.addCompletedHandler { _ in _ = retain } }
+        if let retain { commandBuffer.addCompletedHandler { _ in withExtendedLifetime(retain) {} } }
         commandBuffer.present(drawable)
         commandBuffer.commit()
+        return true
     }
 
     /// Wrap an NV12 image buffer as two Metal textures: plane 0 luma as `.r8Unorm`
@@ -648,6 +687,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
             cvTextures: [lumaCV, chromaCV],
             pixelBuffer: imageBuffer,
             isNV12: true,
+            colorConversion: VideoColorConversion(imageBuffer: imageBuffer),
             width: width,
             height: height
         )
@@ -672,6 +712,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
             cvTextures: [cvTex],
             pixelBuffer: imageBuffer,
             isNV12: false,
+            colorConversion: VideoColorConversion(imageBuffer: imageBuffer),
             width: width,
             height: height
         )
@@ -709,11 +750,13 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         encoder.setVertexBuffer(texCoords, offset: 0, index: 1)
         encoder.setFragmentTexture(frame.texture, index: 0)
         encoder.setFragmentTexture(chroma, index: 1)
+        var conversion = frame.colorConversion
+        encoder.setFragmentBytes(&conversion, length: MemoryLayout<VideoColorConversion>.stride, index: 0)
         encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         encoder.endEncoding()
 
         let retain = frame
-        commandBuffer.addCompletedHandler { _ in _ = retain }
+        commandBuffer.addCompletedHandler { _ in withExtendedLifetime(retain) {} }
         commandBuffer.commit()
         return dest
     }
@@ -723,7 +766,9 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     /// Apply a changed screen region into the persistent canvas. Called off the
     /// transport thread; hops to main so it serializes with the present.
     func applyTile(x: Int, y: Int, width: Int, height: Int, bgra: Data) {
-        DispatchQueue.main.async { [weak self] in
+        guard width > 0, height > 0, width <= 16_384, height <= 16_384,
+              bgra.count == width * height * 4 else { return }
+        Task { @MainActor [weak self] in
             guard let self else { return }
             if self.canvasTexture == nil {
                 // Need a base canvas sized to the stream; seed from the last
@@ -732,7 +777,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
                 self.ensureCanvas(width: self.sourceWidth, height: self.sourceHeight, seedFrom: self.lastPresentedFrame)
             }
             guard let canvas = self.canvasTexture,
-                  x >= 0, y >= 0, x + width <= canvas.width, y + height <= canvas.height,
+                  x >= 0, y >= 0, x <= canvas.width - width, y <= canvas.height - height,
                   let tileTex = self.makeSharedTexture(width: width, height: height) else {
                 return
             }
@@ -755,6 +800,8 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         canvasTexture = tex
         sourceWidth = width
         sourceHeight = height
+        lastDrawableSize = .zero
+        canvasDirty = true
         if let seed = seedFrom, seed.width == width, seed.height == height {
             // The canvas is BGRA; an NV12 seed must be converted first, otherwise
             // the blit copies an r8 luma plane into a bgra8 target (incompatible
@@ -793,7 +840,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
                   to: canvas, destinationSlice: 0, destinationLevel: 0,
                   destinationOrigin: MTLOrigin(x: x, y: y, z: 0))
         blit.endEncoding()
-        if let retain { cb.addCompletedHandler { _ in _ = retain } }
+        if let retain { cb.addCompletedHandler { _ in withExtendedLifetime(retain) {} } }
         cb.commit()
         canvasDirty = true
     }

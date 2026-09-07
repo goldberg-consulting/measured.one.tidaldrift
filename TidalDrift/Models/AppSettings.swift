@@ -25,6 +25,43 @@ struct AppSettings: Codable, Equatable {
     
     // Bonjour display name (persists across IP changes)
     var tidalDriftDisplayName: String
+
+    private enum CodingKeys: String, CodingKey {
+        case launchAtLogin, scanIntervalSeconds, showNotifications, useBiometrics
+        case enableConnectionLogging, showMenuBarIcon, autoConnectTrustedDevices
+        case peerDiscoveryEnabled, sshDiscoveryEnabled, showExperimentalFeatures, theme
+        case wakeOnLANEnabled, wakeOnLANPort, wakeOnLANRetries, autoWakeBeforeConnect
+        case tidalDropDestination, tidalDropDestinationBookmark, tidalDriftDisplayName
+    }
+
+    /// Preserve existing preferences when older files omit settings introduced later.
+    init(from decoder: Decoder) throws {
+        self.init()
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        launchAtLogin = try values.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? launchAtLogin
+        scanIntervalSeconds = try values.decodeIfPresent(Int.self, forKey: .scanIntervalSeconds) ?? scanIntervalSeconds
+        showNotifications = try values.decodeIfPresent(Bool.self, forKey: .showNotifications) ?? showNotifications
+        useBiometrics = try values.decodeIfPresent(Bool.self, forKey: .useBiometrics) ?? useBiometrics
+        enableConnectionLogging = try values.decodeIfPresent(Bool.self, forKey: .enableConnectionLogging) ?? enableConnectionLogging
+        showMenuBarIcon = try values.decodeIfPresent(Bool.self, forKey: .showMenuBarIcon) ?? showMenuBarIcon
+        autoConnectTrustedDevices = try values.decodeIfPresent(Bool.self, forKey: .autoConnectTrustedDevices) ?? autoConnectTrustedDevices
+        peerDiscoveryEnabled = try values.decodeIfPresent(Bool.self, forKey: .peerDiscoveryEnabled) ?? peerDiscoveryEnabled
+        sshDiscoveryEnabled = try values.decodeIfPresent(Bool.self, forKey: .sshDiscoveryEnabled) ?? sshDiscoveryEnabled
+        showExperimentalFeatures = try values.decodeIfPresent(Bool.self, forKey: .showExperimentalFeatures) ?? showExperimentalFeatures
+        if let rawTheme = try values.decodeIfPresent(String.self, forKey: .theme) {
+            theme = AppTheme(rawValue: rawTheme) ?? .system
+        }
+        wakeOnLANEnabled = try values.decodeIfPresent(Bool.self, forKey: .wakeOnLANEnabled) ?? wakeOnLANEnabled
+        wakeOnLANPort = try values.decodeIfPresent(Int.self, forKey: .wakeOnLANPort) ?? wakeOnLANPort
+        wakeOnLANRetries = try values.decodeIfPresent(Int.self, forKey: .wakeOnLANRetries) ?? wakeOnLANRetries
+        autoWakeBeforeConnect = try values.decodeIfPresent(Bool.self, forKey: .autoWakeBeforeConnect) ?? autoWakeBeforeConnect
+        tidalDropDestination = try values.decodeIfPresent(String.self, forKey: .tidalDropDestination) ?? tidalDropDestination
+        tidalDropDestinationBookmark = try values.decodeIfPresent(Data.self, forKey: .tidalDropDestinationBookmark)
+        tidalDriftDisplayName = try values.decodeIfPresent(String.self, forKey: .tidalDriftDisplayName) ?? tidalDriftDisplayName
+        if !(15...300).contains(scanIntervalSeconds) { scanIntervalSeconds = 30 }
+        if !(1...65535).contains(wakeOnLANPort) { wakeOnLANPort = 9 }
+        if !(1...10).contains(wakeOnLANRetries) { wakeOnLANRetries = 3 }
+    }
     
     init(launchAtLogin: Bool = false,
          scanIntervalSeconds: Int = 30,
@@ -85,6 +122,12 @@ struct AppSettings: Codable, Equatable {
                 .appendingPathComponent("Drop Box")
         }
         return URL(fileURLWithPath: tidalDropDestination)
+    }
+
+    /// Restore the default folder and discard the custom folder's security bookmark.
+    mutating func resetTidalDropDestination() {
+        tidalDropDestination = ""
+        tidalDropDestinationBookmark = nil
     }
     
     enum AppTheme: String, Codable, CaseIterable {

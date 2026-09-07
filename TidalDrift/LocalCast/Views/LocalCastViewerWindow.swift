@@ -45,7 +45,7 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
         let mtkView = MTKView()
         mtkView.device = MTLCreateSystemDefaultDevice()
         mtkView.colorPixelFormat = .bgra8Unorm
-        mtkView.framebufferOnly = false // Need this for sampling in shader
+        mtkView.framebufferOnly = true
         
         // Wrap in hosting view with overlay
         let contentView = LocalCastContentView(
@@ -59,7 +59,18 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
         super.init(window: window)
         
         window.delegate = self
-        session.renderer = MetalRenderer(mtkView: mtkView)
+        guard let renderer = MetalRenderer(mtkView: mtkView) else {
+            session.connectionStatus = "Metal video rendering is unavailable on this Mac."
+            session.connectionPhase = .disconnected
+            window.contentView = NSHostingView(rootView:
+                Text("LocalCast requires Metal video rendering, which could not be initialized on this Mac.")
+                    .font(.body)
+                    .padding(32)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .accessibilityLabel("LocalCast unavailable. Metal video rendering could not be initialized."))
+            return
+        }
+        session.renderer = renderer
         session.delegate = self
         
         lcDebug("🎮 LocalCastViewerWindowController: Calling setupInputCapture()...")
@@ -995,7 +1006,7 @@ struct LocalCastStatsOverlay: View {
                 row("Mode", stats.mode)
                 row("Rate", "\(stats.fps)/s")
                 row("Bitrate", String(format: "%.1f Mbps", stats.bitrateMbps))
-                row("Latency", "\(Int(stats.latencyMs)) ms")
+                row("Network RTT", "\(Int(stats.latencyMs)) ms")
                 row("Dropped", "\(stats.droppedPerSec)/s",
                     warn: stats.droppedPerSec > 0)
                 row("Recovered", "\(stats.fecRecoveredPerSec)/s")

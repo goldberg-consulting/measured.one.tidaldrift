@@ -36,6 +36,11 @@ struct ClipboardBulkManifest: Codable {
     let kind: ClipboardContentKind
     let totalBytes: Int64
     let files: [ClipboardFileStub]?
+
+    /// Ensure received bytes are attributed to exactly the offered files.
+    func matches(_ offer: ClipboardBulkOffer, kind expectedKind: ClipboardContentKind) -> Bool {
+        kind == expectedKind && totalBytes == offer.totalBytes && files == offer.files
+    }
 }
 
 struct ClipboardBulkTrailer: Codable {
@@ -46,6 +51,7 @@ struct ClipboardBulkTrailer: Codable {
 struct ClipboardTextContent: Codable {
     let text: String
     let rtf: Data?
+    var html: Data? = nil
 }
 
 /// What a completed inbound transfer delivers.
@@ -138,6 +144,7 @@ enum ClipboardBulkFraming {
 
     /// Build one length-prefixed wire frame: type tag + body, sealed.
     static func encodeFrame(type: ClipboardBulkFrameType, body: Data, key: SymmetricKey?) -> Data? {
+        guard body.count <= maxFrameLength - 30 else { return nil }
         var plaintext = Data([type.rawValue])
         plaintext.append(body)
         guard let sealed = seal(plaintext, key: key) else { return nil }
@@ -164,7 +171,7 @@ enum ClipboardBulkFraming {
     }
 
     static func decodeChunkBody(_ body: Data) -> (sequence: UInt32, content: Data)? {
-        guard body.count >= 4 else { return nil }
+        guard body.count > 4, body.count <= chunkSize + 4 else { return nil }
         // The body is a slice starting one byte into the decrypted frame (the
         // type tag), so it is never 4-byte aligned; a plain load(as:) traps.
         let seq = body.prefix(4).withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }.bigEndian
@@ -176,10 +183,11 @@ enum ClipboardBulkFraming {
     /// `URL(fileURLWithPath:)`, which resolves ".." and "" against the current
     /// working directory and would return its name instead of rejecting.
     static func sanitizeFileName(_ raw: String) -> String? {
-        guard let last = raw.split(separator: "/").last else { return nil }
+        guard !raw.utf8.contains(0), !raw.contains("\\"),
+              let last = raw.split(separator: "/").last else { return nil }
         let name = String(last)
         if name.isEmpty || name == "." || name == ".." { return nil }
-        if name.hasPrefix(".") { return nil }
+        if name.hasPrefix(".") || name.utf8.count > 255 { return nil }
         return name
     }
 

@@ -18,8 +18,6 @@ struct LocalCastSettingsView: View {
     @AppStorage("localCastThermalThrottle") var thermalThrottle = true
     
     @State private var hostPassword = ""
-    @State private var isRestartingStream = false
-    @State private var pendingRestart: Task<Void, Never>?
     
     @StateObject private var permissions = LocalCastPermissions()
     @ObservedObject private var service = LocalCastService.shared
@@ -48,7 +46,8 @@ struct LocalCastSettingsView: View {
                         set: { newValue in
                             Task {
                                 if newValue {
-                                    try? await service.startHosting()
+                                    do { try await service.startHosting() }
+                                    catch { service.hostingError = error.localizedDescription }
                                 } else {
                                     service.stopHosting()
                                 }
@@ -57,9 +56,15 @@ struct LocalCastSettingsView: View {
                     ))
                     .toggleStyle(.switch)
                     .labelsHidden()
+                    .accessibilityLabel("Host this Mac")
+                    .disabled(service.isStartingHosting)
                 }
                 .padding(.vertical, 4)
                 
+                if let error = service.hostingError {
+                    Text(error).font(.caption).foregroundStyle(.red)
+                }
+
                 // Live quality controls (always visible, marked "LIVE" when hosting)
                 StreamingQualityControlView(
                     tuning: service.streamingTuning,
@@ -77,7 +82,7 @@ struct LocalCastSettingsView: View {
                 
                 if service.isHosting {
                     HStack(spacing: 6) {
-                        if isRestartingStream {
+                        if service.isApplyingSettings {
                             ProgressView().scaleEffect(0.7)
                             Text("Applying codec/resolution to the live stream...")
                         } else {
@@ -106,8 +111,8 @@ struct LocalCastSettingsView: View {
                     .help("Sets the starting quality when a new session begins. Use the slider above for live tuning.")
                     
                     Picker("Video Codec", selection: $codec) {
-                        Text("H.264 (Faster)").tag(LocalCastConfiguration.Codec.h264)
-                        Text("HEVC (Smaller)").tag(LocalCastConfiguration.Codec.hevc)
+                        Text("H.264 (Compatibility)").tag(LocalCastConfiguration.Codec.h264)
+                        Text("HEVC (Efficiency)").tag(LocalCastConfiguration.Codec.hevc)
                     }
                     
                     Toggle("Auto-host on launch", isOn: $autoHost)
@@ -127,7 +132,7 @@ struct LocalCastSettingsView: View {
                             Text(option.label).tag(option.value)
                         }
                     }
-                    .help("Caps the captured frame's longest edge (aspect ratio preserved). Native streams the full panel resolution, including ultrawide (5120x1440). Applies to the next session.")
+                    .help("Caps the captured frame's longest edge (aspect ratio preserved). Native streams the full panel resolution; Automatic follows quality tuning. A viewer resolution override takes precedence. Applies to the live stream.")
 
                     Toggle("Adaptive bitrate", isOn: $adaptiveQuality)
                         .help("Automatically lowers bitrate when the link drops packets so motion (e.g. dragging) stays smooth, then restores quality when it clears. Host-side; applies live.")
@@ -139,7 +144,7 @@ struct LocalCastSettingsView: View {
                         .help("Request a fresh keyframe immediately when a frame is lost, so the picture heals in ~1 round trip instead of waiting for the next scheduled keyframe. Client-side; applies to the next connection.")
 
                     Toggle("Forward error correction (FEC)", isOn: $forwardErrorCorrection)
-                        .help("Send two parity packets per 16 video fragments so the viewer can rebuild up to two lost packets without a retransmit (Moonlight/Sunshine-style). Best for lossy Wi-Fi; adds ~12% bandwidth. Host-side; applies live. Watch \"Recovered/s\" in the stats overlay.")
+                        .help("Send two parity packets per 16 video fragments so the viewer can rebuild up to two lost packets without a retransmit (Moonlight/Sunshine-style). Best for lossy Wi-Fi; adds ~12% bandwidth. Host-side; applies live. View recovery counts in Stream Controls → Info.")
 
                     Picker("Latency mode", selection: $latencyMode) {
                         ForEach(LocalCastConfiguration.LatencyMode.allCases, id: \.self) { mode in
@@ -153,10 +158,10 @@ struct LocalCastSettingsView: View {
                             Text(profile.displayName).tag(profile)
                         }
                     }
-                    .help("Auto picks Fast LAN on a clean wired link (low RTT, no loss) and Resilient on Wi-Fi. Fast LAN drops pacing, widens the reassembly window, loosens the keyframe cap, and raises bitrate. Forcing Fast LAN also uses jumbo datagrams (needs a 9000 MTU). Applies live.")
+                    .help("Auto picks Fast LAN on a clean wired link (low RTT, no loss) and Resilient on Wi-Fi. Fast LAN drops pacing, widens the reassembly window, loosens the keyframe cap, and raises bitrate. Datagrams remain safe for standard Ethernet MTUs. Applies live.")
 
                     Toggle("Show remote cursor in stream", isOn: $captureCursor)
-                        .help("Composites the host's cursor into the video. Off (default), your local cursor is the pointer, removing the network round trip from pointer motion. Turn on for view-only sessions. Applies live on macOS 14+, otherwise next session.")
+                        .help("Composites the host's cursor into the video. Off (default), your local cursor is the pointer, removing the network round trip from pointer motion. Turn on for view-only sessions. Applies live.")
 
                     Toggle("Thermal throttling", isOn: $thermalThrottle)
                         .help("When macOS reports thermal pressure, automatically lowers the stream's frame rate and bitrate (30 fps / half bitrate at serious, 15 fps / quarter bitrate at critical) so the host cools down, then restores quality. Host-side; applies live.")
@@ -184,7 +189,7 @@ struct LocalCastSettingsView: View {
                         .foregroundColor(.secondary)
                     
                     Toggle("Require authentication", isOn: $requireAuth)
-                        .help("When enabled, clients must authenticate with the host password to connect.")
+                        .help("When enabled, a host password is required before hosting can start. Security changes apply after stopping and starting hosting.")
                     
                     if requireAuth {
                         HStack {
@@ -194,7 +199,7 @@ struct LocalCastSettingsView: View {
                                 .frame(width: 160)
                                 .textFieldStyle(.roundedBorder)
                         }
-                        .help("Clients use this password (or their saved device credentials) to connect. Set the same password on both machines.")
+                        .help("Clients use this password (or their saved device credentials) to connect. Enter this host password when connecting from the viewer. Changes apply after stopping and starting hosting.")
                         
                         if hostPassword.isEmpty {
                             Text("Set a password above to enable encrypted connections.")
@@ -210,7 +215,7 @@ struct LocalCastSettingsView: View {
                         Text("500 / sec").tag(500)
                         Text("Unlimited").tag(0)
                     }
-                    .help("Maximum number of input events per second from the client. Prevents input flooding.")
+                    .help("Maximum input events per second from the client. Applies after stopping and starting hosting.")
                     
                     Text("Authentication encrypts all traffic with AES-256-GCM. Clients can connect using their saved device credentials or by entering the host password. Rate limiting protects against input flooding.")
                         .font(.caption)
@@ -279,26 +284,15 @@ struct LocalCastSettingsView: View {
         // Codec and resolution need a fresh capture/encoder session, but the user
         // shouldn't have to find and click a button. Re-apply them automatically
         // (debounced) so changing them while hosting "just works".
-        .onChange(of: codec) { _ in scheduleAutoApply() }
-        .onChange(of: maxDimension) { _ in scheduleAutoApply() }
-        .onChange(of: quality) { _ in scheduleAutoApply() }
-        .onDisappear { pendingRestart?.cancel() }
+        .onChange(of: codec) { _ in service.scheduleStreamingSettingsApply() }
+        .onChange(of: maxDimension) { _ in
+            service.streamingTuning.maxDimensionOverride = nil
+            service.scheduleStreamingSettingsApply()
+        }
+        .onChange(of: quality) { _ in service.scheduleStreamingSettingsApply() }
     }
 
-    /// Debounced auto-restart for settings that need a new session (codec,
-    /// resolution). Coalesces rapid changes into a single restart ~0.6s after
-    /// the last edit, so flipping through options doesn't thrash the stream.
-    private func scheduleAutoApply() {
-        guard service.isHosting else { return }
-        pendingRestart?.cancel()
-        pendingRestart = Task {
-            try? await Task.sleep(nanoseconds: 600_000_000)
-            if Task.isCancelled { return }
-            await MainActor.run { isRestartingStream = true }
-            await service.restartHostingToApplySettings()
-            await MainActor.run { isRestartingStream = false }
-        }
-    }
+
 }
 
 struct LocalCastSettingsView_Previews: PreviewProvider {

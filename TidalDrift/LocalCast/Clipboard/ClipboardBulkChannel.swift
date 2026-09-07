@@ -144,7 +144,8 @@ final class ClipboardBulkStream: @unchecked Sendable {
         try await withThrowingTaskGroup(of: T.self) { group in
             group.addTask {
                 try await withTaskCancellationHandler {
-                    try await operation()
+                    try Task.checkCancellation()
+                    return try await operation()
                 } onCancel: {
                     self.connection.cancel()
                 }
@@ -171,6 +172,7 @@ enum ClipboardBulkTransfer {
         var sequence: UInt32 = 0
 
         func sendSlice(_ slice: Data) async throws {
+            try Task.checkCancellation()
             hasher.update(data: slice)
             let body = ClipboardBulkFraming.encodeChunkBody(sequence: sequence, content: slice)
             sequence &+= 1
@@ -216,6 +218,11 @@ enum ClipboardBulkTransfer {
             throw ClipboardBulkError.limitExceeded
         }
 
+        guard (manifest.kind == .files) == (manifest.files != nil),
+              manifest.kind != .files || manifest.files?.isEmpty == false else {
+            throw ClipboardBulkError.manifestMismatch
+        }
+
         if let stubs = manifest.files {
             guard manifest.kind == .files, let cacheDirectory else { throw ClipboardBulkError.manifestMismatch }
             return try await receiveFiles(stubs: stubs, manifest: manifest, over: stream, cacheDirectory: cacheDirectory)
@@ -226,6 +233,7 @@ enum ClipboardBulkTransfer {
         var receivedBytes: Int64 = 0
         var data = Data()
         while receivedBytes < manifest.totalBytes {
+            try Task.checkCancellation()
             guard let frame = try await stream.readFrame(), frame.type == .chunk,
                   let chunk = ClipboardBulkFraming.decodeChunkBody(frame.body),
                   chunk.sequence == expectedSequence,
@@ -293,8 +301,10 @@ enum ClipboardBulkTransfer {
             guard let handle = try? FileHandle(forWritingTo: temp) else {
                 throw ClipboardBulkError.fileUnreadable
             }
+            defer { try? handle.close() }
             var remaining = stub.size
             while remaining > 0 {
+                try Task.checkCancellation()
                 guard let frame = try await stream.readFrame(), frame.type == .chunk,
                       let chunk = ClipboardBulkFraming.decodeChunkBody(frame.body),
                       chunk.sequence == expectedSequence,
