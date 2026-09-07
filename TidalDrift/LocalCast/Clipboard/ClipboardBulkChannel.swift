@@ -144,7 +144,8 @@ final class ClipboardBulkStream: @unchecked Sendable {
         try await withThrowingTaskGroup(of: T.self) { group in
             group.addTask {
                 try await withTaskCancellationHandler {
-                    try await operation()
+                    try Task.checkCancellation()
+                    return try await operation()
                 } onCancel: {
                     self.connection.cancel()
                 }
@@ -171,6 +172,7 @@ enum ClipboardBulkTransfer {
         var sequence: UInt32 = 0
 
         func sendSlice(_ slice: Data) async throws {
+            try Task.checkCancellation()
             hasher.update(data: slice)
             let body = ClipboardBulkFraming.encodeChunkBody(sequence: sequence, content: slice)
             sequence &+= 1
@@ -216,6 +218,11 @@ enum ClipboardBulkTransfer {
             throw ClipboardBulkError.limitExceeded
         }
 
+        guard (manifest.kind == .files) == (manifest.files != nil),
+              manifest.kind != .files || manifest.files?.isEmpty == false else {
+            throw ClipboardBulkError.manifestMismatch
+        }
+
         if let stubs = manifest.files {
             guard manifest.kind == .files, let cacheDirectory else { throw ClipboardBulkError.manifestMismatch }
             return try await receiveFiles(stubs: stubs, manifest: manifest, over: stream, cacheDirectory: cacheDirectory)
@@ -226,6 +233,7 @@ enum ClipboardBulkTransfer {
         var receivedBytes: Int64 = 0
         var data = Data()
         while receivedBytes < manifest.totalBytes {
+            try Task.checkCancellation()
             guard let frame = try await stream.readFrame(), frame.type == .chunk,
                   let chunk = ClipboardBulkFraming.decodeChunkBody(frame.body),
                   chunk.sequence == expectedSequence,
@@ -242,6 +250,22 @@ enum ClipboardBulkTransfer {
         return .data(kind: manifest.kind, data: data)
     }
 
+    /// Sum of the per-file sizes a peer declared, or nil if any size is
+    /// negative, over the transfer cap, or the sum overflows. Each size is
+    /// range-checked before it is added: the sizes are peer-controlled Int64s,
+    /// and summing first with a trapping `+` let two stubs (Int64.max, 1)
+    /// crash the receiver.
+    static func declaredTotal(of stubs: [ClipboardFileStub]) -> Int64? {
+        var total: Int64 = 0
+        for stub in stubs {
+            guard stub.size >= 0, stub.size <= LocalCastConfiguration.clipboardMaxTransferBytes else { return nil }
+            let (sum, overflow) = total.addingReportingOverflow(stub.size)
+            guard !overflow, sum <= LocalCastConfiguration.clipboardMaxTransferBytes else { return nil }
+            total = sum
+        }
+        return total
+    }
+
     /// Files branch of `receive`. Per-file sizes come from the peer's
     /// manifest, so they are validated against the declared total, which was
     /// itself validated against the transfer cap; without this a manifest
@@ -253,8 +277,7 @@ enum ClipboardBulkTransfer {
         over stream: ClipboardBulkStream,
         cacheDirectory: URL
     ) async throws -> ClipboardBulkReceived {
-        let declaredTotal = stubs.reduce(Int64(0)) { $0 + $1.size }
-        guard stubs.allSatisfy({ $0.size >= 0 }),
+        guard let declaredTotal = Self.declaredTotal(of: stubs),
               declaredTotal == manifest.totalBytes,
               declaredTotal <= LocalCastConfiguration.clipboardMaxTransferBytes else {
             throw ClipboardBulkError.limitExceeded
@@ -278,8 +301,10 @@ enum ClipboardBulkTransfer {
             guard let handle = try? FileHandle(forWritingTo: temp) else {
                 throw ClipboardBulkError.fileUnreadable
             }
+            defer { try? handle.close() }
             var remaining = stub.size
             while remaining > 0 {
+                try Task.checkCancellation()
                 guard let frame = try await stream.readFrame(), frame.type == .chunk,
                       let chunk = ClipboardBulkFraming.decodeChunkBody(frame.body),
                       chunk.sequence == expectedSequence,

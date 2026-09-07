@@ -52,7 +52,11 @@ struct LocalCastConfiguration: Codable {
     /// visual quality. The encoder falls back to H.264 if HEVC setup fails.
     var codec: Codec = .hevc
     var targetFrameRate: Int = 60
-    var adaptiveQuality: Bool = false // Disable by default for "fastest pipe" on LAN
+    /// On by default (matching the settings UI and the service fallback). The
+    /// controller only steps bitrate down in response to reported loss and
+    /// climbs back on clean windows, so on a clean 10GbE link it sits at the
+    /// ceiling and costs nothing.
+    var adaptiveQuality: Bool = true
     /// When false (default), the host omits its cursor from the capture and the
     /// pointer the viewer sees is the local macOS cursor, so pointer motion
     /// never round-trips the capture/encode/decode pipeline. Enable to
@@ -62,7 +66,7 @@ struct LocalCastConfiguration: Codable {
     var captureAudio: Bool = false  // Future
 
     /// User override for the capture's longest-edge dimension in pixels. 0 means
-    /// "use the preset default". A value at/above the display's longest edge
+    /// "use quality tuning"; -1 means native. A value at/above the display's longest edge
     /// captures at native resolution, which is what large/ultrawide panels
     /// (e.g. 5120x1440) need. Aspect ratio is always preserved.
     var maxDimensionOverride: Int = 0
@@ -126,7 +130,8 @@ struct LocalCastConfiguration: Codable {
     /// otherwise higher quality presets allow larger captures to preserve detail
     /// on high-DPI / large displays.
     var maxCaptureDimension: Int {
-        if maxDimensionOverride > 0 { return maxDimensionOverride }
+        if maxDimensionOverride == -1 { return Int.max }
+        if maxDimensionOverride > 0 { return min(max(maxDimensionOverride, 640), 8192) & ~1 }
         switch qualityPreset {
         case .ultra: return 3840    // Up to 4K
         case .high: return 2560     // Up to 1440p
@@ -135,11 +140,12 @@ struct LocalCastConfiguration: Codable {
         }
     }
 
-    /// Resolution-cap choices for the streaming-resolution picker. `0` = Native
-    /// (no cap, full panel resolution incl. ultrawide). Aspect ratio is always
+    /// Resolution-cap choices: `0` follows quality, `-1` is native resolution.
+    /// Aspect ratio is always
     /// preserved; the value caps the longest edge.
     static let captureDimensionOptions: [(label: String, value: Int)] = [
-        ("Native", 0),
+        ("Automatic (quality)", 0),
+        ("Native", -1),
         ("720p (1280)", 1280),
         ("1080p (1920)", 1920),
         ("1440p (2560)", 2560),
@@ -217,7 +223,7 @@ class StreamingTuning: ObservableObject {
     @Published var quality: Double = 1.0 {
         didSet {
             let clamped = quality.clamped(to: 0...1)
-            if clamped != oldValue, clamped != quality { quality = clamped }
+            if clamped != quality { quality = clamped }
         }
     }
     
@@ -232,25 +238,25 @@ class StreamingTuning: ObservableObject {
     
     /// Effective FPS (override or interpolated from master slider).
     var effectiveFps: Int {
-        if let fps = fpsOverride { return fps }
+        if let fps = fpsOverride { return min(max(fps, 15), 120) }
         return Self.interpolate(low: 15, high: 120, t: quality)
     }
     
     /// Effective bitrate in Mbps (override or interpolated).
     var effectiveBitrateMbps: Int {
-        if let br = bitrateOverride { return br }
+        if let br = bitrateOverride { return min(max(br, 8), 400) }
         return Self.interpolate(low: 8, high: 150, t: quality)
     }
     
     /// Effective encoder quality hint (override or interpolated).
     var effectiveEncoderQuality: Float {
-        if let q = encoderQualityOverride { return q }
+        if let q = encoderQualityOverride { return q.isFinite ? min(max(q, 0.4), 1.0) : 0.8 }
         return Float(Self.interpolateDouble(low: 0.40, high: 0.95, t: quality))
     }
     
     /// Effective max capture dimension (override or interpolated).
     var effectiveMaxDimension: Int {
-        if let d = maxDimensionOverride { return d }
+        if let d = maxDimensionOverride { return min(max(d, 640), 8192) & ~1 }
         return Self.interpolate(low: 1280, high: 3840, t: quality) & ~1
     }
     
@@ -311,10 +317,10 @@ class StreamingTuning: ObservableObject {
     func toPayload() -> QualityUpdatePayload {
         QualityUpdatePayload(
             quality: quality,
-            fpsOverride: fpsOverride,
-            bitrateOverride: bitrateOverride,
-            encoderQualityOverride: encoderQualityOverride,
-            maxDimensionOverride: maxDimensionOverride
+            fpsOverride: fpsOverride.map { _ in effectiveFps },
+            bitrateOverride: bitrateOverride.map { _ in effectiveBitrateMbps },
+            encoderQualityOverride: encoderQualityOverride.map { _ in effectiveEncoderQuality },
+            maxDimensionOverride: maxDimensionOverride.map { _ in effectiveMaxDimension }
         )
     }
     
@@ -326,8 +332,7 @@ class StreamingTuning: ObservableObject {
         maxDimensionOverride = payload.maxDimensionOverride
     }
 
-    /// Persist the live tuning values so a host restart (needed for codec,
-    /// resolution, FEC, or region-aware changes) does not reset the slider back
+    /// Persist the live tuning values so a host restart does not reset the slider back
     /// to the preset. This mirrors game-streaming clients: negotiated session
     /// parameters stay stable until the user changes them.
     func saveToDefaults() {
@@ -384,7 +389,7 @@ class StreamingTuning: ObservableObject {
     }
 }
 
-struct QualityUpdatePayload: Codable {
+struct QualityUpdatePayload: Codable, Sendable {
     let quality: Double
     let fpsOverride: Int?
     let bitrateOverride: Int?
@@ -394,6 +399,6 @@ struct QualityUpdatePayload: Codable {
 
 private extension Double {
     func clamped(to range: ClosedRange<Double>) -> Double {
-        min(max(self, range.lowerBound), range.upperBound)
+        isFinite ? min(max(self, range.lowerBound), range.upperBound) : range.lowerBound
     }
 }

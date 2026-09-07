@@ -28,24 +28,32 @@ extension HostSession {
 
     /// Handle authRequest from client: generate hostNonce, derive pairingKey, encrypt sessionKey, reply with authChallenge.
     func handleAuthRequest(payload: Data, from endpoint: NWEndpoint) {
-        guard payload.count == 32 else {
-            logger.warning("🔐 authRequest: bad nonce length (\(payload.count))")
+        guard let (nonce, version) = SessionCrypto.parseAuthRequest(payload) else {
+            logger.warning("🔐 authRequest: unrecognized payload (\(payload.count) bytes)")
             return
         }
         guard let password = hostPassword, let sessionKey = sessionKey else {
             logger.warning("🔐 authRequest received but no password/session key (auth disabled?)")
             return
         }
+        guard authAttemptsAllowed() else {
+            logger.warning("🔐 authRequest ignored: too many failed attempts, cooling down")
+            return
+        }
+        guard authRequestLimiter.shouldAllow() else {
+            logger.warning("🔐 authRequest ignored: rate limit")
+            return
+        }
 
         // Store client nonce
-        clientNonce = payload
+        clientNonce = nonce
 
         // Generate our nonce
         let hNonce = SessionCrypto.generateNonce()
         hostNonce = hNonce
 
         // Derive pairing key from password + nonces
-        let pairingKey = SessionCrypto.derivePairingKey(password: password, clientNonce: payload, hostNonce: hNonce)
+        let pairingKey = SessionCrypto.derivePairingKey(password: password, clientNonce: nonce, hostNonce: hNonce, version: version)
 
         // Encrypt the real session key with the pairing key
         let sessionKeyData = SessionCrypto.exportKey(sessionKey)
@@ -66,7 +74,7 @@ extension HostSession {
             payload: challengePayload
         )
         transport.send(packet: challenge, to: endpoint)
-        logger.info("🔐 Sent authChallenge to client (\(challengePayload.count) bytes)")
+        logger.info("🔐 Sent authChallenge to client (\(challengePayload.count) bytes, pairing v\(version.rawValue))")
 
         // authChallenge is a single plaintext datagram with no retransmit
         // layer; if it is lost the client re-sends authRequest, but resending
@@ -86,19 +94,18 @@ extension HostSession {
     /// Handle authComplete from client: verify proof, activate encryption, send authSuccess.
     func handleAuthComplete(payload: Data, from endpoint: NWEndpoint) {
         guard let sessionKey = sessionKey else { return }
+        guard authAttemptsAllowed() else { return }
 
         // The client sends AES-GCM(sessionKey, "AUTH-OK") as proof it derived the correct key.
-        guard let proof = SessionCrypto.decrypt(payload, using: sessionKey) else {
-            logger.warning("🔐 authComplete: decryption failed — wrong PIN?")
-            return
-        }
-
-        guard String(data: proof, encoding: .utf8) == "AUTH-OK" else {
-            logger.warning("🔐 authComplete: proof mismatch")
+        guard let proof = SessionCrypto.decrypt(payload, using: sessionKey),
+              String(data: proof, encoding: .utf8) == "AUTH-OK" else {
+            logger.warning("🔐 authComplete: proof rejected — wrong password?")
+            noteAuthFailure()
             return
         }
 
         // Auth succeeded — enable encryption on the transport
+        resetAuthFailures()
         authState = .authenticated
         transport.sessionKey = sessionKey
         logger.info("🔐 ✅ Client authenticated — encryption enabled")
@@ -135,6 +142,38 @@ extension HostSession {
         startClipboardSyncIfEligible()
     }
 
+    // MARK: - Auth brute-force throttle
+    //
+    // The pairing key is derived from the host password, so every failed
+    // proof is a password guess. A LAN peer could otherwise stream guesses
+    // at the host as fast as the round trip allows. After a handful of
+    // consecutive failures the host ignores auth traffic for a cooldown.
+
+    /// Whether a handshake packet may be processed right now.
+    func authAttemptsAllowed() -> Bool {
+        authThrottleLock.lock()
+        defer { authThrottleLock.unlock() }
+        return Date() >= authCooldownUntil
+    }
+
+    func noteAuthFailure() {
+        authThrottleLock.lock()
+        defer { authThrottleLock.unlock() }
+        authFailureCount += 1
+        if authFailureCount >= Self.authMaxFailures {
+            authFailureCount = 0
+            authCooldownUntil = Date().addingTimeInterval(Self.authCooldownSeconds)
+            logger.warning("🔐 \(Self.authMaxFailures) failed auth attempts — ignoring handshakes for \(Int(Self.authCooldownSeconds))s")
+        }
+    }
+
+    func resetAuthFailures() {
+        authThrottleLock.lock()
+        authFailureCount = 0
+        authCooldownUntil = .distantPast
+        authThrottleLock.unlock()
+    }
+
     // MARK: - Window Resize
 
     func handleWindowResize(payload: Data) {
@@ -142,6 +181,11 @@ extension HostSession {
 
         let width = Double(bitPattern: payload.subdata(in: 0..<8).withUnsafeBytes { $0.load(as: UInt64.self).bigEndian })
         let height = Double(bitPattern: payload.subdata(in: 8..<16).withUnsafeBytes { $0.load(as: UInt64.self).bigEndian })
+        guard width.isFinite, height.isFinite,
+              (64...16384).contains(width), (64...16384).contains(height) else {
+            logger.warning("📐 Resize request rejected: \(width)x\(height) out of range")
+            return
+        }
 
         switch captureTarget {
         case .fullDisplay:

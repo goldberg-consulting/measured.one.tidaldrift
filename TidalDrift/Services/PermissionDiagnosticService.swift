@@ -152,51 +152,20 @@ class PermissionDiagnosticService: ObservableObject {
     
     private func checkScreenSharingService() async -> (isRunning: Bool, portOpen: Bool) {
         // Check if service is running
-        let serviceRunning = await withCheckedContinuation { continuation in
-            let task = Process()
-            task.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-            task.arguments = ["print", "system/com.apple.screensharing"]
-            
-            let pipe = Pipe()
-            task.standardOutput = pipe
-            task.standardError = pipe
-            
-            do {
-                try task.run()
-                task.waitUntilExit()
-                
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                let output = String(data: data, encoding: .utf8) ?? ""
-                
-                // Check for "state = running"
-                let isRunning = output.contains("state = running")
-                continuation.resume(returning: isRunning)
-            } catch {
-                continuation.resume(returning: false)
-            }
-        }
+        // ShellExecutor drains the pipe as the child writes; `launchctl print`
+        // output comfortably exceeds the 64 KB pipe buffer.
+        let serviceRunning = await Task.detached(priority: .utility) {
+            let result = ShellExecutor.execute(
+                executable: "/bin/launchctl", arguments: ["print", "system/com.apple.screensharing"])
+            return result.output.contains("state = running")
+        }.value
         
         // Check if port 5900 is listening
-        let portOpen = await withCheckedContinuation { continuation in
-            let task = Process()
-            task.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
-            task.arguments = ["-i", ":5900", "-sTCP:LISTEN"]
-            
-            let pipe = Pipe()
-            task.standardOutput = pipe
-            task.standardError = Pipe()
-            
-            do {
-                try task.run()
-                task.waitUntilExit()
-                
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                let output = String(data: data, encoding: .utf8) ?? ""
-                continuation.resume(returning: !output.isEmpty)
-            } catch {
-                continuation.resume(returning: false)
-            }
-        }
+        let portOpen = await Task.detached(priority: .utility) {
+            let result = ShellExecutor.execute(
+                executable: "/usr/sbin/lsof", arguments: ["-i", ":5900", "-sTCP:LISTEN"])
+            return result.exitCode == 0 && !result.output.isEmpty
+        }.value
         
         return (serviceRunning, portOpen)
     }
@@ -221,36 +190,19 @@ class PermissionDiagnosticService: ObservableObject {
             return (false, nil)
         }
         
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
-        task.arguments = ["-dv", bundlePath]
+        let result = ShellExecutor.execute(executable: "/usr/bin/codesign", arguments: ["-dv", bundlePath])
+        let output = result.output
+        let isValid = result.exitCode == 0
         
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = pipe
-        
-        do {
-            try task.run()
-            task.waitUntilExit()
-            
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let output = String(data: data, encoding: .utf8) ?? ""
-            
-            let isValid = task.terminationStatus == 0
-            
-            // Extract identifier
-            var identifier: String?
-            if let range = output.range(of: "Identifier=") {
-                let start = output[range.upperBound...]
-                if let end = start.firstIndex(of: "\n") {
-                    identifier = String(start[..<end])
-                }
+        var identifier: String?
+        if let range = output.range(of: "Identifier=") {
+            let start = output[range.upperBound...]
+            if let end = start.firstIndex(of: "\n") {
+                identifier = String(start[..<end])
             }
-            
-            return (isValid, identifier)
-        } catch {
-            return (false, nil)
         }
+        
+        return (isValid, identifier)
     }
     
     private func findDuplicateInstallations() -> [URL] {
@@ -291,19 +243,20 @@ class PermissionDiagnosticService: ObservableObject {
     /// Check current hostname and Bonjour configuration
     func checkHostnameConfiguration() -> HostnameConfig {
         // Get Computer Name
-        let computerNameResult = ShellExecutor.execute("scutil --get ComputerName 2>/dev/null")
-        let computerName = computerNameResult.output.trimmingCharacters(in: .whitespacesAndNewlines)
+        let computerNameResult = ShellExecutor.execute(executable: "/usr/sbin/scutil", arguments: ["--get", "ComputerName"])
+        let computerName = computerNameResult.exitCode == 0 ? computerNameResult.output : ""
         
         // Get Local Hostname (.local domain)
-        let localHostnameResult = ShellExecutor.execute("scutil --get LocalHostName 2>/dev/null")
-        let localHostname = localHostnameResult.output.trimmingCharacters(in: .whitespacesAndNewlines)
+        let localHostnameResult = ShellExecutor.execute(executable: "/usr/sbin/scutil", arguments: ["--get", "LocalHostName"])
+        let localHostname = localHostnameResult.exitCode == 0 ? localHostnameResult.output : ""
         
         // Get HostName (dynamic global hostname)
-        let hostnameResult = ShellExecutor.execute("scutil --get HostName 2>/dev/null")
-        let hostname = hostnameResult.exitCode == 0 ? hostnameResult.output.trimmingCharacters(in: .whitespacesAndNewlines) : nil
+        let hostnameResult = ShellExecutor.execute(executable: "/usr/sbin/scutil", arguments: ["--get", "HostName"])
+        let hostname = hostnameResult.exitCode == 0 ? hostnameResult.output : nil
         
         // Check for Wide-Area Bonjour configuration
-        let wideAreaResult = ShellExecutor.execute("defaults read /Library/Preferences/com.apple.mDNSResponder 2>/dev/null")
+        let wideAreaResult = ShellExecutor.execute(
+            executable: "/usr/bin/defaults", arguments: ["read", "/Library/Preferences/com.apple.mDNSResponder"])
         let wideAreaEnabled = !wideAreaResult.output.isEmpty && wideAreaResult.exitCode == 0
         
         // Get Bonjour registration domains
@@ -360,25 +313,19 @@ class PermissionDiagnosticService: ObservableObject {
     
     /// Reset all TidalDrift TCC permissions (requires app restart)
     func resetAllPermissions() async -> Bool {
-        let result = ShellExecutor.execute("tccutil reset All com.goldbergconsulting.tidaldrift 2>&1")
+        let result = ShellExecutor.execute(executable: "/usr/bin/tccutil", arguments: ["reset", "All", "com.goldbergconsulting.tidaldrift"])
         return result.exitCode == 0
     }
     
     /// Reset just Screen Recording permission
     func resetScreenRecordingPermission() async -> Bool {
-        let result = ShellExecutor.execute("tccutil reset ScreenCapture com.goldbergconsulting.tidaldrift 2>&1")
+        let result = ShellExecutor.execute(executable: "/usr/bin/tccutil", arguments: ["reset", "ScreenCapture", "com.goldbergconsulting.tidaldrift"])
         return result.exitCode == 0
     }
     
-    /// Kickstart the Screen Sharing service
+    /// Kickstart the Screen Sharing service via the admin-prompted path.
     func kickstartScreenSharing() async -> Bool {
-        // Restart the launchd service
-        let result = ShellExecutor.execute("""
-            sudo launchctl kickstart -k system/com.apple.screensharing 2>&1 || \
-            sudo launchctl enable system/com.apple.screensharing 2>&1
-        """)
-        
-        return result.exitCode == 0
+        await SharingConfigurationService.shared.restartScreenSharing()
     }
     
     /// Open Screen Recording settings directly

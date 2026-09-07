@@ -14,6 +14,98 @@ class KeychainService {
 
     private init() {}
 
+    /// Whether the data protection keychain is usable from this process.
+    /// `kSecAttrAccessible` and `kSecAttrAccessControl` are only honored
+    /// there, but it requires an application identifier from code signing;
+    /// an unsigned dev build gets errSecMissingEntitlement, so probe once and
+    /// fall back to the file-based keychain rather than fail every call.
+    /// Every query goes through `baseQuery` so saves and lookups always
+    /// target the same keychain.
+    private var dataProtectionProbe: Bool?
+    private let probeLock = NSLock()
+    private var useDataProtectionKeychain: Bool {
+        probeLock.lock()
+        defer { probeLock.unlock() }
+        if let known = dataProtectionProbe { return known }
+        let probe: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: serviceName,
+            kSecAttrAccount as String: "com.tidaldrift.keychain-probe",
+            kSecUseDataProtectionKeychain as String: true,
+            kSecUseAuthenticationUI as String: kSecUseAuthenticationUIFail
+        ]
+        let status = SecItemCopyMatching(probe as CFDictionary, nil)
+        let usable = status != errSecMissingEntitlement
+        dataProtectionProbe = usable
+        if usable { migrateLegacyItemsIfNeeded() }
+        return usable
+    }
+
+    private func baseQuery(account: String? = nil) -> [String: Any] {
+        var query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: serviceName,
+            kSecUseDataProtectionKeychain as String: useDataProtectionKeychain
+        ]
+        if let account { query[kSecAttrAccount as String] = account }
+        return query
+    }
+
+    private static let legacyMigrationKey = "keychainLegacyMigrationDone"
+
+    /// One-time copy of items saved before queries pinned the data protection
+    /// keychain. Legacy items carry no ACL, so reading them never prompts.
+    /// Runs from the `useDataProtectionKeychain` initializer, so it must not
+    /// touch that property; it addresses both keychains explicitly.
+    private func migrateLegacyItemsIfNeeded() {
+        guard !UserDefaults.standard.bool(forKey: Self.legacyMigrationKey) else { return }
+        defer { UserDefaults.standard.set(true, forKey: Self.legacyMigrationKey) }
+
+        let legacyQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: serviceName,
+            kSecUseDataProtectionKeychain as String: false,
+            kSecReturnAttributes as String: true,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitAll,
+            kSecUseAuthenticationUI as String: kSecUseAuthenticationUIFail
+        ]
+        var result: AnyObject?
+        guard SecItemCopyMatching(legacyQuery as CFDictionary, &result) == errSecSuccess,
+              let items = result as? [[String: Any]] else { return }
+
+        for item in items {
+            guard let account = item[kSecAttrAccount as String] as? String,
+                  let data = item[kSecValueData as String] as? Data else { continue }
+            var add: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: serviceName,
+                kSecAttrAccount as String: account,
+                kSecUseDataProtectionKeychain as String: true,
+                kSecValueData as String: data
+            ]
+            applyProtection(to: &add)
+            let status = SecItemAdd(add as CFDictionary, nil)
+            guard status == errSecSuccess || status == errSecDuplicateItem else { continue }
+            let legacyDelete: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: serviceName,
+                kSecAttrAccount as String: account,
+                kSecUseDataProtectionKeychain as String: false
+            ]
+            SecItemDelete(legacyDelete as CFDictionary)
+        }
+    }
+
+    /// Attach the protection class that matches the current biometric setting.
+    private func applyProtection(to attributes: inout [String: Any]) {
+        if let accessControl = createAccessControl() {
+            attributes[kSecAttrAccessControl as String] = accessControl
+        } else {
+            attributes[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlocked
+        }
+    }
+
     /// Credential structure for JSON encoding (safer than delimiter-based storage)
     private struct StoredCredential: Codable {
         let username: String
@@ -43,42 +135,32 @@ class KeychainService {
             throw KeychainError.encodingFailed
         }
 
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: serviceName,
-            kSecAttrAccount as String: deviceId
-        ]
-
-        let updateAttributes: [String: Any] = [
-            kSecValueData as String: data
-        ]
-        var addAttributes = updateAttributes
-        if let accessControl = createAccessControl() {
-            addAttributes[kSecAttrAccessControl as String] = accessControl
-        } else {
-            addAttributes[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlocked
+        // Delete and re-add rather than update: SecItemUpdate cannot change
+        // the protection class, so an item saved before Touch ID was enabled
+        // would otherwise keep its old ACL forever.
+        let query = baseQuery(account: deviceId)
+        let deleteStatus = SecItemDelete(query as CFDictionary)
+        guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else {
+            throw KeychainError.deleteFailed(deleteStatus)
         }
 
-        let updateStatus = SecItemUpdate(query as CFDictionary, updateAttributes as CFDictionary)
-        switch updateStatus {
-        case errSecSuccess:
+        var addQuery = query
+        addQuery[kSecValueData as String] = data
+        applyProtection(to: &addQuery)
+
+        let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+        if addStatus == errSecDuplicateItem {
+            // Lost a race with a concurrent save; the value wins, the ACL is
+            // whatever the winner set.
+            let update: [String: Any] = [kSecValueData as String: data]
+            let retryStatus = SecItemUpdate(query as CFDictionary, update as CFDictionary)
+            guard retryStatus == errSecSuccess else {
+                throw KeychainError.updateFailed(retryStatus)
+            }
             return
-        case errSecItemNotFound:
-            var addQuery = query
-            addAttributes.forEach { addQuery[$0.key] = $0.value }
-            let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
-            if addStatus == errSecDuplicateItem {
-                let retryStatus = SecItemUpdate(query as CFDictionary, updateAttributes as CFDictionary)
-                guard retryStatus == errSecSuccess else {
-                    throw KeychainError.updateFailed(retryStatus)
-                }
-                return
-            }
-            guard addStatus == errSecSuccess else {
-                throw KeychainError.saveFailed(addStatus)
-            }
-        default:
-            throw KeychainError.updateFailed(updateStatus)
+        }
+        guard addStatus == errSecSuccess else {
+            throw KeychainError.saveFailed(addStatus)
         }
     }
 
@@ -136,13 +218,9 @@ class KeychainService {
     }
 
     private func copyCredential(for deviceId: String, allowUI: Bool) throws -> (username: String, password: String)? {
-        var query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: serviceName,
-            kSecAttrAccount as String: deviceId,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
+        var query = baseQuery(account: deviceId)
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
 
         if allowUI {
             let context = LAContext()
@@ -185,13 +263,7 @@ class KeychainService {
     }
 
     func deleteCredential(for deviceId: String) throws {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: serviceName,
-            kSecAttrAccount as String: deviceId
-        ]
-
-        let status = SecItemDelete(query as CFDictionary)
+        let status = SecItemDelete(baseQuery(account: deviceId) as CFDictionary)
 
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw KeychainError.deleteFailed(status)
@@ -208,13 +280,9 @@ class KeychainService {
     }
 
     func hasCredential(for deviceId: String) -> Bool {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: serviceName,
-            kSecAttrAccount as String: deviceId,
-            kSecReturnData as String: false,
-            kSecUseAuthenticationUI as String: kSecUseAuthenticationUIFail
-        ]
+        var query = baseQuery(account: deviceId)
+        query[kSecReturnData as String] = false
+        query[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUIFail
 
         let status = SecItemCopyMatching(query as CFDictionary, nil)
         return status == errSecSuccess
@@ -225,12 +293,9 @@ class KeychainService {
     }
 
     func getAllSavedDeviceIds() throws -> [String] {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: serviceName,
-            kSecReturnAttributes as String: true,
-            kSecMatchLimit as String: kSecMatchLimitAll
-        ]
+        var query = baseQuery()
+        query[kSecReturnAttributes as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitAll
 
         var result: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
@@ -334,13 +399,9 @@ class KeychainService {
     }
 
     private func readWithContext(account: String, context: LAContext?) throws -> (username: String, password: String)? {
-        var query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: serviceName,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
+        var query = baseQuery(account: account)
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
         if let context {
             query[kSecUseAuthenticationContext as String] = context
         } else {

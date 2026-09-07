@@ -6,24 +6,9 @@ import CoreGraphics
 import IOKit.pwr_mgt
 import OSLog
 
-// MARK: - Architecture
-//
-// TidalCast uses a two-tier architecture:
-//
-// Tier 1 — Full Desktop (VNC):
-//   macOS built-in Screen Sharing via vnc:// handles full-desktop viewing.
-//   No custom video pipeline needed; Apple provides encoding, compression,
-//   input forwarding, clipboard sync, and authentication natively.
-//   Initiated by ScreenShareConnectionService.connect(to:).
-//
-// Tier 2 — App/Window Streaming (custom):
-//   Uses ScreenCaptureKit to capture a single window or app on the host,
-//   VideoToolbox H.264 encoding, UDP transport, Metal rendering on the client.
-//   The client sees the remote app in a native-feeling NSWindow.
-//   Initiated by connectSystemScreenShare(to:), which opens VNC for the
-//   desktop AND a control channel for app enumeration / targeted capture.
-//
-// The LocalCast transport (UDP + PacketProtocol) is retained for Tier 2 only.
+// LocalCast captures desktops, windows, and apps with ScreenCaptureKit,
+// hardware VideoToolbox codecs, and Metal presentation. The separate system
+// Screen Sharing connection remains available through ScreenShareConnectionService.
 
 @MainActor
 protocol LocalCastServiceDelegate: AnyObject {
@@ -68,6 +53,11 @@ class LocalCastService: ObservableObject {
     let logger = Logger(subsystem: "com.tidaldrift", category: "LocalCastService")
 
     @Published var isHosting = false
+    @Published private(set) var isStartingHosting = false
+    @Published private(set) var isApplyingSettings = false
+    @Published var hostingError: String?
+    private var pendingSettingsApply: Task<Void, Never>?
+    private var hostingGeneration: UInt64 = 0
     @Published var activeConnections: [LocalCastConnection] = []
     @Published var currentStats: LocalCastStats?
     
@@ -161,7 +151,7 @@ class LocalCastService: ObservableObject {
                 guard let self, self.isHosting else { return }
                 self.logger.info("⏰ System powered on (dark or full wake) — restarting LocalCast hosting and advertisement")
                 self.holdWakeGraceAssertion()
-                await self.restartHostingToApplySettings()
+                await self.restartHostingAfterNetworkLoss()
             }
         }
         powerMonitor.start()
@@ -247,6 +237,18 @@ class LocalCastService: ObservableObject {
     }
 
     private func startHosting(target: HostCaptureTarget) async throws {
+        guard !isHosting, !isStartingHosting else { return }
+        isStartingHosting = true
+        hostingGeneration &+= 1
+        let generation = hostingGeneration
+        defer { isStartingHosting = false }
+        hostingError = nil
+        reloadConfigurationFromDefaults()
+        if configuration.requireAuthentication && (LocalCastPasswordStore.load()?.isEmpty ?? true) {
+            let message = "Set a host password in Metal Streaming settings before starting authenticated hosting."
+            hostingError = message
+            throw LocalCastError.connectionFailed(message)
+        }
         // Let any in-flight stop release port 5904 before rebinding.
         await stopTask?.value
         stopTask = nil
@@ -262,6 +264,7 @@ class LocalCastService: ObservableObject {
             }
         }
 
+        guard generation == hostingGeneration, !Task.isCancelled else { throw CancellationError() }
         await permissions.checkPermissions()
         if !permissions.accessibilityGranted {
             logger.warning("Accessibility permission not granted -- input forwarding disabled")
@@ -277,7 +280,7 @@ class LocalCastService: ObservableObject {
             hostPassword = stored.isEmpty ? nil : stored
             self.isAuthEnabled = hostPassword != nil
             if hostPassword == nil {
-                logger.warning("🔐 Auth enabled but no host password set — auth will be skipped")
+                throw LocalCastError.connectionFailed("Set a host password before starting authenticated hosting.")
             } else {
                 logger.info("🔐 Auth enabled with host password")
             }
@@ -294,6 +297,9 @@ class LocalCastService: ObservableObject {
         }
         
         let session = HostSession(configuration: configuration, password: hostPassword)
+        session.onSettingsApplyFailed = { [weak self] message in
+            Task { @MainActor in self?.hostingError = message }
+        }
         // When the client picks a window/app, keep our restart target in sync so
         // a later resolution/codec restart keeps streaming the same target.
         session.onClientRetarget = { [weak self] newTarget, name in
@@ -311,11 +317,16 @@ class LocalCastService: ObservableObject {
             Task { @MainActor in
                 guard let self, self.isHosting else { return }
                 self.logger.warning("🔌 LocalCast listener died — rebinding")
-                await self.restartHostingToApplySettings()
+                await self.restartHostingAfterNetworkLoss()
             }
         }
         try await session.start(target: target)
 
+        guard generation == hostingGeneration, !Task.isCancelled else {
+            await session.stop()
+            throw CancellationError()
+        }
+        session.updateStreamingQuality(streamingTuning)
         advertiseLocalCast(port: LocalCastConfiguration.hostPort, authEnabled: hostPassword != nil)
 
         self.hostSession = session
@@ -354,18 +365,28 @@ class LocalCastService: ObservableObject {
         }
     }
 
-    /// Apply settings that can change without recreating the capture/encoder
-    /// session. Codec/resolution still require restart; resilience toggles should
-    /// not.
-    func applyLiveResilienceSettingsFromDefaults() {
-        reloadConfigurationFromDefaults()
-        hostSession?.updateRuntimeConfiguration(configuration)
+    /// Coalesce settings edits independently of the settings view's lifetime.
+    /// Only capture and the encoder rebuild; viewers retain authentication,
+    /// transport, and in-flight clipboard transfers.
+    func scheduleStreamingSettingsApply() {
+        guard isHosting else { return }
+        pendingSettingsApply?.cancel()
+        pendingSettingsApply = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: 600_000_000) } catch { return }
+            guard let self, self.isHosting, let session = self.hostSession else { return }
+            self.isApplyingSettings = true
+            defer { self.isApplyingSettings = false }
+            self.reloadConfigurationFromDefaults()
+            await session.updateRuntimeConfiguration(self.configuration)
+        }
     }
 
-    /// Restart the active host session with the same share target, reloading all
-    /// non-live settings first (codec, resolution cap, region-aware, FEC, etc.).
-    /// Live bitrate/fps tuning still flows through `StreamingTuning`.
-    func restartHostingToApplySettings() async {
+    func applyLiveResilienceSettingsFromDefaults() {
+        scheduleStreamingSettingsApply()
+    }
+
+    /// A dead listener needs a complete restart; ordinary settings edits do not.
+    private func restartHostingAfterNetworkLoss() async {
         guard isHosting else { return }
         let target = currentHostTarget
         let name = shareTargetName
@@ -381,19 +402,27 @@ class LocalCastService: ObservableObject {
         isAuthEnabled = false
         stopAdvertisement()
         hostSession = nil
-        await oldSession?.stop()
+        hostingGeneration &+= 1
+        let generation = hostingGeneration
+        stopTask = Task { await oldSession?.stop() }
+        await stopTask?.value
+        guard generation == hostingGeneration else { return }
         delegate?.localCastDidStopHosting()
 
         do {
             try await startHosting(target: target)
             shareTargetName = name
         } catch {
-            logger.error("Failed to restart hosting with updated settings: \(error.localizedDescription)")
+            hostingError = error.localizedDescription
+            logger.error("Failed to restart hosting: \(error.localizedDescription)")
         }
     }
 
     func stopHosting() {
-        guard isHosting else { return }
+        hostingGeneration &+= 1
+        pendingSettingsApply?.cancel()
+        pendingSettingsApply = nil
+        guard isHosting || isStartingHosting else { return }
         self.isHosting = false
         self.isAuthEnabled = false
         self.shareTargetName = "Entire Desktop"
@@ -466,7 +495,7 @@ class LocalCastService: ObservableObject {
         // rebind cannot double-fire.
         if hostSession?.isListenerDead == true {
             logger.warning("LocalCast listener died while hosting — rebinding")
-            Task { await self.restartHostingToApplySettings() }
+            Task { await self.restartHostingAfterNetworkLoss() }
             return
         }
 
@@ -521,8 +550,15 @@ class LocalCastService: ObservableObject {
         }
         
         let session = ClientSession(device: device)
-        try await session.connect(password: resolvedPassword)
         let controller = LocalCastViewerWindowController(device: device, session: session)
+        guard session.renderer != nil else {
+            throw LocalCastError.connectionFailed("Metal rendering is unavailable on this Mac.")
+        }
+        do { try await session.connect(password: resolvedPassword) }
+        catch {
+            session.disconnect()
+            throw error
+        }
         
         // Retain the controller so its NSEvent monitors (input capture) stay alive
         // for the lifetime of the window. Without this, ARC deallocates the controller
@@ -619,9 +655,9 @@ enum LocalCastError: LocalizedError {
         case .connectionFailed(let reason):
             return "Connection failed: \(reason)"
         case .encoderInitializationFailed:
-            return "Failed to initialize video encoder"
+            return "Hardware video encoding is unavailable for this stream. Try H.264 or a lower resolution."
         case .decoderInitializationFailed:
-            return "Failed to initialize video decoder"
+            return "Hardware video decoding is unavailable for this stream. Try H.264 or a lower resolution."
         case .noDisplayAvailable:
             return "No display available to share"
         case .hostNotReady:

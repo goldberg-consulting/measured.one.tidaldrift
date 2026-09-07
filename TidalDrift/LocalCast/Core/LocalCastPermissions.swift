@@ -78,7 +78,7 @@ class LocalCastPermissions: ObservableObject {
     }
 
     func requestAccessibilityPermission() {
-        let options = [kAXTrustedCheckOptionPrompt.takeRetainedValue() as String: true] as CFDictionary
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         AXIsProcessTrustedWithOptions(options)
     }
 }

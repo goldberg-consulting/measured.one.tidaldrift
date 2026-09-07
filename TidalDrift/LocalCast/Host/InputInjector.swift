@@ -48,8 +48,11 @@ class InputInjector {
     /// key-downs latch at the HID level, so a release that never arrives leaves
     /// every later keystroke reading as a shortcut, which presents as a dead
     /// keyboard on the host. Tracked so the latch can be cleared on departure.
-    /// `inject(_:)` is called sequentially per client, so a plain var is safe.
+    /// `inject(_:)` runs on the transport queue but `releaseHeldInput()` is
+    /// called from the capture callback and the idle timer, so the held state
+    /// is guarded.
     private var heldModifierKeyCodes: Set<UInt16> = []
+    private let heldStateLock = NSLock()
     
     /// The capture bounds for input mapping (defaults to full screen)
     /// When capturing a window/app, this should be set to the window's frame.
@@ -64,7 +67,7 @@ class InputInjector {
 
     /// Mouse button currently held down (0 = left, 1 = right, 2 = other), so a
     /// subsequent move can be injected as a drag rather than a plain move.
-    /// `inject(_:)` is called sequentially per client, so a plain var is safe.
+    /// Guarded by `heldStateLock`.
     private var heldMouseButton: Int?
 
     /// Limits the release-visible click-mapping diagnostic to the first few clicks.
@@ -99,59 +102,79 @@ class InputInjector {
     /// Bring the application with the given PID to the foreground.
     /// Uses NSRunningApplication.activate which does not require Accessibility permission.
     func focusApp(pid: pid_t) {
-        guard let app = NSRunningApplication(processIdentifier: pid) else {
-            logger.warning("Cannot focus app — PID \(pid) not found")
-            return
-        }
-        let ok = app.activate(options: [.activateIgnoringOtherApps])
-        if ok {
-            logger.info("✅ Focused app '\(app.localizedName ?? "PID \(pid)")' (PID \(pid))")
-        } else {
-            logger.warning("Failed to activate app PID \(pid)")
+        DispatchQueue.main.async { [logger] in
+            guard let app = NSRunningApplication(processIdentifier: pid) else {
+                logger.warning("Cannot focus app — PID \(pid) not found")
+                return
+            }
+            let ok = app.activate(options: [.activateIgnoringOtherApps])
+            if ok {
+                logger.info("✅ Focused app '\(app.localizedName ?? "PID \(pid)")' (PID \(pid))")
+            } else {
+                logger.warning("Failed to activate app PID \(pid)")
+            }
         }
     }
     
     // MARK: - App Isolation (for VNC single-app view)
+    //
+    // NSWorkspace and NSRunningApplication are main-thread API; the requests
+    // arrive on the transport queue and departure cleanup on the capture
+    // queue, so every entry point hops to main, which also serializes the
+    // hidden-PID bookkeeping.
     
     /// PIDs of apps we hid during isolation, so we can restore them later.
+    /// Main thread only.
     private var isolatedHiddenPIDs: [pid_t] = []
     
-    /// The PID of the currently isolated app, if any.
+    /// The PID of the currently isolated app, if any. Main thread only.
     private(set) var isolatedAppPID: pid_t?
     
     /// Hide every regular (non-target, non-TidalDrift) app and activate the target.
     /// Designed for use with System Screen Sharing (VNC) so only one app is visible.
     func isolateApp(pid: pid_t) {
-        guard let targetApp = NSRunningApplication(processIdentifier: pid) else {
-            logger.warning("Cannot isolate — PID \(pid) not found")
-            return
-        }
-        
-        restoreApps()
-        
-        var hidden: [pid_t] = []
-        let ownBundleID = Bundle.main.bundleIdentifier ?? ""
-        
-        for app in NSWorkspace.shared.runningApplications {
-            guard app.activationPolicy == .regular,
-                  app.processIdentifier != pid,
-                  app.bundleIdentifier != ownBundleID,
-                  !app.isHidden else { continue }
-            
-            if app.hide() {
-                hidden.append(app.processIdentifier)
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            guard let targetApp = NSRunningApplication(processIdentifier: pid) else {
+                self.logger.warning("Cannot isolate — PID \(pid) not found")
+                return
             }
+            
+            self.restoreAppsOnMain()
+            
+            var hidden: [pid_t] = []
+            let ownBundleID = Bundle.main.bundleIdentifier ?? ""
+            
+            for app in NSWorkspace.shared.runningApplications {
+                guard app.activationPolicy == .regular,
+                      app.processIdentifier != pid,
+                      app.bundleIdentifier != ownBundleID,
+                      !app.isHidden else { continue }
+                
+                if app.hide() {
+                    hidden.append(app.processIdentifier)
+                }
+            }
+            
+            self.isolatedHiddenPIDs = hidden
+            self.isolatedAppPID = pid
+            targetApp.activate(options: [.activateIgnoringOtherApps])
+            
+            self.logger.info("🔒 Isolated '\(targetApp.localizedName ?? "PID \(pid)")' — hid \(hidden.count) other apps")
         }
-        
-        isolatedHiddenPIDs = hidden
-        isolatedAppPID = pid
-        targetApp.activate(options: [.activateIgnoringOtherApps])
-        
-        logger.info("🔒 Isolated '\(targetApp.localizedName ?? "PID \(pid)")' — hid \(hidden.count) other apps")
     }
     
-    /// Unhide all apps that were hidden by `isolateApp(pid:)`.
+    /// Unhide all apps that were hidden by `isolateApp(pid:)`. Safe from any
+    /// queue; a no-op when nothing is isolated.
     func restoreApps() {
+        if Thread.isMainThread {
+            restoreAppsOnMain()
+        } else {
+            DispatchQueue.main.async { [weak self] in self?.restoreAppsOnMain() }
+        }
+    }
+
+    private func restoreAppsOnMain() {
         guard !isolatedHiddenPIDs.isEmpty else { return }
         
         var restored = 0
@@ -225,7 +248,44 @@ class InputInjector {
     ///
     /// The client sends normalized coordinates where x=0,y=0 is the top-left of
     /// the captured content and (1,1) is the bottom-right.
-    private func normalizedToScreenCoordinates(x: Double, y: Double) -> CGPoint {
+    /// The modifier bits a remote keystroke may carry. Everything else in the
+    /// 64-bit flag word (device-dependent and reserved bits) is stripped.
+    static let allowedModifierMask: UInt64 = CGEventFlags([
+        .maskShift, .maskControl, .maskAlternate, .maskCommand,
+        .maskAlphaShift, .maskSecondaryFn, .maskNumericPad, .maskHelp,
+    ]).rawValue
+
+    /// Command chords that still make sense when a single window or app is
+    /// shared: select all, save, find, undo/redo, cut, copy, paste, and
+    /// Command+arrow navigation. Anything else with Command held (Cmd+Q,
+    /// Cmd+Tab, Cmd+Space, Ctrl+Cmd+Q, Cmd+Shift+Q, Cmd+Option+Esc, the
+    /// screenshot chords) acts on the host as a whole, not the shared window.
+    static let scopedCommandAllowlist: Set<UInt16> = [
+        0, 1, 3, 6, 7, 8, 9,      // A S F Z X C V
+        123, 124, 125, 126,       // left right down up
+    ]
+
+    /// Flags to inject for a remote keystroke, or nil when the keystroke must
+    /// be dropped. In scoped (window/app) mode Command chords are limited to
+    /// `scopedCommandAllowlist`; bare modifier presses always pass so the
+    /// allowed chords can be formed. Full-display mode only masks the flags.
+    static func keystrokeFlags(keyCode: UInt16, modifiers: UInt64, scoped: Bool) -> CGEventFlags? {
+        let flags = CGEventFlags(rawValue: modifiers & allowedModifierMask)
+        guard scoped, !ModifierKey.isModifier(keyCode), flags.contains(.maskCommand) else { return flags }
+        return scopedCommandAllowlist.contains(keyCode) ? flags : nil
+    }
+
+    /// Clamp a wire coordinate into the unit interval. NaN and infinities
+    /// (raw bit patterns off the network) map to 0.
+    static func clampNormalized(_ value: Double) -> Double {
+        value.isFinite ? min(max(value, 0), 1) : 0
+    }
+
+    private func normalizedToScreenCoordinates(x rawX: Double, y rawY: Double) -> CGPoint {
+        // Clamp so a single-window viewer can only ever click inside the
+        // shared window, never on the rest of the host desktop.
+        let x = Self.clampNormalized(rawX)
+        let y = Self.clampNormalized(rawY)
         if let bounds = captureBounds {
             // Window/app capture — captureBounds is already in Quartz coordinates
             // (origin = top-left of the captured area on screen).
@@ -283,7 +343,10 @@ class InputInjector {
             // held button so drags follow the cursor live.
             let moveType: CGEventType
             let moveButton: CGMouseButton
-            if let held = heldMouseButton {
+            heldStateLock.lock()
+            let held = heldMouseButton
+            heldStateLock.unlock()
+            if let held {
                 moveType = held == 0 ? .leftMouseDragged : (held == 1 ? .rightMouseDragged : .otherMouseDragged)
                 moveButton = CGMouseButton(rawValue: UInt32(held)) ?? .left
             } else {
@@ -307,42 +370,61 @@ class InputInjector {
                 logger.info("🖱️ map norm(\(String(format: "%.3f", x)), \(String(format: "%.3f", y))) -> screen(\(Int(point.x)), \(Int(point.y))) bounds=\(b)")
             }
             let type: CGEventType = button == 0 ? .leftMouseDown : (button == 1 ? .rightMouseDown : .otherMouseDown)
-            guard let event = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: point, mouseButton: CGMouseButton(rawValue: UInt32(button))!) else {
+            guard let mouseButton = CGMouseButton(rawValue: UInt32(button)),
+                  let event = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: point, mouseButton: mouseButton) else {
                 lcDebug("[INPUT-DIAG] ❌ INJECT FAILED: could not create mouseDown CGEvent at norm(\(x), \(y))")
                 return
             }
+            heldStateLock.lock()
             heldMouseButton = button
+            heldStateLock.unlock()
             lcDebug("[INPUT-DIAG] 💉 INJECTING mouseDown button=\(button) at screen(\(Int(point.x)), \(Int(point.y))) from norm(\(String(format: "%.3f", x)), \(String(format: "%.3f", y))) bounds=\(String(describing: captureBounds))")
             event.post(tap: .cghidEventTap)
             
         case .mouseUp(let button, let x, let y):
             let point = normalizedToScreenCoordinates(x: x, y: y)
             let type: CGEventType = button == 0 ? .leftMouseUp : (button == 1 ? .rightMouseUp : .otherMouseUp)
-            guard let event = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: point, mouseButton: CGMouseButton(rawValue: UInt32(button))!) else {
+            guard let mouseButton = CGMouseButton(rawValue: UInt32(button)),
+                  let event = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: point, mouseButton: mouseButton) else {
                 lcDebug("[INPUT-DIAG] ❌ INJECT FAILED: could not create mouseUp CGEvent at norm(\(x), \(y))")
                 return
             }
+            heldStateLock.lock()
             if heldMouseButton == button { heldMouseButton = nil }
+            heldStateLock.unlock()
             lcDebug("[INPUT-DIAG] 💉 INJECTING mouseUp button=\(button) at screen(\(Int(point.x)), \(Int(point.y)))")
             event.post(tap: .cghidEventTap)
             
         case .keyDown(let keyCode, let modifiers):
+            guard let flags = Self.keystrokeFlags(keyCode: keyCode, modifiers: modifiers, scoped: captureBounds != nil) else {
+                lcDebug("[INPUT-DIAG] 🚫 keyDown keyCode=\(keyCode) blocked in single-window mode")
+                return
+            }
             guard let event = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: true) else {
                 lcDebug("[INPUT-DIAG] ❌ INJECT FAILED: could not create keyDown CGEvent for keyCode \(keyCode)")
                 return
             }
-            event.flags = CGEventFlags(rawValue: modifiers)
-            if ModifierKey.isModifier(keyCode) { heldModifierKeyCodes.insert(keyCode) }
+            event.flags = flags
+            if ModifierKey.isModifier(keyCode) {
+                heldStateLock.lock()
+                heldModifierKeyCodes.insert(keyCode)
+                heldStateLock.unlock()
+            }
             lcDebug("[INPUT-DIAG] 💉 INJECTING keyDown keyCode=\(keyCode) modifiers=\(modifiers)")
             event.post(tap: .cghidEventTap)
             
         case .keyUp(let keyCode, let modifiers):
+            guard let flags = Self.keystrokeFlags(keyCode: keyCode, modifiers: modifiers, scoped: captureBounds != nil) else {
+                return
+            }
             guard let event = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false) else {
                 lcDebug("[INPUT-DIAG] ❌ INJECT FAILED: could not create keyUp CGEvent for keyCode \(keyCode)")
                 return
             }
-            event.flags = CGEventFlags(rawValue: modifiers)
+            event.flags = flags
+            heldStateLock.lock()
             heldModifierKeyCodes.remove(keyCode)
+            heldStateLock.unlock()
             lcDebug("[INPUT-DIAG] 💉 INJECTING keyUp keyCode=\(keyCode)")
             event.post(tap: .cghidEventTap)
             
@@ -374,8 +456,12 @@ class InputInjector {
     /// Command key makes the host keyboard appear broken to whoever is sitting
     /// in front of it.
     func releaseHeldInput() {
+        heldStateLock.lock()
         let stuckKeys = heldModifierKeyCodes
         heldModifierKeyCodes.removeAll()
+        let stuckButton = heldMouseButton
+        heldMouseButton = nil
+        heldStateLock.unlock()
 
         for keyCode in stuckKeys {
             guard let event = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false) else { continue }
@@ -383,8 +469,7 @@ class InputInjector {
             event.post(tap: .cghidEventTap)
         }
 
-        if let button = heldMouseButton {
-            heldMouseButton = nil
+        if let button = stuckButton {
             let type: CGEventType = button == 0 ? .leftMouseUp : (button == 1 ? .rightMouseUp : .otherMouseUp)
             let location = CGEvent(source: nil)?.location ?? .zero
             if let mouseButton = CGMouseButton(rawValue: UInt32(button)),
@@ -446,41 +531,42 @@ extension InputInjector.RemoteInput {
         return data
     }
     
-    static func deserialize(_ data: Data) -> InputInjector.RemoteInput? {
+    /// Highest mouse button index the wire format accepts. `CGMouseButton` has
+    /// exactly three cases; anything else off the network is rejected here so
+    /// the injector never has to handle it.
+    static let maxMouseButton = 2
+
+    static func deserialize(_ raw: Data) -> InputInjector.RemoteInput? {
+        // Re-base so absolute offsets below are correct even for a slice.
+        let data = raw.startIndex == 0 ? raw : Data(raw)
         guard !data.isEmpty else { return nil }
-        let type = data[0]
-        switch type {
+
+        func u64(_ range: Range<Int>) -> UInt64 {
+            data.subdata(in: range).withUnsafeBytes { $0.loadUnaligned(as: UInt64.self).bigEndian }
+        }
+        func u16(_ range: Range<Int>) -> UInt16 {
+            data.subdata(in: range).withUnsafeBytes { $0.loadUnaligned(as: UInt16.self).bigEndian }
+        }
+
+        switch data[0] {
         case 1: // mouseMove
             guard data.count >= 17 else { return nil }
-            let x = Double(bitPattern: data.subdata(in: 1..<9).withUnsafeBytes { $0.load(as: UInt64.self).bigEndian })
-            let y = Double(bitPattern: data.subdata(in: 9..<17).withUnsafeBytes { $0.load(as: UInt64.self).bigEndian })
-            return .mouseMove(x: x, y: y)
-        case 2: // mouseDown
-            guard data.count >= 18 else { return nil }
+            return .mouseMove(x: Double(bitPattern: u64(1..<9)), y: Double(bitPattern: u64(9..<17)))
+        case 2, 3: // mouseDown / mouseUp
+            guard data.count >= 18, data[1] <= maxMouseButton else { return nil }
             let button = Int(data[1])
-            let x = Double(bitPattern: data.subdata(in: 2..<10).withUnsafeBytes { $0.load(as: UInt64.self).bigEndian })
-            let y = Double(bitPattern: data.subdata(in: 10..<18).withUnsafeBytes { $0.load(as: UInt64.self).bigEndian })
-            return .mouseDown(button: button, x: x, y: y)
-        case 3: // mouseUp
-            guard data.count >= 18 else { return nil }
-            let button = Int(data[1])
-            let x = Double(bitPattern: data.subdata(in: 2..<10).withUnsafeBytes { $0.load(as: UInt64.self).bigEndian })
-            let y = Double(bitPattern: data.subdata(in: 10..<18).withUnsafeBytes { $0.load(as: UInt64.self).bigEndian })
-            return .mouseUp(button: button, x: x, y: y)
-        case 4: // keyDown
+            let x = Double(bitPattern: u64(2..<10))
+            let y = Double(bitPattern: u64(10..<18))
+            return data[0] == 2 ? .mouseDown(button: button, x: x, y: y) : .mouseUp(button: button, x: x, y: y)
+        case 4, 5: // keyDown / keyUp
             guard data.count >= 11 else { return nil }
-            let keyCode = data.subdata(in: 1..<3).withUnsafeBytes { $0.load(as: UInt16.self).bigEndian }
-            let modifiers = data.subdata(in: 3..<11).withUnsafeBytes { $0.load(as: UInt64.self).bigEndian }
-            return .keyDown(keyCode: keyCode, modifiers: modifiers)
-        case 5: // keyUp
-            guard data.count >= 11 else { return nil }
-            let keyCode = data.subdata(in: 1..<3).withUnsafeBytes { $0.load(as: UInt16.self).bigEndian }
-            let modifiers = data.subdata(in: 3..<11).withUnsafeBytes { $0.load(as: UInt64.self).bigEndian }
-            return .keyUp(keyCode: keyCode, modifiers: modifiers)
+            let keyCode = u16(1..<3)
+            let modifiers = u64(3..<11)
+            return data[0] == 4 ? .keyDown(keyCode: keyCode, modifiers: modifiers) : .keyUp(keyCode: keyCode, modifiers: modifiers)
         case 6: // scroll
             guard data.count >= 17 else { return nil }
-            let dx = Double(bitPattern: data.subdata(in: 1..<9).withUnsafeBytes { $0.load(as: UInt64.self).bigEndian })
-            let dy = Double(bitPattern: data.subdata(in: 9..<17).withUnsafeBytes { $0.load(as: UInt64.self).bigEndian })
+            let dx = Double(bitPattern: u64(1..<9))
+            let dy = Double(bitPattern: u64(9..<17))
             // 17-byte payloads come from builds that predate the precise flag;
             // they always injected as pixels, so keep that reading for them.
             let precise = data.count >= 18 ? data[17] == 1 : true

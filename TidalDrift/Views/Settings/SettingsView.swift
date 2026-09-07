@@ -367,13 +367,12 @@ struct NetworkSettingsView: View {
                 Toggle("Enable SSH Discovery", isOn: $appState.settings.sshDiscoveryEnabled)
                     .help("Actively scan the network for devices with SSH enabled.")
                 
-                Picker("Scan interval", selection: $appState.settings.scanIntervalSeconds) {
+                Picker("Device cleanup interval", selection: $appState.settings.scanIntervalSeconds) {
                     ForEach(AppSettings.scanIntervalOptions, id: \.self) { interval in
                         Text(AppSettings.scanIntervalDisplayName(for: interval)).tag(interval)
                     }
                 }
-                
-                Toggle("Auto-connect to trusted devices", isOn: $appState.settings.autoConnectTrustedDevices)
+                .help("Bonjour updates continuously. This interval controls removal of stale devices, without repeating a subnet scan.")
             }
             
             Section {
@@ -640,7 +639,7 @@ struct RemoteLoginToggle: View {
                 ProgressView()
                     .scaleEffect(0.7)
             } else {
-                Toggle("", isOn: Binding(
+                Toggle("Remote Login", isOn: Binding(
                     get: { isEnabled },
                     set: { newValue in
                         toggleRemoteLogin(enable: newValue)
@@ -717,7 +716,7 @@ struct DirectRoutingToggle: View {
                 if isToggling {
                     ProgressView().scaleEffect(0.7)
                 } else {
-                    Toggle("", isOn: Binding(
+                    Toggle("Route home LAN direct", isOn: Binding(
                         get: { status.installed },
                         set: { setEnabled($0) }
                     ))
@@ -891,7 +890,7 @@ struct TidalDropFolderPicker: View {
                 
                 if !appState.settings.tidalDropDestination.isEmpty {
                     Button("Reset to Default") {
-                        appState.settings.tidalDropDestination = ""
+                        appState.settings.resetTidalDropDestination()
                     }
                     .buttonStyle(.plain)
                     .foregroundColor(.secondary)

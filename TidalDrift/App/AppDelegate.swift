@@ -442,9 +442,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     /// right edge never falls off-screen. This is the whole point of
     /// going from NSPopover → NSPanel: AppKit will never flip us above.
     private func positionMenuPanel(_ panel: NSWindow, below button: NSStatusBarButton) {
-        guard let buttonWindow = button.window else { return }
+        // Headless Macs (a common screen-sharing target) can report no
+        // screens at all; there is nowhere to position the panel then.
+        guard let buttonWindow = button.window,
+              let screen = buttonWindow.screen ?? NSScreen.main ?? NSScreen.screens.first else { return }
         let buttonFrameInScreen = buttonWindow.convertToScreen(button.frame)
-        let screenFrame = (buttonWindow.screen ?? NSScreen.main ?? NSScreen.screens.first!).visibleFrame
+        let screenFrame = screen.visibleFrame
 
         let desiredHeight = currentMenuPanelHeight(maxScreenHeight: screenFrame.height - 16)
         let panelSize = NSSize(width: Self.menuPanelWidth, height: desiredHeight)

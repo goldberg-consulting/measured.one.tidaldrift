@@ -107,14 +107,14 @@ extension HostSession {
 
         logger.info("🚀 LocalCast: Capturing at \(width)x\(height) (native: \(nativeWidth)x\(nativeHeight), scale: \(String(format: "%.2f", scale)))")
 
-        encoder.setup(
+        guard encoder.setup(
             width: width,
             height: height,
             codec: configuration.codec,
             bitrateMbps: effectiveBitrateMbps,
             fps: configuration.targetFrameRate,
             quality: configuration.encoderQuality
-        )
+        ) else { throw LocalCastError.encoderInitializationFailed }
         logger.info("✅ Video encoder configured: \(self.configuration.codec.rawValue), \(self.effectiveBitrateMbps)Mbps, \(self.configuration.targetFrameRate)fps, quality=\(self.configuration.encoderQuality)")
 
         try await captureManager.startCapture(
@@ -138,14 +138,14 @@ extension HostSession {
         // Pre-create encoder with placeholder dimensions so the very first
         // frames don't get silently dropped. The encoder auto-reconfigures
         // when it receives frames at the actual Retina capture resolution.
-        encoder.setup(
+        guard encoder.setup(
             width: 1920,
             height: 1080,
             codec: configuration.codec,
             bitrateMbps: effectiveBitrateMbps,
             fps: configuration.targetFrameRate,
             quality: configuration.encoderQuality
-        )
+        ) else { throw LocalCastError.encoderInitializationFailed }
         encoder.forceKeyFrame()
 
         try await captureManager.startWindowCapture(
@@ -161,14 +161,14 @@ extension HostSession {
 
         // Pre-create encoder with placeholder dimensions (auto-reconfigures
         // to actual Retina resolution on first frame).
-        encoder.setup(
+        guard encoder.setup(
             width: 1920,
             height: 1080,
             codec: configuration.codec,
             bitrateMbps: effectiveBitrateMbps,
             fps: configuration.targetFrameRate,
             quality: configuration.encoderQuality
-        )
+        ) else { throw LocalCastError.encoderInitializationFailed }
         encoder.forceKeyFrame()
 
         try await captureManager.startAppCapture(

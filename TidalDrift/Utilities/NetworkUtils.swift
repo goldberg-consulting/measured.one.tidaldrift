@@ -165,6 +165,19 @@ struct NetworkUtils {
         return false
     }
     
+    /// Whether a peer address is on the local network in the sense that
+    /// unauthenticated LAN services (TidalDrop, the speed-test responder) may
+    /// talk to it: private or link-local IPv4, loopback, or IPv6 link-local /
+    /// unique-local. A zone suffix ("%en0") is ignored.
+    static func isLocalPeerAddress(_ address: String) -> Bool {
+        let bare = address.split(separator: "%", maxSplits: 1).first.map(String.init) ?? address
+        if bare == "127.0.0.1" || bare == "::1" { return true }
+        if isLocalNetworkAddress(bare) { return true }
+        let lower = bare.lowercased()
+        guard isValidIPAddress(bare) else { return false }
+        return lower.hasPrefix("fe80:") || lower.hasPrefix("fd") || lower.hasPrefix("fc")
+    }
+
     static func isLocalNetworkAddress(_ address: String) -> Bool {
         guard isValidIPAddress(address) else { return false }
         

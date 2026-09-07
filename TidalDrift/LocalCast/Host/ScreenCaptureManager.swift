@@ -39,6 +39,23 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     weak var delegate: ScreenCaptureManagerDelegate?
     
     private var stream: SCStream?
+    // A dedicated sequencer keeps whole-configuration mutations ordered across
+    // suspension points. It is independent of HostSession's outer sequencer;
+    // only public entry points enqueue, so internal start/stop cannot recurse.
+    private let captureOperations = CaptureTransitionQueue()
+    private let outputStreamLock = NSLock()
+    private var outputStreamID: ObjectIdentifier?
+
+    private func setOutputStream(_ stream: SCStream?) {
+        outputStreamLock.lock()
+        outputStreamID = stream.map(ObjectIdentifier.init)
+        outputStreamLock.unlock()
+    }
+
+    private func isCurrentOutputStream(_ stream: SCStream) -> Bool {
+        outputStreamLock.lock(); defer { outputStreamLock.unlock() }
+        return outputStreamID == ObjectIdentifier(stream)
+    }
     private let captureQueue = DispatchQueue(label: "com.tidaldrift.localcast.capture", qos: .userInteractive)
 
     /// Per-frame change description parsed from ScreenCaptureKit's frame info.
@@ -77,7 +94,7 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Whether the host cursor is composited into captured frames. Off by
     /// default: the viewer's local cursor is the pointer, so pointer motion
     /// does not round-trip the streaming pipeline. Read at stream setup;
-    /// `updateCursorCapture` applies changes to a live stream on macOS 14+.
+    /// `updateCursorCapture` applies changes to a live stream.
     var captureCursor = false
 
     /// Whether the active session captures for the region-aware (tile) path,
@@ -135,6 +152,12 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     // MARK: - Full Display Capture
     
     func startCapture(displayID: CGDirectDisplayID, width: Int, height: Int, frameRate: Int) async throws {
+        try await captureOperations.runThrowing {
+            try await self.performStartCapture(displayID: displayID, width: width, height: height, frameRate: frameRate)
+        }
+    }
+
+    private func performStartCapture(displayID: CGDirectDisplayID, width: Int, height: Int, frameRate: Int) async throws {
         logger.info("Requesting shareable content...")
         
         let content: SCShareableContent
@@ -168,6 +191,12 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     
     /// Start capturing a specific window by its window ID
     func startWindowCapture(windowID: CGWindowID, frameRate: Int = 30, maxDimension: Int = 2560) async throws {
+        try await captureOperations.runThrowing {
+            try await self.performStartWindowCapture(windowID: windowID, frameRate: frameRate, maxDimension: maxDimension)
+        }
+    }
+
+    private func performStartWindowCapture(windowID: CGWindowID, frameRate: Int, maxDimension: Int) async throws {
         logger.info("Starting window capture for windowID: \(windowID)")
         
         let content: SCShareableContent
@@ -190,7 +219,7 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
         
         // window.frame is in points. Multiply by backingScaleFactor to get
         // actual pixel dimensions on Retina displays (typically 2x).
-        let retinaScale = NSScreen.main?.backingScaleFactor ?? 2.0
+        let retinaScale = Self.backingScale(for: window.frame)
         let pixelWidth = window.frame.width * retinaScale
         let pixelHeight = window.frame.height * retinaScale
         
@@ -202,8 +231,8 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         
         // Round to even numbers (required for video encoding)
-        let width = Int(pixelWidth * scale) & ~1
-        let height = Int(pixelHeight * scale) & ~1
+        let width = max(2, Int(pixelWidth * scale) & ~1)
+        let height = max(2, Int(pixelHeight * scale) & ~1)
         
         // Store the window's on-screen bounds for input mapping. Prefer the
         // Quartz (top-left origin) bounds from CGWindowList, which match the
@@ -226,6 +255,12 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     /// is perfectly cropped to the window content, and `captureBounds` (window.frame)
     /// maps directly to Quartz global coordinates for accurate cursor injection.
     func startAppCapture(processID: pid_t, frameRate: Int = 30, maxDimension: Int = 2560) async throws {
+        try await captureOperations.runThrowing {
+            try await self.performStartAppCapture(processID: processID, frameRate: frameRate, maxDimension: maxDimension)
+        }
+    }
+
+    private func performStartAppCapture(processID: pid_t, frameRate: Int, maxDimension: Int) async throws {
         logger.info("Starting app capture for PID: \(processID)")
         
         let content: SCShareableContent
@@ -272,13 +307,13 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
         // no sourceRect needed, proven approach matching startWindowCapture.
         let filter = SCContentFilter(desktopIndependentWindow: mainWindow)
         
-        let retinaScale = NSScreen.main?.backingScaleFactor ?? 2.0
+        let retinaScale = Self.backingScale(for: mainWindow.frame)
         let pixelWidth = mainWindow.frame.width * retinaScale
         let pixelHeight = mainWindow.frame.height * retinaScale
         let scale = min(1.0, Double(maxDimension) / Double(max(pixelWidth, pixelHeight)))
         // Round to even numbers (required for video encoding)
-        let width = Int(pixelWidth * scale) & ~1
-        let height = Int(pixelHeight * scale) & ~1
+        let width = max(2, Int(pixelWidth * scale) & ~1)
+        let height = max(2, Int(pixelHeight * scale) & ~1)
         
         // Prefer Quartz (top-left) bounds for input mapping; see startWindowCapture.
         let bounds = Self.quartzWindowBounds(mainWindow.windowID) ?? mainWindow.frame
@@ -306,11 +341,33 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
 
     // MARK: - Shared Stream Setup
     
-    private func startStream(with filter: SCContentFilter, width: Int, height: Int, frameRate: Int, description: String) async throws {
-        if stream != nil {
-            await stopCapture()
+    /// Choose the display containing the largest part of a Quartz window rect.
+    /// Using the main display's scale blurs windows on a different density panel.
+    private static func backingScale(for windowRect: CGRect) -> CGFloat {
+        let screen = NSScreen.screens.max { lhs, rhs in
+            func area(_ screen: NSScreen) -> CGFloat {
+                guard let id = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID else { return 0 }
+                let overlap = CGDisplayBounds(id).intersection(windowRect)
+                return overlap.isNull ? 0 : overlap.width * overlap.height
+            }
+            return area(lhs) < area(rhs)
         }
-        
+        return screen?.backingScaleFactor ?? 1
+    }
+
+    private func startStream(with filter: SCContentFilter, width: Int, height: Int, frameRate: Int, description: String) async throws {
+        guard width >= 2, height >= 2, frameRate > 0, frameRate <= 240 else {
+            throw LocalCastError.connectionFailed("Invalid screen capture dimensions or frame rate.")
+        }
+        if let previous = stream {
+            // Geometry was assigned by the caller for the incoming stream. Do
+            // not clear that new geometry while stopping the previous capture.
+            stream = nil
+            setOutputStream(nil)
+            activeConfig = nil
+            try? await previous.stopCapture()
+        }
+
         let config = SCStreamConfiguration()
         config.width = width
         config.height = height
@@ -322,6 +379,7 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
         // client samples it with full-range BT.709 coefficients to match.
         config.pixelFormat = regionAwareCapture ? kCVPixelFormatType_32BGRA : kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
         config.colorSpaceName = CGColorSpace.sRGB
+        if !regionAwareCapture { config.colorMatrix = CGDisplayStream.yCbCrMatrix_ITU_R_709_2 }
         config.showsCursor = captureCursor
         // LocalCast is video-only (LocalCastConfiguration.captureAudio is a
         // future flag). Pin both audio knobs explicitly so an SCStream never
@@ -330,88 +388,96 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
         // default leaves us exposed if a macOS release changes it.
         config.capturesAudio = false
         config.excludesCurrentProcessAudio = true
+        let nextStream = SCStream(filter: filter, configuration: config, delegate: self)
+        stream = nextStream
+        setOutputStream(nextStream)
         activeConfig = config
-        
-        logger.info("Creating SCStream for \(description)...")
-        stream = SCStream(filter: filter, configuration: config, delegate: self)
-        
         do {
-            try stream?.addStreamOutput(self, type: .screen, sampleHandlerQueue: captureQueue)
-            logger.info("Added stream output")
-        } catch {
-            logger.error("Failed to add stream output: \(error.localizedDescription)")
-            throw error
-        }
-        
-        do {
-            try await stream?.startCapture()
+            try nextStream.addStreamOutput(self, type: .screen, sampleHandlerQueue: captureQueue)
+            try await nextStream.startCapture()
             logger.info("Capture started for \(description) at \(width)x\(height)@\(frameRate)fps")
         } catch {
+            if stream === nextStream {
+                stream = nil
+                setOutputStream(nil)
+                activeConfig = nil
+                captureMode = nil
+                setGeometry(bounds: nil, windowID: nil)
+            }
+            try? nextStream.removeStreamOutput(self, type: .screen)
             logger.error("Failed to start capture: \(error.localizedDescription)")
             throw error
         }
     }
-    
-    /// Update the capture frame rate live without stopping/restarting the stream.
-    /// Uses `SCStream.updateConfiguration()` on macOS 14+; no-op on older versions.
+
+    /// Snapshot all configured capture properties before a live update. Failed
+    /// updates leave the applied configuration available for a later retry.
+    private func copyConfiguration(_ source: SCStreamConfiguration) -> SCStreamConfiguration {
+        let copy = SCStreamConfiguration()
+        copy.width = source.width
+        copy.height = source.height
+        copy.minimumFrameInterval = source.minimumFrameInterval
+        copy.queueDepth = source.queueDepth
+        copy.pixelFormat = source.pixelFormat
+        copy.colorSpaceName = source.colorSpaceName
+        if source.pixelFormat != kCVPixelFormatType_32BGRA { copy.colorMatrix = source.colorMatrix }
+        copy.showsCursor = source.showsCursor
+        copy.capturesAudio = source.capturesAudio
+        copy.excludesCurrentProcessAudio = source.excludesCurrentProcessAudio
+        return copy
+    }
+
+    /// Change cadence in place on every supported macOS release (12.3+ API).
     func updateFrameRate(_ fps: Int) async {
-        guard let stream = stream else {
-            logger.warning("updateFrameRate: no active stream")
-            return
-        }
-        guard let config = activeConfig else {
-            logger.warning("updateFrameRate: no active configuration")
-            return
-        }
+        await captureOperations.run { await self.performUpdateFrameRate(fps) }
+    }
 
-        // Mutate only the frame interval on the existing configuration.
-        // updateConfiguration replaces the whole config, so a bare config here
-        // would reset width/height/pixelFormat and break the stream (frozen
-        // viewer). Reusing activeConfig preserves everything else.
-        let newInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
-        if CMTimeCompare(config.minimumFrameInterval, newInterval) == 0 { return }
-        config.minimumFrameInterval = newInterval
-
-        if #available(macOS 14.0, *) {
-            do {
-                try await stream.updateConfiguration(config)
-                logger.info("Live capture update: fps → \(fps)")
-            } catch {
-                logger.warning("Failed to update capture frame rate: \(error.localizedDescription)")
-            }
-        } else {
-            logger.info("Live capture fps update requires macOS 14+ (current frame rate unchanged)")
+    private func performUpdateFrameRate(_ fps: Int) async {
+        guard (1...240).contains(fps), let stream, let previous = activeConfig else { return }
+        let interval = CMTime(value: 1, timescale: CMTimeScale(fps))
+        guard CMTimeCompare(previous.minimumFrameInterval, interval) != 0 else { return }
+        let next = copyConfiguration(previous)
+        next.minimumFrameInterval = interval
+        do {
+            try await stream.updateConfiguration(next)
+            if self.stream === stream { activeConfig = next }
+            logger.info("Live capture update: fps → \(fps)")
+        } catch {
+            logger.warning("Failed to update capture frame rate: \(error.localizedDescription)")
         }
     }
-    
-    /// Update cursor compositing live without stopping/restarting the stream.
-    /// Uses `SCStream.updateConfiguration()` on macOS 14+; on older versions
-    /// the new value takes effect on the next session.
-    func updateCursorCapture(_ show: Bool) async {
-        captureCursor = show
-        guard let stream = stream, let config = activeConfig else { return }
-        if config.showsCursor == show { return }
-        config.showsCursor = show
 
-        if #available(macOS 14.0, *) {
-            do {
-                try await stream.updateConfiguration(config)
-                logger.info("Live capture update: showsCursor → \(show)")
-            } catch {
-                logger.warning("Failed to update cursor capture: \(error.localizedDescription)")
-            }
-        } else {
-            logger.info("Live cursor capture update requires macOS 14+ (applies on next session)")
+    /// Change cursor compositing without replacing the capture stream.
+    func updateCursorCapture(_ show: Bool) async {
+        await captureOperations.run { await self.performUpdateCursorCapture(show) }
+    }
+
+    private func performUpdateCursorCapture(_ show: Bool) async {
+        captureCursor = show
+        guard let stream, let previous = activeConfig, previous.showsCursor != show else { return }
+        let next = copyConfiguration(previous)
+        next.showsCursor = show
+        do {
+            try await stream.updateConfiguration(next)
+            if self.stream === stream { activeConfig = next }
+            logger.info("Live capture update: showsCursor → \(show)")
+        } catch {
+            logger.warning("Failed to update cursor capture: \(error.localizedDescription)")
         }
     }
 
     func stopCapture() async {
+        await captureOperations.run { await self.performStopCapture() }
+    }
+
+    private func performStopCapture() async {
         // Detach the stream state first so it is cleared even when the stop
         // call throws. Leaving `stream` set after a failed stop meant a later
         // startStream retried the failing stop and then overwrote the field
         // anyway, leaking a live SCStream that kept delivering stale frames.
         let current = stream
         stream = nil
+        setOutputStream(nil)
         activeConfig = nil
         captureMode = nil
         setGeometry(bounds: nil, windowID: nil)
@@ -428,7 +494,7 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     // MARK: - SCStreamOutput
     
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .screen, sampleBuffer.isValid else { return }
+        guard type == .screen, sampleBuffer.isValid, isCurrentOutputStream(stream) else { return }
         lastFrameChange = parseFrameChange(sampleBuffer)
         delegate?.screenCaptureManager(self, didOutput: sampleBuffer)
     }
@@ -489,6 +555,7 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     // MARK: - SCStreamDelegate
     
     func stream(_ stream: SCStream, didStopWithError error: Error) {
+        guard isCurrentOutputStream(stream) else { return }
         logger.error("Stream stopped with error: \(error.localizedDescription)")
         delegate?.screenCaptureManager(self, didFailWithError: error)
     }

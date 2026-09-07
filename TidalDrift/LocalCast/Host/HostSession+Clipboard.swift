@@ -10,9 +10,14 @@ extension HostSession {
     func startClipboardSyncIfEligible() {
         guard isRunning, authState == .authenticated, hasActiveClient, !isLoopbackConnection else { return }
 
-        let key = transport.sessionKey.map(SessionCrypto.deriveClipboardKey)
-        let allowedHost = clientEndpoint.flatMap(ClipboardBulkPeerAddress.hostString(from:))
-        clipboardBulkHost.start(key: key, allowedHost: allowedHost)
+        // The bulk listener only runs on keyed sessions; a keyless session has
+        // no way to tell the viewer from any other LAN host on that port.
+        if let key = transport.sessionKey.map(SessionCrypto.deriveClipboardKey) {
+            let allowedHost = clientEndpoint.flatMap(ClipboardBulkPeerAddress.hostString(from:))
+            clipboardBulkHost.start(key: key, allowedHost: allowedHost)
+        } else {
+            clipboardBulkHost.stop()
+        }
 
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -36,7 +41,7 @@ extension HostSession {
             // connect and push.
             engine.fetchEager = { [weak self] offer, kind, completion in
                 guard let self else { return }
-                self.clipboardBulkHost.expectPush(token: offer.token, kind: kind, cacheDir: nil) { result in
+                self.clipboardBulkHost.expectPush(token: offer.token, kind: kind, offer: offer, cacheDir: nil) { result in
                     completion(result)
                 }
                 self.sendClipboardPacket(type: .clipboardFetchRequest, payload: offer.token, copies: 3)
@@ -48,7 +53,7 @@ extension HostSession {
                 }
                 let cacheDir = FileManager.default.temporaryDirectory
                     .appendingPathComponent("TidalDriftClipboard", isDirectory: true)
-                self.clipboardBulkHost.expectPush(token: offer.token, kind: .files, cacheDir: cacheDir) { result in
+                self.clipboardBulkHost.expectPush(token: offer.token, kind: .files, offer: offer, cacheDir: cacheDir) { result in
                     switch result {
                     case .success(.files(let urls)):
                         completion(.success(urls))
@@ -60,7 +65,7 @@ extension HostSession {
                 }
                 self.sendClipboardPacket(type: .clipboardFetchRequest, payload: offer.token, copies: 3)
             }
-            engine.isFileSyncAllowed = { [weak self] in
+            engine.isBulkSyncAllowed = { [weak self] in
                 self?.transport.sessionKey != nil
             }
             engine.start()

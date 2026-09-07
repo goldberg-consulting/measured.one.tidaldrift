@@ -21,7 +21,6 @@ final class ClipboardFilePromiseDelegate: NSObject, NSFilePromiseProviderDelegat
 
     private let lock = NSLock()
     private var staged: [URL]?
-    private var fetchError: Error?
     private var waiters: [(Result<[URL], Error>) -> Void] = []
     private var fetching = false
     private var invalidated = false
@@ -104,6 +103,14 @@ final class ClipboardFilePromiseDelegate: NSObject, NSFilePromiseProviderDelegat
         }
     }
 
+    /// A transfer can finish after its promise was invalidated or released.
+    /// Dispose of those late results just as we dispose of cached results.
+    private static func removeStaging(from result: Result<[URL], Error>) {
+        if case .success(let urls) = result, let first = urls.first {
+            try? FileManager.default.removeItem(at: first.deletingLastPathComponent())
+        }
+    }
+
     /// Single-flight fetch of the whole offer.
     private func ensureStaged(_ completion: @escaping (Result<[URL], Error>) -> Void) {
         lock.lock()
@@ -125,7 +132,10 @@ final class ClipboardFilePromiseDelegate: NSObject, NSFilePromiseProviderDelegat
         guard shouldFetch else { return }
         logger.info("📋 Paste triggered fetch of \(self.stubs.count) promised file(s)")
         fetch { [weak self] result in
-            guard let self else { return }
+            guard let self else {
+                Self.removeStaging(from: result)
+                return
+            }
             self.lock.lock()
             self.fetching = false
             if case .success(let urls) = result, !self.invalidated {
@@ -133,8 +143,10 @@ final class ClipboardFilePromiseDelegate: NSObject, NSFilePromiseProviderDelegat
             }
             let pending = self.waiters
             self.waiters = []
-            let finalResult: Result<[URL], Error> = self.invalidated ? .failure(ClipboardBulkError.cancelled) : result
+            let isInvalidated = self.invalidated
+            let finalResult: Result<[URL], Error> = isInvalidated ? .failure(ClipboardBulkError.cancelled) : result
             self.lock.unlock()
+            if isInvalidated { Self.removeStaging(from: result) }
             for waiter in pending { waiter(finalResult) }
         }
     }

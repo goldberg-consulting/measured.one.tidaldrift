@@ -195,6 +195,18 @@ class StreamingNetworkService: ObservableObject, @unchecked Sendable {
     }
     
     nonisolated private func handleIncomingConnection(_ connection: NWConnection) {
+        // Unauthenticated control channel: only talk to peers on the local
+        // network, and never to anything that can reach us through a router.
+        let remoteIP: String
+        switch connection.endpoint {
+        case .hostPort(.ipv4(let addr), _): remoteIP = "\(addr)"
+        case .hostPort(.ipv6(let addr), _): remoteIP = "\(addr)"
+        default: remoteIP = ""
+        }
+        guard NetworkUtils.isLocalPeerAddress(remoteIP) else {
+            connection.cancel()
+            return
+        }
         connection.stateUpdateHandler = { [weak self, weak connection] state in
             guard let connection = connection else { return }
             switch state {
@@ -249,25 +261,6 @@ class StreamingNetworkService: ObservableObject, @unchecked Sendable {
                 if let jsonData = try? JSONSerialization.data(withJSONObject: response) {
                     connection.send(content: jsonData, completion: .contentProcessed { _ in })
                 }
-            }
-            
-        case "RESTART_SCREEN_SHARING":
-            // Remote request to restart local Screen Sharing service
-            // This fixes the "not permitted" macOS bug
-            Task {
-                #if DEBUG
-                print("🔧 Remote request to restart Screen Sharing")
-                #endif
-                
-                let success = await ScreenShareConnectionService.shared.restartLocalScreenSharing()
-                
-                let response = success ? "OK" : "FAILED"
-                let responseData = Data(response.utf8)
-                connection.send(content: responseData, completion: .contentProcessed { _ in })
-                
-                #if DEBUG
-                print("🔧 Screen Sharing restart: \(success ? "success" : "failed")")
-                #endif
             }
             
         case "PING":

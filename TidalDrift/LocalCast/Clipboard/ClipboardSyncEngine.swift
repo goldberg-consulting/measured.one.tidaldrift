@@ -30,11 +30,19 @@ final class ClipboardSyncEngine {
     var fetchEager: ((ClipboardBulkOffer, ClipboardContentKind, @escaping (Result<ClipboardBulkReceived, Error>) -> Void) -> Void)?
     /// Resolve a file offer at paste time, delivering staged URLs in offer order.
     var fetchFilesForPaste: ((ClipboardBulkOffer, @escaping (Result<[URL], Error>) -> Void) -> Void)?
-    /// File sync needs a keyed session; text and images match the session's level.
-    var isFileSyncAllowed: (() -> Bool)?
+    /// Whether the bulk (TCP) channel may be used. Bulk needs a keyed session:
+    /// on a keyless one the offer token rides in a sniffable UDP packet and
+    /// the listener has no cryptographic gate, so any LAN host could fetch the
+    /// offered content or push into an armed slot. Keyless sessions sync
+    /// inline (small text and images) only.
+    var isBulkSyncAllowed: (() -> Bool)?
 
     private let logger = Logger(subsystem: "com.tidaldrift", category: "ClipboardSyncEngine")
-    private let pasteboard = NSPasteboard.general
+    private let pasteboard: NSPasteboard
+    private let isSyncEnabled: @MainActor () -> Bool
+    private var pendingRemoteUpdateID: UUID?
+    private var updateSendTask: Task<Void, Never>?
+    private var wasSyncEnabled = false
     private var timer: Timer?
     private var lastChangeCount = 0
     private var lastAppliedDigest: Data?
@@ -50,9 +58,15 @@ final class ClipboardSyncEngine {
     private var promiseDelegate: ClipboardFilePromiseDelegate?
     private(set) var isRunning = false
 
+    init(pasteboard: NSPasteboard = .general, isSyncEnabled: (@MainActor () -> Bool)? = nil) {
+        self.pasteboard = pasteboard
+        self.isSyncEnabled = isSyncEnabled ?? { ClipboardSyncPreferences.shared.isEnabled }
+    }
+
     func start() {
         guard !isRunning else { return }
         isRunning = true
+        wasSyncEnabled = isSyncEnabled()
         // Whatever was copied before the session started stays private.
         lastChangeCount = pasteboard.changeCount
         timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
@@ -64,6 +78,9 @@ final class ClipboardSyncEngine {
     func stop() {
         guard isRunning else { return }
         isRunning = false
+        pendingRemoteUpdateID = nil
+        updateSendTask?.cancel()
+        updateSendTask = nil
         timer?.invalidate()
         timer = nil
         promiseDelegate?.invalidate()
@@ -76,13 +93,29 @@ final class ClipboardSyncEngine {
 
     // MARK: - Local pasteboard to peer
 
-    private func checkPasteboard() {
-        guard isRunning, ClipboardSyncPreferences.shared.isEnabled else { return }
+    func checkPasteboard() {
+        guard isRunning else { return }
+        let enabled = isSyncEnabled()
+        if !enabled || !wasSyncEnabled {
+            // Copies made with sync disabled remain private after re-enabling.
+            lastChangeCount = pasteboard.changeCount
+            if wasSyncEnabled != enabled {
+                supersedePendingContent()
+                lastAppliedDigest = nil
+            }
+            wasSyncEnabled = enabled
+            return
+        }
         let count = pasteboard.changeCount
         guard count != lastChangeCount else { return }
         lastChangeCount = count
 
-        guard let snapshot = ClipboardPasteboard.capture(from: pasteboard) else { return }
+        guard let snapshot = ClipboardPasteboard.capture(from: pasteboard) else {
+            // Concealed or unsupported content still invalidates an older offer.
+            supersedePendingContent()
+            lastAppliedDigest = nil
+            return
+        }
         // Echo gate: the content we just applied from the peer, rewritten by
         // an app that bumps the change count. Time-boxed; see lastAppliedAt.
         if snapshot.digest == lastAppliedDigest,
@@ -94,9 +127,7 @@ final class ClipboardSyncEngine {
 
     private func broadcast(_ snapshot: ClipboardSnapshot) {
         // A newer copy supersedes whatever was offered or in flight.
-        cancelOutbound?()
-        promiseDelegate?.invalidate()
-        promiseDelegate = nil
+        supersedePendingContent()
         // The local pasteboard has moved on, so the receive-side duplicate
         // gate must not keep suppressing the content it once applied.
         lastAppliedDigest = nil
@@ -106,7 +137,7 @@ final class ClipboardSyncEngine {
         if snapshot.kind != .files {
             let inline = ClipboardUpdatePayload(
                 updateId: updateId, kind: snapshot.kind,
-                text: snapshot.text, rtf: snapshot.rtf, png: snapshot.png,
+                text: snapshot.text, rtf: snapshot.rtf, html: snapshot.html, png: snapshot.png,
                 bulk: nil, digest: snapshot.digest
             )
             if let encoded = try? JSONEncoder().encode(inline),
@@ -116,8 +147,8 @@ final class ClipboardSyncEngine {
             }
         }
 
-        if snapshot.kind == .files, isFileSyncAllowed?() != true {
-            logger.info("📋 File copy not offered: file sync requires a password-protected session")
+        if isBulkSyncAllowed?() != true {
+            logger.info("📋 \(snapshot.kind == .files ? "File" : "Large") copy not offered: bulk sync requires a password-protected session")
             return
         }
 
@@ -149,12 +180,13 @@ final class ClipboardSyncEngine {
             content = .data(kind: .image, data: png)
         case .text:
             guard let text = snapshot.text,
-                  let encoded = try? JSONEncoder().encode(ClipboardTextContent(text: text, rtf: snapshot.rtf)) else { return nil }
+                  let encoded = try? JSONEncoder().encode(ClipboardTextContent(text: text, rtf: snapshot.rtf, html: snapshot.html)) else { return nil }
             content = .data(kind: .text, data: encoded)
         }
 
         let totalBytes = content.totalBytes
-        guard totalBytes > 0, totalBytes <= LocalCastConfiguration.clipboardMaxTransferBytes else {
+        guard (totalBytes > 0 || snapshot.kind == .files),
+              totalBytes <= LocalCastConfiguration.clipboardMaxTransferBytes else {
             logger.info("📋 Copy skipped: \(totalBytes) bytes exceeds the transfer limit")
             return nil
         }
@@ -169,39 +201,65 @@ final class ClipboardSyncEngine {
     }
 
     private func send(_ payload: ClipboardUpdatePayload) {
-        for _ in 0..<3 { sendUpdate?(payload) }
+        sendUpdate?(payload)
+        updateSendTask?.cancel()
+        updateSendTask = Task { @MainActor [weak self] in
+            // Space retries across separate network bursts. Back-to-back copies
+            // are commonly all lost in the same Wi-Fi queue overflow.
+            for delay in [80_000_000, 160_000_000] {
+                do { try await Task.sleep(nanoseconds: UInt64(delay)) }
+                catch { return }
+                guard let self, self.isRunning, self.isSyncEnabled() else { return }
+                self.sendUpdate?(payload)
+            }
+        }
+    }
+
+    private func supersedePendingContent() {
+        pendingRemoteUpdateID = nil
+        updateSendTask?.cancel()
+        updateSendTask = nil
+        cancelOutbound?()
+        promiseDelegate?.invalidate()
+        promiseDelegate = nil
     }
 
     // MARK: - Peer to local pasteboard
 
     func handleRemoteUpdate(_ payload: ClipboardUpdatePayload) {
-        guard isRunning, ClipboardSyncPreferences.shared.isEnabled else { return }
+        guard isRunning, isSyncEnabled(), Self.isValid(payload) else { return }
         guard !recentUpdateIds.contains(payload.updateId) else { return }
         recentUpdateIds.append(payload.updateId)
         if recentUpdateIds.count > 16 { recentUpdateIds.removeFirst() }
 
         guard payload.digest != lastAppliedDigest else { return }
+        supersedePendingContent()
+        pendingRemoteUpdateID = payload.updateId
+        let expectedChangeCount = pasteboard.changeCount
 
         guard let bulk = payload.bulk else {
             let count = ClipboardPasteboard.applyInline(
-                kind: payload.kind, text: payload.text, rtf: payload.rtf, png: payload.png,
+                kind: payload.kind, text: payload.text, rtf: payload.rtf, html: payload.html, png: payload.png,
                 to: pasteboard
             )
             recordApplied(changeCount: count, digest: payload.digest)
             return
         }
 
+        guard isBulkSyncAllowed?() == true else { return }
         switch payload.kind {
         case .files:
-            guard isFileSyncAllowed?() == true else { return }
             applyFileOffer(bulk, digest: payload.digest)
         case .text, .image:
             guard bulk.totalBytes <= LocalCastConfiguration.clipboardMaxTransferBytes else { return }
             fetchEager?(bulk, payload.kind) { [weak self] result in
                 Task { @MainActor [weak self] in
-                    guard let self else { return }
+                    guard let self, self.isRunning, self.isSyncEnabled(),
+                          self.pendingRemoteUpdateID == payload.updateId,
+                          self.pasteboard.changeCount == expectedChangeCount else { return }
                     switch result {
                     case .success(.data(let kind, let data)):
+                        guard kind == payload.kind else { return }
                         self.applyFetched(kind: kind, data: data, digest: payload.digest)
                     case .success(.files):
                         self.logger.error("📋 Eager fetch unexpectedly returned files")
@@ -216,14 +274,48 @@ final class ClipboardSyncEngine {
     private func applyFetched(kind: ClipboardContentKind, data: Data, digest: Data) {
         switch kind {
         case .text:
-            guard let content = try? JSONDecoder().decode(ClipboardTextContent.self, from: data) else { return }
-            let count = ClipboardPasteboard.applyInline(kind: .text, text: content.text, rtf: content.rtf, png: nil, to: pasteboard)
+            guard let content = try? JSONDecoder().decode(ClipboardTextContent.self, from: data),
+                  ClipboardPasteboard.textDigest(text: content.text, rtf: content.rtf, html: content.html) == digest else { return }
+            let count = ClipboardPasteboard.applyInline(kind: .text, text: content.text, rtf: content.rtf, html: content.html, png: nil, to: pasteboard)
             recordApplied(changeCount: count, digest: digest)
         case .image:
+            guard ClipboardPasteboard.isValidInline(kind: .image, text: nil, rtf: nil, png: data),
+                  ClipboardPasteboard.digest(kind: .image, chunks: [data]) == digest else { return }
             let count = ClipboardPasteboard.applyInline(kind: .image, text: nil, rtf: nil, png: data, to: pasteboard)
             recordApplied(changeCount: count, digest: digest)
         case .files:
             break
+        }
+    }
+
+    /// Reject malformed announcements before they change the pasteboard or
+    /// allocate file promise state. Limits cover both inline and bulk shapes.
+    static func isValid(_ payload: ClipboardUpdatePayload) -> Bool {
+        guard payload.digest.count == 32 else { return false }
+        if let bulk = payload.bulk {
+            guard payload.text == nil, payload.rtf == nil, payload.html == nil, payload.png == nil,
+                  bulk.token.count == 32, bulk.totalBytes >= 0,
+                  bulk.totalBytes <= LocalCastConfiguration.clipboardMaxTransferBytes else { return false }
+            if payload.kind == .files {
+                guard let files = bulk.files, !files.isEmpty,
+                      files.count <= LocalCastConfiguration.clipboardMaxFiles,
+                      files.allSatisfy({ ClipboardBulkFraming.sanitizeFileName($0.name) != nil }),
+                      ClipboardBulkTransfer.declaredTotal(of: files) == bulk.totalBytes else { return false }
+                return true
+            }
+            return bulk.files == nil && bulk.totalBytes > 0
+        }
+        guard let encoded = try? JSONEncoder().encode(payload),
+              encoded.count <= LocalCastConfiguration.clipboardInlineLimit,
+              ClipboardPasteboard.isValidInline(kind: payload.kind, text: payload.text, rtf: payload.rtf,
+                                                 html: payload.html, png: payload.png) else { return false }
+        switch payload.kind {
+        case .text:
+            return ClipboardPasteboard.textDigest(text: payload.text ?? "", rtf: payload.rtf, html: payload.html) == payload.digest
+        case .image:
+            return ClipboardPasteboard.digest(kind: .image, chunks: [payload.png ?? Data()]) == payload.digest
+        case .files:
+            return false
         }
     }
 
@@ -233,13 +325,15 @@ final class ClipboardSyncEngine {
               stubs.allSatisfy({ ClipboardBulkFraming.sanitizeFileName($0.name) != nil }) else { return }
 
         promiseDelegate?.invalidate()
-        let fetchFiles = fetchFilesForPaste
-        let delegate = ClipboardFilePromiseDelegate(stubs: stubs) { completion in
-            guard let fetchFiles else {
-                completion(.failure(ClipboardBulkError.cancelled))
-                return
+        let delegate = ClipboardFilePromiseDelegate(stubs: stubs) { [weak self] completion in
+            Task { @MainActor [weak self] in
+                guard let self, self.isRunning, self.isSyncEnabled(),
+                      self.isBulkSyncAllowed?() == true, let fetchFiles = self.fetchFilesForPaste else {
+                    completion(.failure(ClipboardBulkError.cancelled))
+                    return
+                }
+                fetchFiles(offer, completion)
             }
-            fetchFiles(offer, completion)
         }
         promiseDelegate = delegate
         let count = ClipboardPasteboard.applyPromises(delegate.makeProviders(), to: pasteboard)

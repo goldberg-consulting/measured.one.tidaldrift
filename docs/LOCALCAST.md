@@ -1,563 +1,171 @@
-# LocalCast (Metal Streaming): Pipeline, Input, and Latency
-
-**Scope:** How the LocalCast screen-streaming path works, the reliability/input
-fixes landed in 1.6.x, and where latency actually comes from.
-
----
-
-## Pipeline (fully GPU / hardware accelerated)
-
-| Stage | Tech | Notes |
-|---|---|---|
-| Capture (host) | ScreenCaptureKit | IOSurface-backed frames from the window server; no CPU readback |
-| Encode (host) | VideoToolbox `VTCompressionSession` (H.264/HEVC) | Apple-silicon **hardware** encoder; `RealTime = true`, `MaxFrameDelayCount = 0` |
-| Transport | UDP (`NWListener`/`NWConnection`), app-level fragmentation | ~1400-byte fragments; AES-256-GCM when auth is on |
-| Decode (client) | VideoToolbox `VTDecompressionSession` | **hardware** decoder; output is NV12 (full range), Metal-compatible |
-| Render (client) | `CVMetalTextureCache` + `MTKView` | **zero-copy** `CVPixelBuffer` → `MTLTexture`; NV12 two-plane YUV (full-range BT.709) or BGRA pipeline per frame; display-linked with an adaptive jitter buffer (not draw-on-demand) |
-
-The whole chain is hardware-accelerated, which is why TidalDrift sits near
-**0% CPU** while streaming. The GPU/codec is not the bottleneck.
-
-## Reliability and input fixes (1.6.x)
-
-- **IPv4 transport pin (1.6.10).** `NWListener` could bind the host port
-  IPv6-only while clients resolve hosts to IPv4 (`AF_INET`), so the host
-  received nothing and the client showed "no response from host." The UDP
-  transport now pins `NWProtocolIP.Options.version = .v4` on both ends.
-- **Auth in the menu + pre-auth heartbeats (1.6.11).** The require-password /
-  host-password controls were hidden in a Settings sub-tab (behind the tab
-  overflow). They are now in the dropdown's hosting section. Separately, a host
-  that requires a password used to drop the client's heartbeats until
-  authenticated, which surfaced as a misleading "no response from host"; the
-  host now answers heartbeats pre-auth (video stays gated) so the failure is
-  recognizably about auth, not the network.
-- **Input coordinate normalization (1.6.12).** The viewer normalized mouse
-  coordinates against the whole content view, but the renderer
-  letterboxes/pillarboxes the stream to preserve aspect ratio, so clicks landed
-  offset from the cursor (worst on single-window streaming). Input is now mapped
-  to the actual aspect-fit video rect and clamped to [0,1] (so a mouse-up on a
-  bar can't leave a stuck button). Keyboard modifiers are masked to
-  `deviceIndependentFlagsMask` so shift/control/option/command (e.g. copy/paste
-  on the remote) map cleanly to `CGEventFlags`.
-- **Capture-start race + viewer takeover (earlier 1.6.x).** Capture starts once
-  per connected client (no duplicate `SCStream`s), and the newest viewer takes
-  over as the single active client.
-- **Live drag tracking (1.6.18).** While a button is held, a move is a *drag*:
-  AppKit's window/selection tracking loops consume `.leftMouseDragged`, not
-  `.mouseMoved`. The injector now tracks the held button and emits the matching
-  dragged event, so dragging a window follows the cursor live instead of
-  jumping to the drop point. (The client already sends moves during
-  `.leftMouseDragged`; the gap was host-side injection.)
-- **Live quality change froze the viewer (1.6.18).** `SCStream.updateConfiguration`
-  replaces the *entire* configuration, but the frame-rate update passed a bare
-  `SCStreamConfiguration` (width/height/pixelFormat all default), resetting the
-  stream to 0x0 and freezing the viewer until a re-share rebuilt it. The capture
-  manager now retains the active config and mutates only the frame interval (and
-  skips the call when fps is unchanged); the host also forces a keyframe after a
-  live quality change so the viewer resyncs immediately.
-- **Render tearing / typing shear (1.6.18).** The Metal renderer kept the
-  `MTLTexture` but not the `CVImageBuffer`/`CVMetalTexture` backing it, so
-  VideoToolbox could recycle that IOSurface for a later frame and the GPU would
-  sample a buffer mid-overwrite (shear, worst during rapid small updates like
-  typing). The renderer now retains the current buffer and wrapper, and extends
-  their lifetime through the GPU draw via the command-buffer completion handler.
-
-- **Cursor offset in resized windows (1.6.37).** Input was normalized against
-  the SwiftUI hosting view, but the video is drawn in the `MTKView`. With a
-  full-size content view + transparent titlebar, SwiftUI insets the Metal view
-  by the top safe area in windowed mode, leaving a vertical offset that vanished
-  in full screen (no titlebar). Input now maps through the `MTKView`'s own
-  coordinate space (`viewPoint(fromWindowPoint:)`, `viewSize`), so it matches the
-  rendered surface in both windowed and full-screen.
-- **System-shortcut forwarding (1.6.38).** A plain `NSEvent` local monitor never
-  sees system hotkeys (`Cmd+Space`, `Cmd+Tab`, Mission Control, screenshot
-  combos): the window server dispatches them first. The client now installs a
-  `CGEventTap` (`RemoteKeyboardTap`) at the session level, so while the viewer is
-  the key window and Control is on, those combos are swallowed locally and
-  injected on the host instead. `Cmd+Shift+I` always toggles control back so the
-  user is never trapped; falls back to the `NSEvent` monitor if the tap can't be
-  created (no Accessibility grant).
-
-Coordinate model: the client sends normalized `(x, y)` with a top-left origin
-relative to the video. The host maps them with `InputInjector`:
-`captureBounds` (the window/app frame in Quartz coords) for window/app capture,
-or `CGDisplayBounds(CGMainDisplayID())` for full desktop. Both are top-left
-origin, matching `CGEvent`.
-
-## Diagnosing the link: peer speed test (1.6.14)
-
-Device Details has a **Network Speed Test** (UDP/IPv4, same family as the
-stream) that reports RTT/jitter, down/up throughput, and **packet loss** in each
-direction. Loss is the metric that matters: UDP has no retransmit, so a lossy
-direction breaks frames regardless of raw Mbps.
-
-Measured Air ↔ Pro on Wi-Fi (1.6.15): download 746 Mbps / 0% loss, but a
-saturating **upload burst shed ~13%** of its packets at 349 Mbps. Bandwidth is
-not the constraint; **burst loss on the host's uplink** is. That directly
-implicates keyframe sends, which are exactly such bursts.
-
-**Apply optimized settings (1.6.22):** after a test, Device Details shows a
-recommendation derived from the measured link (`SpeedTestService.recommend`) and
-an "Apply optimized settings" button that writes the `localCast*` defaults
-(resolution, region-aware, adaptive, drop-to-newest, loss recovery, codec).
-Resolution and codec scale with the constrained-direction bandwidth; region-aware
-turns on for lossy/low-bandwidth links; resilience options stay on (no-ops on a
-clean link). Applies on the next session.
-
-## Latency: where it comes from
-
-Latency is dominated by the **link and the transport**, not the GPU:
-
-1. **Burst loss on big frames.** A keyframe is hundreds of UDP fragments. Handed
-   to the stack in one tight loop, they overrun the Wi-Fi uplink and ~13% are
-   dropped (measured). With no FEC/retransmit, losing one fragment makes the
-   whole frame undecodable and the client stalls to the next keyframe. **Fixed
-   in 1.6.16** (see below).
-2. **Wi-Fi bandwidth vs bitrate.** Bitrate above the link's comfortable rate
-   over **UDP with no congestion control** adds queuing delay and loss. (On the
-   tested LAN there is ample bandwidth; this is secondary.)
-3. **Capture buffering.** `SCStreamConfiguration.queueDepth` adds buffered
-   frames ahead of the encoder.
-4. **No client catch-up.** The client does not skip to the newest frame when it
-   falls behind.
-
-### Fix 1: paced fragment sending (1.6.16)
-
-`UDPTransport.sendFragmented` no longer dumps every fragment of a large frame
-into the stack at once. Frames above a small threshold are drained on a
-dedicated queue in bursts of `pacingBatchSize` separated by `pacingGapMicros`,
-keeping the instantaneous send rate (~256 Mbps ceiling) under the uplink's
-capacity. Small frames (≤ `pacingFragmentThreshold` fragments) still send
-immediately, so pacing adds no latency where it isn't needed. This targets the
-~13% burst loss directly. Constants live at the top of `UDPTransport` for tuning
-against speed-test numbers.
-
-### Fix 2: loss resilience bundle (1.6.17)
-
-A symptom report crystallised the remaining problem: when dragging, interim
-frames vanish (low effective fps) while still frames are crisp. Cause: a motion
-frame is a large delta of 100+ fragments, and with no FEC/retransmit one lost
-fragment kills the whole frame. Static frames are a few fragments and almost
-always arrive; motion frames frequently lose one and are dropped. (macOS Screen
-Sharing makes the opposite trade: it softens during motion to hold frame rate.)
-
-Four complementary changes, each individually toggleable in Metal Streaming
-settings:
-
-- **Adaptive bitrate (`localCastAdaptive`, host).** The client requests a
-  keyframe on every abandoned-incomplete frame; the host treats clustered
-  requests as congestion and runs AIMD on the encoder bitrate
-  (`adaptiveScale`, ×0.8 down rate-limited, +0.1 up after a quiet period, floor
-  25%). Motion frames shrink enough to survive, then quality restores. A
-  post-connect grace window ignores the connect-time keyframe requests.
-- **Drop-to-newest (`localCastDropToNewest`, client).** Reassembly abandons
-  frames that fall behind the newest by more than `inFlightFrameWindow` instead
-  of buffering a long backlog, and ignores stragglers for abandoned frames.
-- **Loss-triggered recovery (`localCastLossRecovery`, client).** An abandoned
-  incomplete frame fires `udpTransportDidLoseFrames`; the client requests a
-  keyframe (rate-limited to 1/300 ms) so the picture heals in ~1 RTT instead of
-  waiting for the scheduled IDR.
-- **Shorter keyframe interval (4 s → 1.5 s, host).** Bounds worst-case recovery;
-  pacing keeps the more frequent keyframes from re-introducing burst loss.
-
-### Resolution control (1.6.17)
-
-`LocalCastConfiguration.maxDimensionOverride` (UI: "Streaming resolution",
-`localCastMaxDimension`) caps the captured frame's longest edge, aspect ratio
-preserved. `0` = Native, which streams the full panel resolution including
-ultrawide (5120x1440). Options: Native / 720p / 1080p / 1440p / 4K / Ultrawide.
-
-### Fix 3: adaptive jitter buffer + render pacing (1.6.19)
-
-Even with loss handled, motion looked less smooth than macOS Screen Sharing
-because the client presented each decoded frame the instant it arrived. With
-±30-40 ms link jitter, frames land in clumps, so playback cadence was uneven.
-
-`MetalRenderer` now queues decoded frames and releases them on a steady,
-time-based cadence (the measured source interval, `arrivalIntervalEWMA`),
-decoupled from both bursty arrival and the display refresh rate. The buffer is
-display-linked (`isPaused = false`) rather than draw-on-demand so it has a tick
-to pace against. Depth is adaptive: `targetDepth = round(jitter / interval) + 1`,
-clamped to `[1, 6]`, so a jittery link gets cushion while a clean link stays near
-one frame of latency. Overflow drops to newest; underrun re-buffers and holds the
-last frame. Each queued frame retains its `CVImageBuffer`/`CVMetalTexture` (and is
-held through the GPU draw), preserving the tearing fix.
-
-### Fix 4: region-aware streaming (experimental, 1.6.20)
-
-Full parity step toward Screen Sharing: send only what changed. Toggle in
-Metal Streaming settings ("Region-aware streaming"), host-side, default off.
-
-- Host reads `SCStreamFrameInfo` dirty rects ([ScreenCaptureManager](../TidalDrift/LocalCast/Host/ScreenCaptureManager.swift)).
-  Small changed area -> crop the dirty bounding box and send it as a lossless
-  LZFSE BGRA tile (`tileUpdate` packet, [TileCodec](../TidalDrift/LocalCast/Core/TileCodec.swift));
-  large change -> fall back to full-frame video. Hysteresis
-  (`regionTileMaxCoverage` / `regionVideoCoverage` / streak) avoids flapping.
-- Client keeps a persistent canvas texture ([MetalRenderer](../TidalDrift/LocalCast/Client/MetalRenderer.swift)):
-  tiles blit into sub-rects, full frames replace it, the canvas is presented
-  each display tick. Activated on the first tile, so the default jitter-buffer
-  path is unchanged.
-- Recovery (chosen: periodic + on-request full refresh): the host sends a full
-  frame every ~4 s, on client `keyframeRequest`, and at viewer connect to seed
-  the canvas. A lost tile heals at the next refresh.
-- Transport: the top frameId bit marks droppable (video) frames; drop-to-newest
-  reassembly only discards those, so tiles are never dropped as "stale"
-  ([UDPTransport](../TidalDrift/LocalCast/Transport/UDPTransport.swift)).
-- Codec: HEVC selectable for the full-frame fallback. The decoder routes NALs by
-  codec once HEVC is detected (HEVC IDR type 19 otherwise collided with H.264
-  SEI type 6 and was dropped). Default remains H.264 pending two-Mac validation.
-
-Why not pure "small change = small data": H.264/HEVC P-frames already delta-code,
-so typing is already a small frame. Region-aware's wins are avoiding full-frame
-keyframes, not re-encoding the whole panel every tick (ultrawide), and
-lowest-latency localized updates.
-
-### Fix 5: forward error correction (FEC, experimental, 1.6.30; strengthened 1.6.34)
-
-The Moonlight/Sunshine borrow: recover lost UDP packets without a retransmit.
-Toggle in Metal Streaming settings ("Forward error correction"), host-side,
-default off. Both Macs should be updated.
-
-- Sender ([UDPTransport.sendFragmented](../TidalDrift/LocalCast/Transport/UDPTransport.swift)):
-  for droppable (video) frames, after each block of `fecBlockSize` (16) data
-  fragments, emit two parity fragments:
-  - P = XOR(data[i])
-  - Q = XOR((i + 1) * data[i]) over GF(256)
-  Parity reuses the 10-byte header: high bit of `fragmentIndex` marks parity;
-  the next bit marks Q parity. No header growth. Parity is interleaved after its
-  block and paced with it.
-- Receiver: P and Q parity are stored separately from data fragments (never
-  counted toward completion). `recoverBlock` reconstructs up to two missing data
-  fragments per block, except the frame's last (short) fragment whose length
-  can't be inferred. Recovery is always attempted regardless of the local toggle.
-- Why this instead of full Reed-Solomon: two-parity GF(256) FEC covers the
-  common "multiple losses in one block" case with ~12% overhead and no external
-  dependency. If the stats HUD's "Recovered/s" is high but "Dropped/s" stays
-  non-zero, the next escalation is broader Reed-Solomon blocks or selective NACK.
-- Stats: the HUD now shows "Recovered/s" (`fecRecoveredPerSec`).
-
-Codec note for AV1: M3/M4 can hardware-*decode* AV1 (see the Moonlight/
-Jellyfin-ffmpeg builds), but Apple Silicon has no hardware AV1 *encoder* exposed
-to VideoToolbox, and software AV1 is too slow for interactive Mac-to-Mac. HEVC
-remains the target codec; AV1 is a deferred research spike, not a dependency.
-
-### Fix 13: window geometry drift and stuck presentation (1.6.55)
-
-Symptom: resizing the viewer, full-screening something on either end, or
-running Apple Screen Sharing alongside LocalCast left the picture offset from
-where clicks landed, and sometimes froze the viewer entirely. Four independent
-causes, one per layer.
-
-- **Streamed window geometry was frozen at capture start (host).** Window and
-  app capture stored the target's on-screen rect once, and the SCStream kept
-  the pixel dimensions it was created with. Neither followed the window, so
-  moving it (drag, Stage Manager, Mission Control) sent every remote click to
-  where the window used to be, and resizing it left ScreenCaptureKit fitting
-  new content into the old frame: the picture arrived letterboxed *inside* the
-  video and input mapped through the wrong aspect ratio. Note the viewer's own
-  resize triggers exactly this, since it resizes the remote window over
-  Accessibility. `HostSession+WindowTracking` now polls the target's Quartz
-  bounds twice a second while capture is live: a move re-points input with no
-  stream disruption, a resize rebuilds capture at the new size (debounced 0.4 s
-  so a drag costs one rebuild, not one per tick), and the viewer coalesces its
-  own resize notifications over 0.25 s.
-- **A dead window target retried forever (host).** An app going full screen
-  destroys its windowed window and creates a new one, so a pinned window ID
-  stopped resolving. Capture start failed, the client's stall nudge re-drove
-  it against the same missing ID, and the viewer stayed frozen indefinitely.
-  A window that disappears (three consecutive misses, so a full-screen
-  animation is not mistaken for one) or fails to start now redirects to the
-  owning app, which picks up whatever window that app has now, and to the full
-  display if the app is gone. The fallback cannot cycle: an app target that
-  already failed to start goes straight to the display.
-- **Two aspect fits that could disagree (client).** The renderer letterboxed
-  against the decoded frame size while input letterboxed against the last
-  resolution callback. Those diverge for every frame after a host resolution
-  change, and permanently in tile mode where the canvas size never produces a
-  callback, which shows up as a constant click offset. Both now derive from
-  `MetalRenderer.aspectFitRect`, which also scales the drawn quad, so the
-  picture and the click are fitted by the same arithmetic (`VideoFitTests`).
-- **The display link could stay paused (client).** Presentation pauses while
-  the viewer is not visible, driven only by occlusion notifications. A
-  full-screen transition, a Space switch, or another window covering the viewer
-  could leave that state stale after the viewer came back: frames kept arriving
-  and decoding, nothing was ever presented, and the stream looked frozen with
-  no stall for the watchdog to detect. Visibility is now recomputed from the
-  window's actual state (occlusion, key, main, miniaturized) on every event
-  that can change it, including entering and leaving full screen. Full-screen
-  transitions also request a keyframe, and moving the viewer between displays
-  re-reads the refresh rate the jitter buffer paces against.
-
-### Fix 12: lid-closed hosting, wheel scroll speed, stable credential identity (1.6.52)
-
-Lid-closed sessions failed at three independent layers; all are addressed.
-Diagnosis came from a live repro: the wake knock worked, the host authed the
-viewer, then capture failed repeatedly with "Display 1 not found in available
-displays" (unified log, subsystem com.tidaldrift).
-
-- **DarkWake-aware wake restart (host).** A sleep-proxy knock produces a
-  DarkWake, and `NSWorkspace.didWakeNotification` only fires on *full* wake,
-  so the listener-rebind never ran and the host sat unreachable through the
-  ~30 s DarkWake linger. `LocalCastService` now drives the restart from
-  `IORegisterForSystemPower` (`SystemPowerMonitor`), which reports every
-  power-on, dark or full. At each wake while hosting it also takes a
-  time-bounded `kIOPMAssertNetworkClientActive` assertion (3 min,
-  auto-release) so the machine survives past the linger long enough for the
-  viewer to connect. The 5 s advertisement watchdog additionally rebinds if
-  the UDP listener reports failed/cancelled, and the transport surfaces
-  listener death via `onListenerFailed` -> `HostSession.onTransportDied`.
-- **Full-wake promotion (host).** Inbound client packets (rate-limited to
-  one per 30 s) declare `IOPMAssertionDeclareUserActivity(kIOPMUserActiveRemote)`,
-  the same mechanism screensharingd uses; on an open-lid or external-display
-  host this promotes DarkWake to full wake and resets idle timers. While a
-  viewer is connected the session now holds `kIOPMAssertNetworkClientActive`
-  alongside the existing ProcessInfo activity, because the idle-sleep
-  assertion has no standing against the post-network-wake maintenance
-  re-sleep (it only blocks *idle* sleep).
-- **Virtual display for headless capture (host).** With the lid closed and
-  no external monitor the built-in panel leaves the display list entirely,
-  so there is nothing to capture. Full-display capture now resolves its
-  target from `SCShareableContent` (filtered to active, awake displays,
-  falling back from the main display) and, when nothing usable exists,
-  creates a software display via the private CGVirtualDisplay classes
-  (`VirtualDisplayController`), the same approach Jump Desktop and Splashtop
-  ship. Runtime-resolved ObjC so an API change degrades to the old failure,
-  never a crash; created on demand, retried once (macOS 14 betas transiently
-  rejected creation with zero physical displays), released on idle/stop.
-  Input for a non-main captured display maps through that display's global
-  Quartz bounds instead of assuming the main display.
-- **Capture revival on display arrival (host).** The display-change observer
-  now also starts capture when a display *appears* while an authenticated
-  viewer is waiting with capture down (lid opened, external or virtual
-  display came online), instead of waiting for the client's stall nudge.
-- **Honest connect status + persistent wake (client).** The viewer no longer
-  shows "check Firewall settings" after 6 s of silence; up to 25 s it shows
-  "waking the remote Mac...", re-knocks TCP 5900 every 2 s (the first knock
-  can be dropped, and UDP heartbeats to 5904 do not trigger the sleep
-  proxy), resends WOL when a MAC is stored, and re-drives the auth handshake
-  so authRequests lost while the host was still waking do not strand the
-  session in "Authenticating...".
-- **Wheel scrolling was ~20x too slow (input).** The client sent
-  `scrollingDeltaX/Y` without `hasPreciseScrollingDeltas`, and the host
-  injected everything as `.pixel` units. Trackpad deltas are pixels, but a
-  physical wheel's deltas are *lines*, so one notch moved ~1 px. The scroll
-  input now carries a `precise` flag and the host injects `.line` for wheel
-  events (old 17-byte payloads still read as pixels). Deltas round away
-  from zero so slow drifts are not truncated to no-ops.
-- **Saved logins unseated by rotating IPs / multi-NIC (identity).** Secrets
-  were keyed by hostname (`identityKey` gated peer IDs on an `isTrusted`
-  flag nothing ever set), and hostnames flap: unresolved at rediscovery,
-  Bonjour instance name vs real hostname, renames. The TidalDrift peer ID
-  (persisted per-install UUID from the Bonjour TXT) now leads the identity
-  key, and credential/WOL-MAC lookups walk every alias the computer has
-  ever been keyed by (peer ID, manual ref, hostname, cache UUID, legacy
-  name_ip), migrating hits to the canonical key. Saving, reading, deleting,
-  and has-credential checks all use the alias walk.
-- **Stats readout removed from the video surface.** The optional floating
-  top-right overlay (resolution/codec/mode/rate/bitrate/latency) and its
-  Settings toggle are gone; the same live numbers remain in Stream Controls
-  under Info.
-
-Lid-closed operating constraints (macOS policy, not fixable in-app): wake
-over the network requires "Wake for network access" (womp), which macOS
-enables on AC power but disables on battery by default, and a battery
-machine in standby/hibernation cannot be woken remotely at all. Lid-closed
-hosting is therefore reliable plugged in; on battery only within the
-pre-standby window. FileVault survives sleep (keys stay in memory), but a
-powered-off or hibernated Mac needs a physical power-on.
-
-### Fix 11: display-reconfig recovery, thermal throttle, faster connect/discovery (1.6.50)
-
-Symptom set from running Apple Screen Sharing and LocalCast together: the
-stream froze while both were active, and after the Apple session ended the
-host display mode reverted but the stream kept the stale resolution, so the
-viewer's normalized input mapped through the wrong aspect ratio and the
-cursor landed off-target. Root cause: nothing observed display
-reconfiguration. Apple Screen Sharing changes the host's display mode
-(dynamic resolution) on connect and disconnect; SCStream sometimes dies
-(already handled reactively) but can also keep delivering frames scaled for
-the old mode, which never trips `didFailWithError`.
-
-- **Proactive display-change rebuild (host).** `HostSession` observes
-  `NSApplication.didChangeScreenParametersNotification`, debounces 1 s (a
-  Screen Sharing connect fires several parameter changes back to back), then
-  retargets the live capture to the same target. That re-reads the display
-  mode / window bounds, rebuilds the encoder at the new size, refreshes
-  `InputInjector.captureBounds`, and forces keyframes. Known-recoverable, so
-  it also resets the capture-failure retry budget.
-- **Thermal throttle (host, `localCastThermalThrottle`, default on).** The
-  host observes `ProcessInfo.thermalState`: serious caps the stream at
-  30 fps and half bitrate; critical at 15 fps and quarter bitrate; caps lift
-  automatically when pressure clears. Applied on the adaptive queue through
-  the same `updateLiveParameters`/`updateFrameRate` path as user tuning, and
-  re-imposed after any capture rebuild. Toggle in Metal Streaming settings.
-- **Faster share initiation.** The pre-connect wake knock for hosts that
-  look online is now fire-and-forget (sending the SYN is what wakes the
-  host), removing up to 1.5 s from every VNC/LocalCast connect.
-  `ConnectionResolver`'s ipFirst strategy races the cached-IP probe against
-  the mDNS hostname lookup instead of running them serially, so a stale IP
-  costs the slower of the two rather than their sum.
-- **Faster discovery.** Blocking `dns-sd -L` forks and `getaddrinfo` calls
-  moved off the serial discovery queue onto a dedicated concurrent resolve
-  queue, so browse events and the publish debounce no longer wait up to 5 s
-  behind a single lookup (the main cause of peers appearing late and
-  intermittently). LocalCast resolves now use the advertised TXT `ip=`
-  directly when present, skipping the hostname walk entirely. Manual refresh
-  also clears the hostname-resolve cooldown so it re-resolves immediately.
-
-### Fix 10: blank viewer at 250 Mbps Fast LAN (1.6.49)
-
-1.6.48's Fast LAN bitrate raise (150 → 250 Mbps) regressed connect: the viewer
-window opened but stayed blank, with the host logging an endless keyframe
-retry loop (each keyframe request answered, no keyframe ever decoded). Root
-cause: Fast LAN sends unpaced, and at 250 Mbps the connect keyframe became a
-multi-thousand-datagram back-to-back blast that overran NIC/switch buffers
-even on a clean 10GbE path. One lost fragment makes the whole keyframe
-undecodable, and every retry blasted the same way.
-
-- Fast LAN target reverted to the proven 150 Mbps default (users can still
-  push 200-400 via the manual bitrate override).
-- Fast LAN now **micro-paces large frames**: frames over 256 fragments drain
-  in ~90 KB bursts with a 250 µs gap (~3 Gbps instantaneous ceiling, a 2 MB
-  keyframe drains in ~6 ms). Ordinary P-frames remain unpaced for lowest
-  latency. `paceFragments` takes batch/gap parameters so the resilient Wi-Fi
-  profile is unchanged.
-
-### Fix 9: mid-stream freeze recovery + wired-link headroom (1.6.48)
-
-Freeze diagnosis from a live session (host logs showed `Stream stopped with
-error` / `Capture failure` mid-stream): when SCStream dies (display
-reconfiguration, shared window closed, WindowServer hiccup), the host only
-logged it. The UDP listener and pongs stayed alive, so the client's reconnect
-watchdog correctly never fired, and the viewer froze forever. Fixes:
-
-- **Capture auto-restart.** On `didFailWithError` the host stops the dead
-  stream, waits ~0.8 s, restarts capture for the current target, and forces a
-  keyframe. Bounded to 5 attempts (reset on success) so a revoked permission
-  cannot restart-loop.
-- **Display sleep prevention.** The streaming activity now includes
-  `idleDisplaySleepDisabled`: remote viewing generates no local HID input, so
-  the host's display slept mid-session and ScreenCaptureKit suspended
-  delivery, another forever-freeze with live pongs.
-- **Send-queue race fixes.** The 1.6.47 send queue read the session key inside
-  the async block; the auth flow installs/clears the key right after enqueuing
-  a packet, so a handshake packet could be encrypted before the peer had the
-  key (failed auth) or the disconnect bye could go out plaintext (dropped, so
-  the host held the stale session for the 10 s idle timeout). The key is now
-  snapshotted at enqueue, and `stopListening` drains the send queue before
-  cancelling connections.
-- **Idle media heartbeat.** The idle skip now lets one frame per second
-  through, keeping the client's media clock and stats alive and bounding any
-  stall from a mis-flagged idle frame to about a second.
-
-Wired multi-gig (10GbE) headroom: Fast LAN's bitrate target raised from 150 to
-250 Mbps, and the manual bitrate picker gains 200/300/400 Mbps options (wired
-only; Wi-Fi cannot sustain them). HEVC at 250 Mbps / 5K / 60 fps is visually
-near-lossless for desktop content.
-
-### Fix 8: high-res heat reduction + lid-closed wake (1.6.47)
-
-A codebase-wide CPU audit at 5120x1440 / 100-150 Mbps found the heat coming
-from four places; all are addressed:
-
-- **Idle frames were encoded at full rate (host).** ScreenCaptureKit delivers
-  frames at the configured fps even when nothing changed; the default path
-  encoded and sent every one. Idle frames (`SCFrameStatus != .complete`) are
-  now skipped unless a forced keyframe is pending, so a static screen costs
-  near zero encode/send work.
-- **The transport ran on the VideoToolbox callback thread (host).** Packet
-  serialize, AES-GCM, fragmentation (hundreds of `Data` allocs per frame), and
-  in Fast LAN the entire ~10k packets/sec synchronous send loop all executed on
-  the VT output callback. Everything now runs on a dedicated serial send queue;
-  the fragment header is also written byte-wise (was 4 tiny heap `Data`s per
-  fragment, ~40k allocs/sec).
-- **The viewer re-presented the same frame at display rate (client).** The
-  MTKView ran a full GPU render + present at 60-120 Hz even when the stream was
-  static, occluded, or disconnected. Draw ticks now skip the GPU pass unless a
-  new frame was dequeued, the canvas changed, or the drawable resized; the view
-  fully pauses on disconnect, miniaturize, and window occlusion.
-- **Hot-path release logging** (per-keyframe `logger.info`, dirty-rect stats)
-  downgraded to `.debug`.
-
-Lid-closed / sleeping host fixes (why Apple Screen Sharing could wake a Mac
-but Metal Streaming could not):
-
-- **Wake on Demand knock.** A sleeping Mac's Bonjour records are kept alive by
-  the network's sleep proxy, so it looks "online" and the old wake path bailed
-  out; and LocalCast's UDP port never triggers the proxy (only TCP to a
-  registered service like Screen Sharing's 5900 does). Before any LocalCast
-  connect, the client now always knocks TCP 5900 (short timeout, no stored MAC
-  needed), which is exactly how Apple Screen Sharing wakes the host. WOL magic
-  packets remain as a fallback when a MAC is known.
-- **Host recovery after wake.** Sleep kills the UDP listener and orphans the
-  dns-sd ad while `isHosting` stayed true. `LocalCastService` now observes
-  `NSWorkspace.didWakeNotification` and restarts hosting + advertisement.
-- **Sleep prevention while streaming.** The host holds a
-  `ProcessInfo.beginActivity(.idleSystemSleepDisabled)` assertion while a
-  viewer is connected and capture is active (released on idle/disconnect/stop),
-  so the host cannot idle-sleep mid-stream.
-
-### Fix 7: encoder XPC deadlock under concurrent access (1.6.40)
-
-A `sample` of a hung host showed five threads blocked in
-`xpc_connection_send_message_with_reply_sync` against the VideoToolbox encoder
-service: the main thread in `updateStreamingQuality` →
-`VTCompressionSessionSetProperty`, the adaptive queue in `applyAdaptiveBitrate`
-→ `VTSessionSetProperty`, the capture queue in `VTCompressionSessionEncodeFrame`,
-plus VT's own compression and callback queues. `VTCompressionSession` is not
-safe for concurrent use; simultaneous property-set + encode wedges the encoder
-service, which then blocks every caller forever (UI beachball, and encoder
-instability that outlives the stream). Two fixes:
-
-- `VideoEncoder` serializes every session call (create, encode, property
-  update, invalidate) behind a recursive lock.
-- `HostSession.updateStreamingQuality` applies encoder changes on the adaptive
-  serial queue, never on the caller's (main) thread, so the UI can't block on
-  an in-flight encode even briefly.
-
-Also in 1.6.40: the in-stream chevron now opens the tabbed Stream Controls
-popup directly (no expanded-toolbar submenu step), and the optional stats
-readout floats top-right independent of any toolbar.
-
-### Fix 6: low-latency rate control + frictionless settings (1.6.38)
-
-- **Low-latency rate controller.** `VideoEncoder` now passes
-  `kVTVideoEncoderSpecification_EnableLowLatencyRateControl` at session creation
-  (Apple Silicon, macOS 11.3+). This is the encoder mode built for real-time
-  streaming: it reacts to bitrate changes within a frame or two and holds latency
-  far better than the default controller under motion and loss. Falls back
-  silently on hardware without it.
-- **Codec/resolution apply without a manual restart.** Changing codec or the
-  resolution cap while hosting needs a fresh capture/encoder session, but the
-  user shouldn't hunt for a button. The settings view now auto-applies them via a
-  debounced (~0.6 s) background restart, coalescing rapid edits into one. Live
-  settings (bitrate/fps slider, adaptive, FEC, region-aware) still apply in place.
-- **Unified viewer controls.** The separate floating quality and app-picker
-  menus are consolidated into one tabbed panel (`LocalCastControlsPanel`:
-  Quality / Apps / Info), reachable from a single Controls button, instead of the
-  chevron-then-drill-down flow.
-
-### Plan (remaining, toward Screen-Sharing parity)
-
-The user's target is full parity: adaptive buffering (done), region-aware updates
-(done, experimental, above), plus **reliable transport**. Sequencing and tradeoffs:
-
-- **Reliable transport.** Options, lowest-risk first: (a) FEC/parity on keyframes
-  over the existing UDP (recover lost fragments without a round trip, keeps low
-  latency); (b) selective NACK retransmit; (c) a full TCP transport mode (simplest
-  reliability, but head-of-line blocking adds latency under loss, and it partly
-  undoes the UDP/pacing work). Recommend (a) before (c).
-- **Region-aware updates.** Send only changed regions instead of full-frame video.
-  This is a large rework that converges on what the existing VNC tier already
-  does; for a buttery *full desktop*, the VNC path is the better tool, with
-  LocalCast focused on high-fidelity single app/window streaming.
-- Reduce `queueDepth` (done: 5 → 3) to trim capture-side buffering.
-- Separate the input/heartbeat channel from video to avoid head-of-line blocking
-  under a video burst.
-
-### Calibration
-
-Before deeper transport work, isolate Wi-Fi from our buffering: drag the viewer
-quality slider to **Low** (if lag drops sharply, it's bandwidth) and/or connect
-the two Macs over **Ethernet** (if it gets crisp, it's Wi-Fi). The wired result
-tells us how much budget is the link versus the pipeline.
+# LocalCast engineering and validation guide
+
+Reviewed 2026-09-07. This document describes the current source tree. It does
+not certify a released build or claim that LocalCast outperforms Apple Screen
+Sharing. The separate system Screen Sharing option remains available.
+
+## Streaming contract
+
+LocalCast captures a desktop, app, or window on the host and presents it in a
+native viewer window. One active viewer controls each host session. Host
+Screen Recording permission enables capture; Accessibility enables injected
+input. Local Network permission and network/firewall reachability are required
+for discovery and direct connections.
+
+The default full-frame path is:
+
+1. ScreenCaptureKit supplies IOSurface-backed NV12 frames.
+2. VideoToolbox encodes H.264 or HEVC using a **required hardware encoder**.
+3. UDP transport encrypts authenticated-session packets, fragments frames,
+   paces bursts, and optionally adds forward error correction.
+4. VideoToolbox decodes complete compressed access units using a **required
+   hardware decoder**, emitting Metal-compatible NV12 buffers.
+5. Metal samples the retained IOSurface textures and converts YUV for display.
+
+Hardware media engines perform encode/decode; the GPU performs presentation
+and color conversion. CPU work remains in packet handling, encryption,
+reassembly, input, and clipboard operations. Experimental region tiles also
+use CPU copies and LZFSE compression. There is no supported “0% CPU” claim,
+and region-aware mode is not an entirely GPU-based pipeline.
+
+HEVC is preferred. Encoder creation retries without the optional low-latency
+rate controller, then falls back to hardware H.264 if HEVC is unavailable.
+Software codecs are not a fallback. Hardware initialization failure is reported
+with guidance to select H.264 or reduce resolution. Metal initialization
+failure prevents the viewer connection. Both Macs need compatible hardware.
+
+The decoder detects codec changes from parameter sets and submits all slices
+of a frame together. It can retry a failed session creation. The renderer
+uses pixel-buffer range and matrix metadata for conversion and retains buffers
+through GPU completion. This is an 8-bit, 4:2:0 SDR video path, not a 4:4:4 or
+HDR reference workflow.
+
+## Settings and recovery
+
+- **Bitrate, frame rate, and encoder quality:** live updates. Validated requested
+  values persist across capture rebuilds. Congestion and thermal policies can
+  reduce the actual values; they recover toward the requested bitrate.
+- **Codec, resolution, and region-aware mode:** capture/encoder rebuild within
+  the existing authenticated session. The listener, encryption key, and
+  clipboard channel remain alive. A brief held frame is expected during the
+  rebuild. Changes coalesce for roughly 600 ms and finish even if Settings
+  closes. A capture failure is reported and uses the bounded recovery path.
+- **Resolution:** Automatic follows the quality slider; Native imposes no
+  configured cap. A named host cap replaces Automatic. An explicit viewer
+  resolution override takes precedence. Changing the host resolution picker
+  clears the host's local tuning override. All caps preserve aspect ratio;
+  transport-capacity recovery can lower the effective resolution.
+- **Adaptive bitrate, FEC, transport profile, cursor capture, thermal policy:**
+  apply to hosting without dropping the session. Fast LAN changes pacing and
+  buffering; selecting it alone never assumes a jumbo-frame network.
+- **Viewer latency mode, drop-to-newest, loss recovery:** apply on the next
+  viewer connection, as the settings help states.
+- **Password, authentication, input rate limit:** apply after stopping and
+  starting hosting. Required authentication without a password refuses to
+  start. Disabling authentication explicitly permits unencrypted control/video;
+  clipboard synchronization requires an authenticated session.
+- **Initial quality preset:** initializes tuning when saved live tuning is
+  absent. Existing saved tuning is retained.
+
+Capture transitions serialize stop/start work. Stopped sessions reject late
+capture-start callbacks. Display changes and capture failures rebuild the
+selected target; an invalid app/window request never falls back to revealing
+the whole desktop. A dead network listener or a system wake needs a full host
+restart and client reauthentication. Settings changes use the lighter capture
+path.
+
+Video loss triggers a keyframe request; optional FEC reconstructs up to two
+missing full-size data fragments per block. It cannot recover the short final
+fragment without its length. There is no selective video retransmission or
+reliable control acknowledgement protocol. UDP recovery is bounded and cannot
+guarantee uninterrupted pictures on arbitrary loss or network outages.
+
+## Discovery and clipboard
+
+LocalCast advertises `_tidaldrift-cast._udp` on UDP 5904. Its TXT data includes
+connection metadata and an address hint. Advertisement health is monitored
+and refreshed after address changes. Discovery data identifies candidates;
+it is not cryptographic proof of identity. Consult [Bonjour discovery](BONJOUR_DISCOVERY.md)
+for DNS deadlines, service ports, fallback, and limitations.
+
+Clipboard updates are bidirectional for supported plain/rich text, HTML,
+images, and regular files. Small messages use session UDP; larger payloads
+and files use an authenticated TCP bulk channel on port 5906. Files download
+on paste through file promises. LocalCast deliberately does not copy every
+pasteboard format, folder, file attribute, or privacy-sensitive item. See
+[clipboard sync](CLIPBOARD_SYNC.md) for exact limits and retry semantics.
+
+## Comparison with Apple Screen Sharing
+
+Use both Apple **Standard** and **High Performance** as explicit baselines.
+Apple documents High Performance support for stereo audio, HDR reference mode,
+4:4:4 chroma, and 30/60 fps low-latency streaming on supported Apple-silicon Macs.
+See [Apple's screen sharing modes](https://support.apple.com/guide/mac-help/screen-sharing-type-options-on-mac-mchl1883115d/mac)
+and [clipboard and screen sharing controls](https://support.apple.com/guide/mac-help/share-the-screen-of-another-mac-mh14066/mac).
+
+LocalCast currently lacks audio, HDR/4:4:4, and full clipboard/file semantics
+parity. Its GPU-backed design alone is not evidence of lower latency, better
+compression, or better perceived quality. The UI latency statistic measures
+heartbeat **network round-trip time**, not input-to-photon or capture-to-display
+latency. FPS measures received media activity, not guaranteed displayed frames.
+
+## Reproducible acceptance procedure
+
+For release hardware verification, run
+`LOCALCAST_REQUIRE_HARDWARE_TESTS=1 swift test -c release` from `TidalDrift`.
+This requires real H.264/HEVC round trips, codec/resolution recovery, and
+an IOSurface NV12 4K benchmark. The benchmark submits a static synthetic image
+with at most three outstanding pictures; it excludes capture, network, and
+presentation latency. On the shared M5 test Mac, September 7 measurements
+varied roughly 55–66 fps. Repeated strict 60-fps checks failed under concurrent
+video load, so sustained 4K60 is not certified. Set `LOCALCAST_MIN_4K_FPS=60`
+in addition to the hardware flag for a controlled idle-machine capacity gate.
+
+The low-latency hardware encoder can return `kVTPropertyNotSupportedErr` for
+the optional hardware-status query. Successful creation with
+`RequireHardwareAcceleratedVideoEncoder` already forbids software fallback;
+an unsupported diagnostic no longer causes a working encoder to be rejected.
+
+Record application revision, both Mac models/chips, macOS versions, display
+resolution/refresh/scaling, codec, all tuning overrides, network interfaces,
+link speed/MTU, and power/thermal state. Update both Macs to the same build.
+Use dedicated test content and empty test clipboards.
+
+Run each scenario against LocalCast, Apple Standard, and Apple High Performance
+where supported, at matched resolution and frame rate. Repeat at least three
+times after warm-up. Report raw samples, median, p95, worst case, and failures.
+Do not substitute a throughput benchmark or ping for video measurements.
+
+1. **Input-to-photon:** film a locally visible input trigger and its remote
+   response with a high-speed camera or equivalent synchronized hardware.
+   Include typing, scrolling, window dragging, and animated content.
+2. **Image quality and compression:** use static small text, colored text,
+   gradients, photographs, and motion. At matched bitrate compare captures
+   against source frames, including chroma-detail crops. At matched visual
+   quality compare measured wire bitrate. Record actual codec and resolution,
+   including hardware fallback and capacity reductions.
+3. **Presentation:** record delivered frame intervals, dropped frames, startup
+   time, static-frame behavior, CPU/GPU/media-engine load, memory growth, and
+   temperature over a 30-minute session. Include full-screen transitions,
+   occlusion/minimize, display migration, and 60/120 Hz viewers.
+4. **Settings recovery:** repeatedly change H.264/HEVC, resolution, region mode,
+   bitrate, FPS, FEC, and transport profile while streaming and copying a file.
+   Close Settings immediately after each edit. Verify the selected target,
+   authentication, file transfer, input mapping, and requested tuning survive.
+   Suggested release gate: no disconnect and first fresh frame within two
+   seconds for supported settings on a stable wired link.
+5. **Network recovery:** test normal Ethernet MTU 1500, Wi-Fi, 0.1/1/3% random
+   loss, short loss bursts, interface changes, DHCP renewal, sleep/wake, and
+   listener failure. Measure recovery instead of claiming a fixed guarantee.
+   Reconnect after a host restart and confirm clipboard and input resume.
+6. **Clipboard:** both directions, text/RTF/HTML, PNG/TIFF, multiple regular
+   files, empty files, exactly-at-limit and over-limit payloads. Copy B while A
+   downloads; stop or disable sync during transfer; paste a file twice; cancel
+   and retry. A stale completion must never replace B or write after stop.
+7. **Privacy/failure:** missing password, wrong password, revoked permissions,
+   closed shared window, unavailable hardware codec, and malformed peer data.
+   Failure must explain the problem without widening the shared target.
+
+Automated tests cover deterministic contracts; the matrix above remains a
+release gate requiring two Macs and real displays. No measurements from this
+matrix have been collected as part of this source review.

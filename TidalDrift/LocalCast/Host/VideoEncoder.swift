@@ -10,9 +10,11 @@ class VideoEncoder {
     private let logger = Logger(subsystem: "com.tidaldrift", category: "VideoEncoder")
     
     weak var delegate: VideoEncoderDelegate?
+    /// Delivered asynchronously after session access is unlocked. The host can
+    /// restore capture settings without reentering a VideoToolbox operation.
+    var onError: ((String) -> Void)?
     
     private var session: VTCompressionSession?
-    private let callbackQueue = DispatchQueue(label: "com.tidaldrift.localcast.encoder.callback", qos: .userInteractive)
 
     /// Serializes every VTCompressionSession call (create, encode, property
     /// updates, invalidate). VideoToolbox sessions are not safe for concurrent
@@ -48,13 +50,21 @@ class VideoEncoder {
     /// dataRateLimits, all of which hold it).
     private var keyframeCeilingBytes: Int?
 
-    /// A (width, height) that failed VTCompressionSessionCreate even after the
-    /// dimension fallback, so the encoder is running at a reduced size while
-    /// capture still delivers the larger frames. `encode()` checks this before
-    /// auto-reconfiguring so it does not tear down and rebuild the working
-    /// reduced-size session (with a forced keyframe) on every captured frame.
-    /// Guarded by sessionLock.
-    private var failedSetupDimension: (width: Int, height: Int)?
+    private var hardwareAccelerated = false
+    private var failedAutomaticDimensions: (width: Int, height: Int)?
+    private var lastSubmissionFailure: OSStatus?
+    private var keyframeIntervalSeconds = 1.5
+    private var lastKeyframeTimestamp: CMTime = .invalid
+
+    var isHardwareAccelerated: Bool {
+        sessionLock.lock(); defer { sessionLock.unlock() }
+        return hardwareAccelerated
+    }
+
+    var codecName: String {
+        sessionLock.lock(); defer { sessionLock.unlock() }
+        return currentCodec == .hevc ? "HEVC" : "H.264"
+    }
 
     deinit {
         // SAFETY: The VTCompressionSession callback holds an unretained pointer to
@@ -65,79 +75,69 @@ class VideoEncoder {
         }
     }
     
-    func setup(width: Int, height: Int, codec: LocalCastConfiguration.Codec, bitrateMbps: Int, fps: Int, quality: Float = 0.8, allowDimensionFallback: Bool = true) {
+    /// Creates a hardware session, retaining the working session if replacement fails.
+    /// HEVC may fall back to hardware H.264 at the requested dimensions.
+    @discardableResult
+    func setup(width: Int, height: Int, codec: LocalCastConfiguration.Codec, bitrateMbps: Int, fps: Int, quality: Float = 0.8, allowDimensionFallback: Bool = true) -> Bool {
         sessionLock.lock()
         defer { sessionLock.unlock() }
+        // An explicit settings change permits a retry after resources or codec
+        // choices change. Automatic attempts record failure after setup returns.
+        failedAutomaticDimensions = nil
+        lastSubmissionFailure = nil
+        guard width > 0, height > 0, width <= Int(Int32.max), height <= Int(Int32.max),
+              bitrateMbps > 0, bitrateMbps <= 1_000, fps > 0, fps <= 240,
+              quality.isFinite, (0...1).contains(quality) else { return false }
 
-        // Tear down any existing session first
-        if let old = session {
-            VTCompressionSessionInvalidate(old)
-            session = nil
-        }
-        
-        // Store for auto-reconfigure
-        currentWidth = width
-        currentHeight = height
-        currentCodec = codec
-        currentBitrateMbps = bitrateMbps
-        currentFps = fps
-        currentQuality = quality
-        
         let vtCodec: CMVideoCodecType = codec == .hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264
         var createdSession: VTCompressionSession?
-
-        // Enable Apple's low-latency rate controller (Apple Silicon, macOS 11.3+).
-        // This is the encoder mode built for real-time/conferencing: it reacts to
-        // bitrate changes within a frame or two and holds latency far better than
-        // the default rate controller under motion and loss. Falls back silently
-        // to the default controller on hardware that doesn't support it.
-        var encoderSpec: [CFString: Any] = [:]
-        if #available(macOS 11.3, *) {
-            encoderSpec[kVTVideoEncoderSpecification_EnableLowLatencyRateControl] = kCFBooleanTrue as Any
-        }
-
-        let status = VTCompressionSessionCreate(
-            allocator: kCFAllocatorDefault,
-            width: Int32(width),
-            height: Int32(height),
-            codecType: vtCodec,
-            encoderSpecification: encoderSpec.isEmpty ? nil : encoderSpec as CFDictionary,
-            imageBufferAttributes: nil,
-            compressedDataAllocator: nil,
-            outputCallback: compressionCallback,
-            refcon: Unmanaged.passUnretained(self).toOpaque(),
-            compressionSessionOut: &createdSession
-        )
-
-        guard status == noErr, let session = createdSession else {
-            logger.error("Failed to create \(codec == .hevc ? "HEVC" : "H.264") compression session: \(status)")
-            if codec == .hevc {
-                logger.warning("Falling back to H.264 encoder")
-                setup(width: width, height: height, codec: .h264, bitrateMbps: bitrateMbps, fps: fps, quality: quality, allowDimensionFallback: allowDimensionFallback)
-            } else if allowDimensionFallback, width > 320, height > 240 {
-                // The H.264 attempt also failed at this dimension (e.g. the
-                // encoder cannot create a session at 4K). Retry once at half the
-                // dimension so the host still ends up with a working encoder.
-                let reducedWidth = max(2, width / 2) & ~1
-                let reducedHeight = max(2, height / 2) & ~1
-                logger.warning("H.264 session creation failed at \(width)x\(height); retrying once at reduced \(reducedWidth)x\(reducedHeight)")
-                setup(width: reducedWidth, height: reducedHeight, codec: .h264, bitrateMbps: bitrateMbps, fps: fps, quality: quality, allowDimensionFallback: false)
-                // Recorded after the reduced retry so its success path (below)
-                // does not immediately clear it: encode() reads this to avoid
-                // re-attempting the failing size on every captured frame.
-                failedSetupDimension = (width, height)
+        // LowLatencyRateControl is a requirement, not a preference. Retry the
+        // same codec without it before sacrificing HEVC compression efficiency.
+        var status: OSStatus = kVTVideoEncoderNotAvailableNowErr
+        for lowLatency in [true, false] {
+            var specification: [CFString: Any] = [
+                kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: true
+            ]
+            if lowLatency {
+                specification[kVTVideoEncoderSpecification_EnableLowLatencyRateControl] = true
             }
-            return
+            status = VTCompressionSessionCreate(
+                allocator: kCFAllocatorDefault, width: Int32(width), height: Int32(height),
+                codecType: vtCodec, encoderSpecification: specification as CFDictionary,
+                imageBufferAttributes: nil, compressedDataAllocator: nil,
+                outputCallback: compressionCallback,
+                refcon: Unmanaged.passUnretained(self).toOpaque(),
+                compressionSessionOut: &createdSession)
+            if status == noErr, createdSession != nil { break }
+            if let partial = createdSession { VTCompressionSessionInvalidate(partial) }
+            createdSession = nil
+        }
+        guard status == noErr, let session = createdSession else {
+            logger.error("Hardware encoder creation failed for \(width)x\(height): \(status)")
+            if codec == .hevc {
+                return setup(width: width, height: height, codec: .h264,
+                    bitrateMbps: bitrateMbps, fps: fps, quality: quality,
+                    allowDimensionFallback: false)
+            }
+            // A smaller encoder cannot accept the larger capture buffers. Fail
+            // explicitly so the host can renegotiate capture instead of freezing.
+            return false
+        }
+        var hardware: CFTypeRef?
+        let hardwareStatus = VTSessionCopyProperty(session,
+            key: kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
+            allocator: kCFAllocatorDefault, valueOut: &hardware)
+        // The low-latency hardware encoder can reject this diagnostic property
+        // (-12900) even though creation with RequireHardware succeeded. That
+        // specification forbids software fallback; a missing diagnostic is not
+        // evidence that hardware is unavailable. Still reject an explicit false.
+        guard (hardwareStatus == noErr && hardware as? Bool == true)
+                || hardwareStatus == kVTPropertyNotSupportedErr else {
+            VTCompressionSessionInvalidate(session)
+            logger.error("VideoToolbox could not verify hardware encoding")
+            return false
         }
 
-        self.session = session
-        currentCodec = codec
-        // A session was created at this size, so it is no longer a known-failing
-        // dimension; allow encode() to reconfigure to it again in the future.
-        if let failed = failedSetupDimension, failed.width == width, failed.height == height {
-            failedSetupDimension = nil
-        }
-        
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: fps as CFNumber)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: (bitrateMbps * 1000 * 1000) as CFNumber)
@@ -148,31 +148,61 @@ class VideoEncoder {
         // stream until the next IDR, so a 4 s interval meant up to 4 s of freeze.
         // 1.5 s bounds worst-case recovery; paced sends keep the more frequent
         // keyframes from re-introducing burst loss.
-        let keyframeIntervalSeconds = 1.5
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: keyframeIntervalSeconds as CFNumber)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: Int(Double(fps) * keyframeIntervalSeconds) as CFNumber)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_Quality, value: quality as CFNumber)
         
         // Low-latency tuning: emit each frame immediately instead of buffering
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 0 as CFNumber)
-        // Quality-focused: let the hardware encoder spend more time per frame.
-        // Do NOT set PrioritizeEncodingSpeedOverQuality — we want the best visual
-        // quality the encoder can produce within real-time constraints.
+        // The host is a desktop streaming at hundreds of Mbps; never let the
+        // encoder trade frame time for power.
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaximizePowerEfficiency, value: kCFBooleanFalse)
+        if codec == .h264 {
+            // CABAC is ~10% smaller than CAVLC at equal quality and the hardware
+            // decoder handles it at any of our frame rates.
+            VTSessionSetProperty(session, key: kVTCompressionPropertyKey_H264EntropyMode, value: kVTH264EntropyMode_CABAC)
+        }
+        // Retain the encoder's quality policy. Speed priority did not improve
+        // 4K throughput in the shared-machine benchmark enough to justify
+        // changing compression decisions without a visual quality comparison.
         
         let limitStatus = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: dataRateLimits(bitrateMbps: bitrateMbps))
         if limitStatus != noErr {
             logger.warning("DataRateLimits rejected (\(limitStatus)); keyframe bursts are unbounded on this encoder config")
         }
         
-        VTCompressionSessionPrepareToEncodeFrames(session)
+        let prepareStatus = VTCompressionSessionPrepareToEncodeFrames(session)
+        guard prepareStatus == noErr else {
+            VTCompressionSessionInvalidate(session)
+            logger.error("Hardware encoder preparation failed: \(prepareStatus)")
+            return false
+        }
+        if let old = self.session { VTCompressionSessionInvalidate(old) }
+        self.session = session
+        hardwareAccelerated = true
+        currentWidth = width
+        currentHeight = height
+        currentCodec = codec
+        currentBitrateMbps = bitrateMbps
+        currentFps = fps
+        currentQuality = quality
+        lastKeyframeTimestamp = .invalid
+        forceKeyFrame()
         logger.info("Video encoder setup complete: \(width)x\(height), \(bitrateMbps)Mbps, \(fps)fps, quality=\(quality), profile=\(codec == .hevc ? "HEVC Main" : "H.264 High")")
+        return true
     }
     
     func encode(_ sampleBuffer: CMSampleBuffer) {
         guard let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
+        var failureMessage: String?
         sessionLock.lock()
-        defer { sessionLock.unlock() }
+        defer {
+            sessionLock.unlock()
+            if let failureMessage {
+                Task { [weak self] in self?.onError?(failureMessage) }
+            }
+        }
 
         // Auto-reconfigure if the incoming frame resolution doesn't match the
         // encoder session. This happens when ScreenCaptureManager starts capture
@@ -182,19 +212,16 @@ class VideoEncoder {
         let frameWidth = CVPixelBufferGetWidth(imageBuffer)
         let frameHeight = CVPixelBufferGetHeight(imageBuffer)
         if frameWidth != currentWidth || frameHeight != currentHeight {
-            if let failed = failedSetupDimension, failed.width == frameWidth, failed.height == frameHeight {
-                // This exact size already failed session creation, so the encoder
-                // is running at a reduced fallback size. Re-attempting setup for it
-                // every frame would tear down the working session and force a
-                // keyframe on each captured frame. Skip the reconfigure; the capture
-                // layer must reduce to this size for frames to flow.
-            } else {
-                logger.info("Frame \(frameWidth)x\(frameHeight) != encoder \(self.currentWidth)x\(self.currentHeight) -- reconfiguring")
-                setup(width: frameWidth, height: frameHeight, codec: currentCodec, bitrateMbps: currentBitrateMbps, fps: currentFps, quality: currentQuality)
-                forceKeyFrame()
+            if let failed = failedAutomaticDimensions,
+               failed.width == frameWidth, failed.height == frameHeight { return }
+            guard setup(width: frameWidth, height: frameHeight, codec: currentCodec,
+                        bitrateMbps: currentBitrateMbps, fps: currentFps, quality: currentQuality) else {
+                failedAutomaticDimensions = (frameWidth, frameHeight)
+                failureMessage = "Hardware encoding is unavailable at \(frameWidth)x\(frameHeight). Restore the previous resolution or choose a smaller capture size."
+                return
             }
         }
-        
+
         guard let session = session else { return }
         
         let presentationTimestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
@@ -202,7 +229,12 @@ class VideoEncoder {
         
         // Check if we need to force a keyframe
         keyframeLock.lock()
-        let shouldForceKeyFrame = forceNextKeyFrame
+        // The low-latency rate controller uses an infinite GOP. Force periodic
+        // IDRs explicitly so recovery is bounded even when interval keys are ignored.
+        let elapsed = CMTimeGetSeconds(CMTimeSubtract(presentationTimestamp, lastKeyframeTimestamp))
+        let periodicKeyFrame = !lastKeyframeTimestamp.isValid || !elapsed.isFinite
+            || elapsed < 0 || elapsed >= keyframeIntervalSeconds
+        let shouldForceKeyFrame = forceNextKeyFrame || periodicKeyFrame
         if forceNextKeyFrame {
             forceNextKeyFrame = false
         }
@@ -215,7 +247,7 @@ class VideoEncoder {
         }
         
         var flags: VTEncodeInfoFlags = []
-        VTCompressionSessionEncodeFrame(
+        let status = VTCompressionSessionEncodeFrame(
             session,
             imageBuffer: imageBuffer,
             presentationTimeStamp: presentationTimestamp,
@@ -224,6 +256,17 @@ class VideoEncoder {
             sourceFrameRefcon: nil,
             infoFlagsOut: &flags
         )
+        if status == noErr, !flags.contains(.frameDropped) {
+            lastSubmissionFailure = nil
+            if shouldForceKeyFrame { lastKeyframeTimestamp = presentationTimestamp }
+        } else {
+            forceKeyFrame()
+            logger.error("Hardware encode submission failed or dropped a frame: \(status)")
+            if status != noErr, lastSubmissionFailure != status {
+                lastSubmissionFailure = status
+                failureMessage = "Hardware video encoding failed (\(status)). Restore the capture settings or retry the stream."
+            }
+        }
     }
     
     /// Update encoder parameters in-place without recreating the VTCompressionSession.
@@ -242,13 +285,14 @@ class VideoEncoder {
         var allOk = true
         
         if let bps = bitrateMbps, bps != currentBitrateMbps {
-            currentBitrateMbps = bps
+            guard (1...1_000).contains(bps) else { return false }
             let avgBitRate = bps * 1_000_000
             let s1 = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: avgBitRate as CFNumber)
             
             let s2 = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: dataRateLimits(bitrateMbps: bps))
             
             if s1 == noErr && s2 == noErr {
+                currentBitrateMbps = bps
                 logger.info("Live update: bitrate → \(bps) Mbps")
             } else {
                 logger.warning("Live update bitrate failed: avg=\(s1), limit=\(s2)")
@@ -257,9 +301,10 @@ class VideoEncoder {
         }
         
         if let newFps = fps, newFps != currentFps {
-            currentFps = newFps
+            guard (1...240).contains(newFps) else { return false }
             let s = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: newFps as CFNumber)
             if s == noErr {
+                currentFps = newFps
                 logger.info("Live update: fps → \(newFps)")
             } else {
                 logger.warning("Live update fps failed: \(s)")
@@ -268,9 +313,10 @@ class VideoEncoder {
         }
         
         if let q = quality, q != currentQuality {
-            currentQuality = q
+            guard q.isFinite, (0...1).contains(q) else { return false }
             let s = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_Quality, value: q as CFNumber)
             if s == noErr {
+                currentQuality = q
                 logger.info("Live update: quality → \(q)")
             } else {
                 logger.warning("Live update quality failed: \(s)")
@@ -279,8 +325,13 @@ class VideoEncoder {
         }
         
         if let kfi = keyframeIntervalSeconds {
+            guard kfi.isFinite, (0.1...60).contains(kfi) else { return false }
+            self.keyframeIntervalSeconds = kfi
             let s1 = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: kfi as CFNumber)
-            let kfiFrames = currentFps * Int(kfi)
+            // Round rather than truncate: Int(1.5) is 1, which at 60 fps
+            // requested a keyframe every 60 frames while the duration key
+            // asked for 90, and the encoder honours whichever fires first.
+            let kfiFrames = max(1, Int((Double(currentFps) * kfi).rounded()))
             let s2 = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: kfiFrames as CFNumber)
             if s1 == noErr && s2 == noErr {
                 logger.info("Live update: keyframe interval → \(kfi)s (\(kfiFrames) frames)")
@@ -341,6 +392,8 @@ class VideoEncoder {
             VTCompressionSessionInvalidate(session)
             self.session = nil
         }
+        hardwareAccelerated = false
+        lastKeyframeTimestamp = .invalid
     }
     
     func forceKeyFrame() {
@@ -360,9 +413,12 @@ class VideoEncoder {
     }
     
     private let compressionCallback: VTCompressionOutputCallback = { (outputCallbackRefCon, sourceFrameRefCon, status, infoFlags, sampleBuffer) in
-        guard status == noErr, let sampleBuffer = sampleBuffer else { return }
-        
-        let encoder = Unmanaged<VideoEncoder>.fromOpaque(outputCallbackRefCon!).takeUnretainedValue()
+        guard let outputCallbackRefCon else { return }
+        let encoder = Unmanaged<VideoEncoder>.fromOpaque(outputCallbackRefCon).takeUnretainedValue()
+        guard status == noErr, let sampleBuffer else {
+            encoder.forceKeyFrame()
+            return
+        }
         
         // 1. Check for keyframe
         let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[CFString: Any]]
@@ -472,4 +528,3 @@ class VideoEncoder {
         return parameterSets.isEmpty ? nil : parameterSets
     }
 }
-

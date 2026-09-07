@@ -17,6 +17,7 @@ struct ClipboardUpdatePayload: Codable {
     let kind: ClipboardContentKind
     let text: String?
     let rtf: Data?
+    var html: Data? = nil
     let png: Data?
     let bulk: ClipboardBulkOffer?
     /// SHA-256 of the canonical content, so the receiver can skip an apply
@@ -32,7 +33,7 @@ struct ClipboardBulkOffer: Codable {
     let files: [ClipboardFileStub]?
 }
 
-struct ClipboardFileStub: Codable {
+struct ClipboardFileStub: Codable, Equatable {
     let name: String
     let size: Int64
 }
@@ -42,6 +43,7 @@ struct ClipboardSnapshot {
     let kind: ClipboardContentKind
     let text: String?
     let rtf: Data?
+    var html: Data? = nil
     let png: Data?
     let fileURLs: [URL]
     let digest: Data
@@ -54,7 +56,7 @@ struct ClipboardSnapshot {
         case .image:
             return Int64(png?.count ?? 0)
         case .text:
-            return Int64((text?.utf8.count ?? 0) + (rtf?.count ?? 0))
+            return Int64((text?.utf8.count ?? 0) + (rtf?.count ?? 0) + (html?.count ?? 0))
         }
     }
 
@@ -112,9 +114,10 @@ enum ClipboardPasteboard {
 
         if let text = pasteboard.string(forType: .string), !text.isEmpty {
             let rtf = pasteboard.data(forType: .rtf)
+            let html = pasteboard.data(forType: .html)
             return ClipboardSnapshot(
-                kind: .text, text: text, rtf: rtf, png: nil,
-                fileURLs: [], digest: digest(kind: .text, chunks: [Data(text.utf8), rtf ?? Data()])
+                kind: .text, text: text, rtf: rtf, html: html, png: nil,
+                fileURLs: [], digest: textDigest(text: text, rtf: rtf, html: html)
             )
         }
 
@@ -126,14 +129,24 @@ enum ClipboardPasteboard {
     /// suppression; a read-back after the writes would race a concurrent user
     /// copy and could swallow it.
     @discardableResult
-    static func applyInline(kind: ClipboardContentKind, text: String?, rtf: Data?, png: Data?, to pasteboard: NSPasteboard) -> Int {
+    static func applyInline(kind: ClipboardContentKind, text: String?, rtf: Data?, html: Data? = nil, png: Data?, to pasteboard: NSPasteboard) -> Int {
+        // Validate before clearing so a malformed remote update cannot erase
+        // a valid local clipboard. Image metadata inspection does not decode pixels.
+        guard isValidInline(kind: kind, text: text, rtf: rtf, html: html, png: png) else {
+            return pasteboard.changeCount
+        }
         let changeCount = pasteboard.clearContents()
         switch kind {
         case .text:
             if let text { pasteboard.setString(text, forType: .string) }
             if let rtf { pasteboard.setData(rtf, forType: .rtf) }
+            if let html { pasteboard.setData(html, forType: .html) }
         case .image:
-            if let png {
+            // The PNG came off the wire. Check its declared dimensions from
+            // the header before anything decodes it: a few hundred bytes can
+            // declare a 65535x65535 canvas, and the TIFF conversion below
+            // would try to allocate the whole thing.
+            if let png, let pixels = pngPixelCount(png), pixels <= maxImagePixels {
                 pasteboard.setData(png, forType: .png)
                 // Older apps read only TIFF; write both representations.
                 if let tiff = NSImage(data: png)?.tiffRepresentation {
@@ -153,6 +166,25 @@ enum ClipboardPasteboard {
         let changeCount = pasteboard.clearContents()
         pasteboard.writeObjects(providers)
         return changeCount
+    }
+
+    /// Validate the mutually exclusive inline representations before applying them.
+    static func isValidInline(kind: ClipboardContentKind, text: String?, rtf: Data?, html: Data? = nil, png: Data?) -> Bool {
+        switch kind {
+        case .text:
+            return text != nil && png == nil
+        case .image:
+            guard text == nil, rtf == nil, html == nil, let png,
+                  let pixels = pngPixelCount(png) else { return false }
+            return pixels <= maxImagePixels
+        case .files:
+            return false
+        }
+    }
+
+    /// Preserve the legacy text/RTF digest when HTML is absent for older peers.
+    static func textDigest(text: String, rtf: Data?, html: Data?) -> Data {
+        digest(kind: .text, chunks: [Data(text.utf8), rtf ?? Data(), html ?? Data()])
     }
 
     /// Digest for text and image content: kind tag plus content bytes.
@@ -175,6 +207,22 @@ enum ClipboardPasteboard {
             .sorted()
             .joined(separator: "|")
         return digest(kind: .files, chunks: [Data(entries.utf8)])
+    }
+
+    /// Largest image accepted from a peer, in pixels (8192 x 8192).
+    static let maxImagePixels = 64 * 1024 * 1024
+
+    /// Pixel count declared by the image header, read via ImageIO metadata
+    /// without decoding the bitmap. Nil if the data is not a parseable image.
+    static func pngPixelCount(_ data: Data) -> Int? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              CGImageSourceGetCount(source) > 0,
+              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = props[kCGImagePropertyPixelWidth] as? Int,
+              let height = props[kCGImagePropertyPixelHeight] as? Int,
+              width > 0, height > 0 else { return nil }
+        let (pixels, overflow) = width.multipliedReportingOverflow(by: height)
+        return overflow ? Int.max : pixels
     }
 
     private static func pngFromTIFF(_ tiff: Data?) -> Data? {

@@ -1,8 +1,97 @@
 # Bonjour Discovery Reliability
 
-**Date:** 2026-06
-**Scope:** Why TidalDrift peer discovery was intermittently slow/absent, and the fix shipped in v1.6.7.
-**Status:** Resolved (Option A). Native rewrite (Option C) planned as a follow-up.
+**Updated:** 2026-09-07
+**Scope:** Discovery lifecycle, connection resolution, settings, and historical peer-advertisement fixes.
+**Status:** Targeted reliability fixes implemented. Native discovery migration and two-Mac recovery qualification remain open.
+
+## Current behavior and engineering review
+
+TCP services use `NWBrowser`. LocalCast UDP browsing and peer registration
+still use `dns-sd` subprocesses. Bonjour advertisements and TXT records are
+discovery hints, not authenticated device identities. Credentials and stream
+authorization must be verified by the connection protocol.
+
+The September review addressed these failure modes:
+
+- Starting periodic discovery cancelled its network-path monitor and never
+  restored it. Starting browsing now creates a monitor when needed, including
+  after a full stop. An initial offline path followed by connectivity is handled.
+- Deferred restart callbacks could restart obsolete browsers or launch an
+  untracked LocalCast browse after stopping. TCP retries check the exact browser
+  instance, and delayed browse starts check the current lifecycle generation.
+- DNS timeout tasks cancelled a task group whose lookup continuation could
+  never cancel. The group therefore waited for `getaddrinfo` anyway. A
+  cancellation-aware callback result now releases the waiter at its deadline.
+  The operating-system DNS call can finish later on the existing resolver
+  queue; its result is discarded. TCP probes also release their waiters and
+  cancel their connection when the caller cancels.
+- SMB, AFP, and SSH discovery overwrote the device's VNC port. Screen Sharing
+  keeps its own destination port regardless of the arrival order of other
+  services. Invalid ports are rejected before integer conversion or connection
+  creation.
+- `ip=` TXT values were accepted after a loose numeric prefix match. Discovery
+  now validates the complete address and rejects unspecified, loopback, and
+  IPv4 broadcast destinations. This validation does not authenticate a peer.
+- A deferred startup subnet scan could run after discovery stopped, or scan an
+  assumed `192.168.1.*` network while offline. It is now cancelled on stop and
+  requires an actual local IPv4 address. Cancelling a scan preserves devices
+  that have not been probed yet.
+- LocalCast name matching accepted substrings, so a short instance name could
+  mark a different Mac as a host. Only complete normalized names now match;
+  multiple matching devices require address resolution before any update.
+- Pipe reads can split lines and UTF-8 characters. LocalCast browsing now buffers
+  complete lines, discards lines over 16 KiB, and resumes parsing at the next
+  newline. An incomplete line cannot be mistaken for a complete service name.
+- Generic Bonjour services do not repeatedly announce an unchanged service.
+  Cleanup now refreshes non-peer devices still present in live browser results
+  before applying the age threshold.
+- The GitHub release bundle omitted `_tidaldrift-cast._udp` from
+  `NSBonjourServices`. Its generated list now agrees with `Info.plist` and the
+  local build scripts, so release packaging declares the same discovery types.
+
+## Settings contract
+
+Bonjour updates continuously. **Device cleanup interval** controls stale-cache
+maintenance, between 15 seconds and 5 minutes. It does not cause repeated
+subnet scans. Changing this setting updates the running timer. SSH discovery
+controls both Bonjour SSH browsing and active SSH probes; disabling it removes
+the SSH capability from cached devices. The inactive automatic-connection
+control has been removed from Settings because no automatic connection policy
+is implemented.
+
+Settings files from older versions retain their saved values when newer fields
+are absent. Unknown themes fall back to the system theme. Out-of-range cleanup
+intervals, Wake-on-LAN ports, and retry counts revert to safe defaults. Wrong
+JSON types still reject the file. Resetting the received-files folder clears
+both its path and its security-scoped bookmark.
+
+`DiscoverySettingsTests` covers settings migration, round trips, invalid values,
+folder reset, VNC port preservation, TXT validation, exact name matching, and
+fragmented or oversized helper output.
+`ConnectionResolverTests` uses a deliberately blocked lookup to verify deadline
+and cancellation behavior without depending on live DNS, and checks invalid
+connection inputs and IPv6 VNC URL construction.
+
+## Remaining qualification
+
+Automated tests do not establish real-network discovery performance. Before a
+release, verify two Macs through Wi-Fi to Ethernet changes, DHCP renewal,
+offline launch followed by connectivity, sleep/wake, mDNSResponder restart,
+and stop/start cycles. Check that one browser exists per enabled service and
+that stopped discovery leaves no LocalCast browse child running.
+
+The following limitations remain:
+
+- The hostname lookup and subnet scan paths still favor IPv4. IPv6 URL support
+  alone does not establish end-to-end IPv6 discovery or link-local scope support.
+- Subnet discovery assumes a `/24` range. It does not yet derive the scan range
+  from the selected interface's netmask, and multi-interface address selection
+  needs dedicated tests.
+- Generic Bonjour fallback resolution still derives some hostnames from service
+  display names and assumes a default port in the subprocess fallback. Native
+  service-endpoint resolution should preserve the actual target host and port.
+- Discovery still has mixed queue ownership. A native migration must include
+  cancellation, interface scope, removal, and identity regression tests.
 
 ---
 
@@ -78,8 +167,9 @@ seconds instead of persisting until a restart.
 
 ## Verification
 
-Confirmed in real two-Mac use: discovery is fast and consistent, survives
-Wi-Fi/Ethernet switches and sleep/wake. Host-side log signal:
+The original v1.6.7 notes recorded a successful two-Mac check. Those historical
+observations are not a performance or recovery qualification of the September
+changes. Host-side log signal:
 
 ```
 log stream --predicate 'subsystem == "com.tidaldrift"' --level info
