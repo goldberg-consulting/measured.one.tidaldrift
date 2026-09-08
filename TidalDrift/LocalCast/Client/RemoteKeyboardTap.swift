@@ -22,7 +22,6 @@ final class RemoteKeyboardTap {
     /// The user's release hotkey fired (Cmd+Shift+I), so capture can be toggled
     /// off and the user is never trapped while system shortcuts are swallowed.
     var onToggleCapture: (() -> Void)?
-    var onCloseViewer: (() -> Void)?
 
     /// Whether events should be captured and forwarded right now.
     var shouldCapture: (() -> Bool)?
@@ -142,14 +141,6 @@ final class RemoteKeyboardTap {
            keyCode == 48 || (keyCode == 53 && flags.contains(.maskAlternate)) {
             releaseHeldModifiers()
             return Unmanaged.passUnretained(event)
-        }
-        // Closing the viewer must always remain a local escape hatch.
-        if keyCode == 13, flags.contains(.maskCommand) {
-            if type == .keyDown {
-                releaseHeldModifiers()
-                onCloseViewer?()
-            }
-            return nil
         }
 
         // Release hotkey: Cmd+Shift+I toggles capture so the user can always get

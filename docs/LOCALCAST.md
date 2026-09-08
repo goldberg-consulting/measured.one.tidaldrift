@@ -174,7 +174,9 @@ matrix have been collected as part of this source review.
 
 The viewer uses a normal title bar and makes TidalDrift a regular application
 while any viewer is open. Closing the last viewer restores the prior menu-bar
-activation policy. Cmd+W closes locally; Cmd+Tab and Cmd+Option+Escape remain
+activation policy. Cmd+W closes the remote window during input capture, including
+single-window sharing. Release capture with Cmd+Shift+I before using Cmd+W to
+close the viewer locally, or use its title-bar Close button. Cmd+Tab and Cmd+Option+Escape remain
 local escape routes. Cmd+Shift+I must toggle capture both off and on.
 
 New hosts report Accessibility permission in their heartbeat. A viewer shows
@@ -190,7 +192,8 @@ message is not a delivery acknowledgement. Existing clipboard size/count limits
 apply; disabling sync or copying newer content can cancel an in-flight offer.
 
 Before releasing these changes, test two Macs: select the viewer from another
-app, close via traffic light and Cmd+W, minimize/restore/full-screen, toggle capture
+app, close the remote window via Cmd+W during capture, close the viewer via its
+traffic light or Cmd+W after releasing capture, minimize/restore/full-screen, toggle capture
 twice, type, copy/paste both directions, and drop text and multiple documents.
 Verify a host without Accessibility shows the warning, an old host rejects drops
 clearly, and newer clipboard content is preserved if it changes during transfer.
