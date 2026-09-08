@@ -256,12 +256,12 @@ class InputInjector {
     ]).rawValue
 
     /// Command chords that still make sense when a single window or app is
-    /// shared: select all, save, find, undo/redo, cut, copy, paste, and
+    /// shared: select all, save, find, undo/redo, cut, copy, paste, close, and
     /// Command+arrow navigation. Anything else with Command held (Cmd+Q,
     /// Cmd+Tab, Cmd+Space, Ctrl+Cmd+Q, Cmd+Shift+Q, Cmd+Option+Esc, the
     /// screenshot chords) acts on the host as a whole, not the shared window.
     static let scopedCommandAllowlist: Set<UInt16> = [
-        0, 1, 3, 6, 7, 8, 9,      // A S F Z X C V
+        0, 1, 3, 6, 7, 8, 9, 13,  // A S F Z X C V W
         123, 124, 125, 126,       // left right down up
     ]
 

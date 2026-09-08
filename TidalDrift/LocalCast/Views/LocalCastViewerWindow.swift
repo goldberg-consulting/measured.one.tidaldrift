@@ -249,7 +249,6 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
         keyboardTap.onToggleCapture = { [weak self] in
             DispatchQueue.main.async { self?.clientSession.inputCaptureEnabled.toggle() }
         }
-        keyboardTap.onCloseViewer = { [weak self] in self?.window?.performClose(nil) }
         keyboardTap.onKey = { [weak self] keyCode, modifiers, down in
             guard let self else { return }
             if down {
@@ -276,7 +275,11 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
                 guard let self = self else { return event }
                 guard let window = self.window else { return event }
                 guard event.window == window else { return event }
-                if event.keyCode == 13, event.modifierFlags.contains(.command) {
+                // Cmd+W belongs to the host during remote capture, just like
+                // Copy and Paste. Only close locally after capture is released.
+                if !self.clientSession.inputCaptureEnabled,
+                   !self.clientSession.isOverlayActive,
+                   event.keyCode == 13, event.modifierFlags.contains(.command) {
                     if event.type == .keyDown { window.performClose(nil) }
                     return nil
                 }

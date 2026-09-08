@@ -10,29 +10,31 @@ import CryptoKit
 final class ClipboardSyncTests: XCTestCase {
 
     @MainActor
-    func test_keyboardCapturePreservesLocalCloseAndAppSwitching() throws {
+    func test_keyboardCaptureForwardsCloseAndPreservesLocalAppSwitching() throws {
         let tap = RemoteKeyboardTap()
         tap.shouldCapture = { true }
-        var closed = false
         var forwarded: [UInt16] = []
-        tap.onCloseViewer = { closed = true }
         tap.onKey = { key, _, _ in forwarded.append(key) }
         let close = try XCTUnwrap(CGEvent(keyboardEventSource: nil, virtualKey: 13, keyDown: true))
         close.flags = .maskCommand
         XCTAssertNil(tap.handle(type: .keyDown, event: close))
-        XCTAssertTrue(closed)
-        XCTAssertTrue(forwarded.isEmpty)
+        XCTAssertEqual(forwarded, [13])
+        XCTAssertNil(tap.handle(type: .keyUp, event: close))
+        XCTAssertEqual(forwarded, [13, 13])
+        XCTAssertNotNil(InputInjector.keystrokeFlags(keyCode: 13,
+            modifiers: CGEventFlags.maskCommand.rawValue, scoped: true))
         let tab = try XCTUnwrap(CGEvent(keyboardEventSource: nil, virtualKey: 48, keyDown: true))
         tab.flags = .maskCommand
         XCTAssertNotNil(tap.handle(type: .keyDown, event: tab))
-        XCTAssertTrue(forwarded.isEmpty)
+        XCTAssertEqual(forwarded, [13, 13])
         let text = try XCTUnwrap(CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true))
         text.flags = []
         XCTAssertNil(tap.handle(type: .keyDown, event: text))
-        XCTAssertEqual(forwarded, [0])
+        XCTAssertEqual(forwarded, [13, 13, 0])
         tap.shouldCapture = { false }
+        XCTAssertNotNil(tap.handle(type: .keyDown, event: close))
         XCTAssertNotNil(tap.handle(type: .keyDown, event: text))
-        XCTAssertEqual(forwarded, [0])
+        XCTAssertEqual(forwarded, [13, 13, 0])
     }
 
     @MainActor
