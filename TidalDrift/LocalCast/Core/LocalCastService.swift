@@ -122,13 +122,10 @@ class LocalCastService: ObservableObject {
         observeWake()
     }
 
-    /// IOKit power monitor driving the wake-restart. The old observer used
-    /// NSWorkspace.didWakeNotification, which the system only posts on a
-    /// *full* wake; a sleep-proxy knock produces a DarkWake where it never
-    /// fires, so a lid-closed host woke, sat unreachable through the ~30s
-    /// DarkWake linger, and went back to sleep. IORegisterForSystemPower
-    /// reports every power-on, dark or full.
+    /// Full-wake notifications supplement the watchdog's elapsed-sleep check.
+    /// IOKit does not guarantee notifications for network-triggered DarkWake.
     private let powerMonitor = SystemPowerMonitor()
+    private var resumeDetector = SystemResumeDetector()
 
     /// Post-wake keep-awake assertion (kIOPMAssertNetworkClientActive holds
     /// dark wake on AC power). Taken for a bounded window at each wake while
@@ -139,17 +136,14 @@ class LocalCastService: ObservableObject {
     private var wakeGraceAssertion = IOPMAssertionID(0)
     private static let wakeGraceSeconds = 180.0
 
-    /// Restart hosting after system wake. Sleep kills the UDP listener and
-    /// orphans the dns-sd registration while `isHosting` stays true, so a
-    /// woken host looked like it was hosting but could not accept a viewer.
-    /// This is what made lid-closed (Wake on Demand) connections fail even
-    /// after the Mac itself woke: the client's knock woke the machine, but
-    /// TidalDrift never came back up on port 5904.
+    /// Restart hosting after full wake. The watchdog handles resumptions where
+    /// this notification is absent, including network-triggered DarkWake.
     private func observeWake() {
         powerMonitor.onWake = { [weak self] in
             Task { @MainActor in
-                guard let self, self.isHosting else { return }
-                self.logger.info("⏰ System powered on (dark or full wake) — restarting LocalCast hosting and advertisement")
+                guard let self, self.isHosting,
+                      self.resumeDetector.shouldRecover(notified: true) else { return }
+                self.logger.info("⏰ System fully awake — restarting LocalCast hosting and advertisement")
                 self.holdWakeGraceAssertion()
                 await self.restartHostingAfterNetworkLoss()
             }
@@ -164,6 +158,7 @@ class LocalCastService: ObservableObject {
         }
         let properties: [String: Any] = [
             kIOPMAssertionTypeKey: kIOPMAssertNetworkClientActive,
+            kIOPMAssertionLevelKey: kIOPMAssertionLevelOn,
             kIOPMAssertionNameKey: "TidalDrift LocalCast awaiting viewer after wake",
             kIOPMAssertionTimeoutKey: Self.wakeGraceSeconds,
             kIOPMAssertionTimeoutActionKey: kIOPMAssertionTimeoutActionRelease
@@ -388,6 +383,9 @@ class LocalCastService: ObservableObject {
     /// A dead listener needs a complete restart; ordinary settings edits do not.
     private func restartHostingAfterNetworkLoss() async {
         guard isHosting else { return }
+        // A listener-failure callback can beat the watchdog after sleep.
+        // Preserve the same bounded grace before resetting its clock baseline.
+        if resumeDetector.shouldRecover() { holdWakeGraceAssertion() }
         let target = currentHostTarget
         let name = shareTargetName
         streamingTuning.saveToDefaults()
@@ -476,6 +474,7 @@ class LocalCastService: ObservableObject {
     /// re-register it when the local IP changes out from under the TXT `ip=`.
     private func startAdvertisementMonitor() {
         advertisementMonitor?.invalidate()
+        resumeDetector.resetBaseline()
         advertisementMonitor = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.checkAdvertisementHealth()
@@ -486,13 +485,18 @@ class LocalCastService: ObservableObject {
     private func checkAdvertisementHealth() {
         guard isHosting else { return }
 
-        // Listener health first: sleep (including DarkWake cycles that never
-        // post didWakeNotification) kills the UDP socket while `isHosting`
-        // stays true, leaving a host that looks alive but cannot accept a
-        // viewer. The 5s watchdog runs whenever the process is scheduled,
-        // which includes network-triggered DarkWakes, so a woken host rebinds
-        // before the client gives up. Restart tears down this timer, so the
-        // rebind cannot double-fire.
+        // A network wake can resume this timer without an IOKit full-wake
+        // notification, and the old listener may still report "ready". Detect
+        // actual system suspension from the clocks before trusting that state.
+        if resumeDetector.shouldRecover() {
+            logger.info("⏰ Hosting resumed after system sleep — restoring listener and advertisement")
+            holdWakeGraceAssertion()
+            Task { await self.restartHostingAfterNetworkLoss() }
+            return
+        }
+
+        // Also repair failures unrelated to sleep. The timer resumes when
+        // macOS schedules the process; it does not wake the system itself.
         if hostSession?.isListenerDead == true {
             logger.warning("LocalCast listener died while hosting — rebinding")
             Task { await self.restartHostingAfterNetworkLoss() }
