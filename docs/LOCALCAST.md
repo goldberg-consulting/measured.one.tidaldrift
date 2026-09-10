@@ -1,199 +1,154 @@
-# LocalCast engineering and validation guide
+# LocalCast: stream and control another Mac
 
-Reviewed 2026-09-07. This document describes the current source tree. It does
-not certify a released build or claim that LocalCast outperforms Apple Screen
-Sharing. The separate system Screen Sharing option remains available.
+LocalCast is TidalDrift’s streaming engine, called **Metal Streaming** in the app. It opens another Mac’s desktop, app, or window in a native viewer, with remote keyboard and mouse control and bidirectional clipboard sync.
 
-## Streaming contract
+It is built for responsive local-network use: hardware H.264/HEVC encoding and decoding, Metal rendering, and direct UDP transport. Password-authenticated sessions encrypt video, control, and clipboard traffic. Resolution, content, hardware, and the network determine the speed you experience.
 
-LocalCast captures a desktop, app, or window on the host and presents it in a
-native viewer window. One active viewer controls each host session. Host
-Screen Recording permission enables capture; Accessibility enables injected
-input. Local Network permission and network/firewall reachability are required
-for discovery and direct connections.
+LocalCast is under active development and can still be unstable at times. Recovery and reliability remain active work; see [Troubleshooting](TROUBLESHOOTING.md) if a session stalls or needs reconnecting.
 
-The default full-frame path is:
+This guide covers everyday use first, then settings and implementation details. For installation and first launch, start with [Getting started](GETTING_STARTED.md).
 
-1. ScreenCaptureKit supplies IOSurface-backed NV12 frames.
-2. VideoToolbox encodes H.264 or HEVC using a **required hardware encoder**.
-3. UDP transport encrypts authenticated-session packets, fragments frames,
-   paces bursts, and optionally adds forward error correction.
-4. VideoToolbox decodes complete compressed access units using a **required
-   hardware decoder**, emitting Metal-compatible NV12 buffers.
-5. Metal samples the retained IOSurface textures and converts YUV for display.
+## Start a session
 
-Hardware media engines perform encode/decode; the GPU performs presentation
-and color conversion. CPU work remains in packet handling, encryption,
-reassembly, input, and clipboard operations. Experimental region tiles also
-use CPU copies and LZFSE compression. There is no supported “0% CPU” claim,
-and region-aware mode is not an entirely GPU-based pipeline.
+On the **host Mac** — the Mac you want to view:
 
-HEVC is preferred. Encoder creation retries without the optional low-latency
-rate controller, then falls back to hardware H.264 if HEVC is unavailable.
-Software codecs are not a fallback. Hardware initialization failure is reported
-with guidance to select H.264 or reduce resolution. Metal initialization
-failure prevents the viewer connection. Both Macs need compatible hardware.
+1. Open **Settings → Metal Streaming**.
+2. Leave **Require authentication** enabled and set a **Host password**. This is the TidalDrift hosting password; it does not have to match the Mac’s login password.
+3. Grant **Screen Recording** for capture and **Accessibility (for input)** for remote control. Allow Local Network access when macOS requests it.
+4. Turn on **Host this Mac**. The menu-bar **Metal Streaming Host** toggle controls the same service.
 
-The decoder detects codec changes from parameter sets and submits all slices
-of a frame together. It can retry a failed session creation. The renderer
-uses pixel-buffer range and matrix metadata for conversion and retains buffers
-through GPU completion. This is an 8-bit, 4:2:0 SDR video path, not a 4:4:4 or
-HDR reference workflow.
+Before connecting from the **viewer Mac**, prepare its saved password. **Authenticated connections currently require a matching saved device password.** Start Cast uses saved device credentials; it does not open a password-entry sheet. The dashboard password sheet present in the source is not exposed by the current menu-bar app.
 
-## Settings and recovery
+To populate saved credentials through the current interface, open the device’s **Details**, enter a username and the required password under **Saved Credentials**, leave **Save credentials in Keychain** enabled, and launch **Screen Share** or **File Share** from that details window. The app saves after the service launch returns successfully. Entering the fields and clicking **Done** alone does not save them. This uses one shared credential record for the device, so a LocalCast password that differs from its other service password needs care when switching services.
 
-- **Bitrate, frame rate, and encoder quality:** live updates. Validated requested
-  values persist across capture rebuilds. Congestion and thermal policies can
-  reduce the actual values; they recover toward the requested bitrate.
-- **Codec, resolution, and region-aware mode:** capture/encoder rebuild within
-  the existing authenticated session. The listener, encryption key, and
-  clipboard channel remain alive. A brief held frame is expected during the
-  rebuild. Changes coalesce for roughly 600 ms and finish even if Settings
-  closes. A capture failure is reported and uses the bounded recovery path.
-- **Resolution:** Automatic follows the quality slider; Native imposes no
-  configured cap. A named host cap replaces Automatic. An explicit viewer
-  resolution override takes precedence. Changing the host resolution picker
-  clears the host's local tuning override. All caps preserve aspect ratio;
-  transport-capacity recovery can lower the effective resolution.
-- **Adaptive bitrate, FEC, transport profile, cursor capture, thermal policy:**
-  apply to hosting without dropping the session. Fast LAN changes pacing and
-  buffering; selecting it alone never assumes a jumbo-frame network.
-- **Viewer latency mode, drop-to-newest, loss recovery:** apply on the next
-  viewer connection, as the settings help states.
-- **Password, authentication, input rate limit:** apply after stopping and
-  starting hosting. Required authentication without a password refuses to
-  start. Disabling authentication explicitly permits unencrypted control/video;
-  clipboard synchronization requires an authenticated session.
-- **Initial quality preset:** initializes tuning when saved live tuning is
-  absent. Existing saved tuning is retained.
+Then connect from the viewer:
 
-Capture transitions serialize stop/start work. Stopped sessions reject late
-capture-start callbacks. Display changes and capture failures rebuild the
-selected target; an invalid app/window request never falls back to revealing
-the whole desktop. A dead network listener or a system wake needs a full host
-restart and client reauthentication. Settings changes use the lighter capture
-path.
+1. Open the TidalDrift menu and find the host under **Nearby Devices**.
+2. Hover over its row and click the lightning-bolt **Start Cast** action.
+3. Click in the viewer to control the host. If the viewer reports **View only: enable TidalDrift in Accessibility settings on the host Mac**, grant that permission on the host.
 
-Video loss triggers a keyframe request; optional FEC reconstructs up to two
-missing full-size data fragments per block. It cannot recover the short final
-fragment without its length. There is no selective video retransmission or
-reliable control acknowledgement protocol. UDP recovery is bounded and cannot
-guarantee uninterrupted pictures on arbitrary loss or network outages.
+Both Macs need a reachable network path and compatible TidalDrift builds. A host serves one active viewer at a time. To end sharing, turn off **Host this Mac** or **Metal Streaming Host**. **Auto-host on launch** starts hosting whenever TidalDrift launches.
 
-## Discovery and clipboard
+## Choose what to share
 
-LocalCast advertises `_tidaldrift-cast._udp` on UDP 5904. Its TXT data includes
-connection metadata and an address hint. Advertisement health is monitored
-and refreshed after address changes. Discovery data identifies candidates;
-it is not cryptographic proof of identity. Consult [Bonjour discovery](BONJOUR_DISCOVERY.md)
-for DNS deadlines, service ports, fallback, and limitations.
+On the host, open the menu-bar **Sharing:** menu and choose **Entire Desktop** or an app. Use **Refresh App List** after opening an app if it is missing.
 
-Clipboard updates are bidirectional for supported plain/rich text, HTML,
-images, and regular files. Small messages use session UDP; larger payloads
-and files use an authenticated TCP bulk channel on port 5906. Files download
-on paste through file promises. LocalCast deliberately does not copy every
-pasteboard format, folder, file attribute, or privacy-sensitive item. See
-[clipboard sync](CLIPBOARD_SYNC.md) for exact limits and retry semantics.
+Inside the viewer, click the top-edge chevron to open **Stream Controls**, then choose **Apps**. You can switch to **Full Display**, stream an app, expand its row to choose a window, or bring the app to the foreground. The current target also appears in the bottom status bar; clicking it opens the Apps tab.
 
-## Comparison with Apple Screen Sharing
+The app list includes apps with visible, titled windows of a usable size. Hidden, minimized, untitled, background, and some system windows can be absent. Make the desired window visible on the host and refresh the list.
 
-Use both Apple **Standard** and **High Performance** as explicit baselines.
-Apple documents High Performance support for stereo audio, HDR reference mode,
-4:4:4 chroma, and 30/60 fps low-latency streaming on supported Apple-silicon Macs.
-See [Apple's screen sharing modes](https://support.apple.com/guide/mac-help/screen-sharing-type-options-on-mac-mchl1883115d/mac)
-and [clipboard and screen sharing controls](https://support.apple.com/guide/mac-help/share-the-screen-of-another-mac-mh14066/mac).
+The host and viewer can both change the capture target. Selecting an app is a capture choice, not a restriction that prevents the connected viewer from requesting the full display. Invalid or closed app/window requests fail without automatically switching to the entire desktop.
 
-LocalCast currently lacks audio, HDR/4:4:4, and full clipboard/file semantics
-parity. Its GPU-backed design alone is not evidence of lower latency, better
-compression, or better perceived quality. The UI latency statistic measures
-heartbeat **network round-trip time**, not input-to-photon or capture-to-display
-latency. FPS measures received media activity, not guaranteed displayed frames.
+## Keyboard, mouse, and viewer controls
 
-## Reproducible acceptance procedure
+The bottom status bar switches between **Remote Control** and **View Only**. Press **⌘⇧I** to toggle remote control without using the mouse.
 
-For release hardware verification, run
-`LOCALCAST_REQUIRE_HARDWARE_TESTS=1 swift test -c release` from `TidalDrift`.
-This requires real H.264/HEVC round trips, codec/resolution recovery, and
-an IOSurface NV12 4K benchmark. The benchmark submits a static synthetic image
-with at most three outstanding pictures; it excludes capture, network, and
-presentation latency. On the shared M5 test Mac, September 7 measurements
-varied roughly 55–66 fps. Repeated strict 60-fps checks failed under concurrent
-video load, so sustained 4K60 is not certified. Set `LOCALCAST_MIN_4K_FPS=60`
-in addition to the hardware flag for a controlled idle-machine capacity gate.
+While control is enabled and the viewer is focused, typing and pointer actions go to the host. Host Accessibility permission enables input injection. Viewer Accessibility permission enables capture of system shortcuts; without it, ordinary keys use a fallback handler.
 
-The low-latency hardware encoder can return `kVTPropertyNotSupportedErr` for
-the optional hardware-status query. Successful creation with
-`RequireHardwareAcceleratedVideoEncoder` already forbids software fallback;
-an unsupported diagnostic no longer causes a working encoder to be rejected.
+- **⌘⇧I:** release or resume remote control.
+- **⌘W while controlling:** close the remote app’s window.
+- **⌘W after releasing control:** close the local viewer when Stream Controls is closed. The title-bar Close button also closes the viewer.
+- **⌘Tab** and **⌘⌥Escape:** remain local so you can switch apps or open Force Quit.
 
-Record application revision, both Mac models/chips, macOS versions, display
-resolution/refresh/scaling, codec, all tuning overrides, network interfaces,
-link speed/MTU, and power/thermal state. Update both Macs to the same build.
-Use dedicated test content and empty test clipboards.
+The viewer supports normal macOS minimize and full-screen controls. Opening Stream Controls makes its controls local rather than forwarding clicks or keystrokes to the host.
 
-Run each scenario against LocalCast, Apple Standard, and Apple High Performance
-where supported, at matched resolution and frame rate. Repeat at least three
-times after warm-up. Report raw samples, median, p95, worst case, and failures.
-Do not substitute a throughput benchmark or ping for video measurements.
+The stream omits the host’s cursor by default so the viewer uses its local pointer. Enable **Show remote cursor in stream** on the host when you want to watch the host user’s pointer, such as during a view-only session.
 
-1. **Input-to-photon:** film a locally visible input trigger and its remote
-   response with a high-speed camera or equivalent synchronized hardware.
-   Include typing, scrolling, window dragging, and animated content.
-2. **Image quality and compression:** use static small text, colored text,
-   gradients, photographs, and motion. At matched bitrate compare captures
-   against source frames, including chroma-detail crops. At matched visual
-   quality compare measured wire bitrate. Record actual codec and resolution,
-   including hardware fallback and capacity reductions.
-3. **Presentation:** record delivered frame intervals, dropped frames, startup
-   time, static-frame behavior, CPU/GPU/media-engine load, memory growth, and
-   temperature over a 30-minute session. Include full-screen transitions,
-   occlusion/minimize, display migration, and 60/120 Hz viewers.
-4. **Settings recovery:** repeatedly change H.264/HEVC, resolution, region mode,
-   bitrate, FPS, FEC, and transport profile while streaming and copying a file.
-   Close Settings immediately after each edit. Verify the selected target,
-   authentication, file transfer, input mapping, and requested tuning survive.
-   Suggested release gate: no disconnect and first fresh frame within two
-   seconds for supported settings on a stable wired link.
-5. **Network recovery:** test normal Ethernet MTU 1500, Wi-Fi, 0.1/1/3% random
-   loss, short loss bursts, interface changes, DHCP renewal, sleep/wake, and
-   listener failure. Measure recovery instead of claiming a fixed guarantee.
-   Reconnect after a host restart and confirm clipboard and input resume.
-6. **Clipboard:** both directions, text/RTF/HTML, PNG/TIFF, multiple regular
-   files, empty files, exactly-at-limit and over-limit payloads. Copy B while A
-   downloads; stop or disable sync during transfer; paste a file twice; cancel
-   and retry. A stale completion must never replace B or write after stop.
-7. **Privacy/failure:** missing password, wrong password, revoked permissions,
-   closed shared window, unavailable hardware codec, and malformed peer data.
-   Failure must explain the problem without widening the shared target.
+## Copy, paste, and drop files
 
-Automated tests cover deterministic contracts; the matrix above remains a
-release gate requiring two Macs and real displays. No measurements from this
-matrix have been collected as part of this source review.
+Enable **Clipboard Sync** on both Macs. You can also find it at **Settings → General → Sync clipboard during LocalCast sessions**.
 
-### Viewer interaction regression checks
+Copy text, rich text, HTML, an image, or regular files on either Mac, then paste on the other. Files transfer when the receiving app requests them on paste. Password-protected sessions support files and large content; passwordless sessions support only small inline clipboard content.
 
-The viewer uses a normal title bar and makes TidalDrift a regular application
-while any viewer is open. Closing the last viewer restores the prior menu-bar
-activation policy. Cmd+W closes the remote window during input capture, including
-single-window sharing. Release capture with Cmd+Shift+I before using Cmd+W to
-close the viewer locally, or use its title-bar Close button. Cmd+Tab and Cmd+Option+Escape remain
-local escape routes. Cmd+Shift+I must toggle capture both off and on.
+You can also drop regular files, text, or images onto the viewer. This sends content to the **host’s clipboard**; paste it into the remote app after transfer. Files dropped onto the viewer transfer immediately. This workflow requires a password, Clipboard Sync on both Macs, and builds that support viewer drops. The “Drop offered” message confirms the offer, not completed delivery.
 
-New hosts report Accessibility permission in their heartbeat. A viewer shows
-a warning when the host cannot inject input; grant permission on the host Mac.
+The limit is **100 MiB total and 64 regular files**. Folders and app bundles are unsupported. [Clipboard sync](CLIPBOARD_SYNC.md) explains privacy, supported formats, file promises, and retry behavior. TidalDrop is a separate file-transfer feature; it does not use this clipboard channel.
 
-Drops require updated peers, a password-protected session, and clipboard sync
-enabled on both Macs. Regular files are fetched immediately through the encrypted
-clipboard channel into the host's clipboard cache, then placed on its clipboard.
-Text/images also populate the remote clipboard. Paste into the desired remote
-application after transfer. This is not native drag-and-drop into the remote
-application, and folders/file promises are not supported. The viewer's "offered"
-message is not a delivery acknowledgement. Existing clipboard size/count limits
-apply; disabling sync or copying newer content can cancel an in-flight offer.
+## Tune picture quality
 
-Before releasing these changes, test two Macs: select the viewer from another
-app, close the remote window via Cmd+W during capture, close the viewer via its
-traffic light or Cmd+W after releasing capture, minimize/restore/full-screen, toggle capture
-twice, type, copy/paste both directions, and drop text and multiple documents.
-Verify a host without Accessibility shows the warning, an old host rejects drops
-clearly, and newer clipboard content is preserved if it changes during transfer.
+Start with the **Streaming Quality** slider in **Settings → Metal Streaming** or **Stream Controls → Quality**. Move toward **Fastest** to reduce the workload, or **Best Quality** for more detail. Expand **Fine-Tune Controls** to adjust frame rate, bitrate, encoder quality, and resolution individually.
+
+Requested settings can be reduced by congestion, thermal pressure, or transport capacity. The initial quality preset is used when saved live tuning is absent; it does not overwrite existing saved tuning.
+
+### Changes that apply during a session
+
+Bitrate, frame rate, and encoder quality update live. **Video Codec**, **Streaming resolution**, and **Region-aware streaming** rebuild capture and encoding within the existing session. Changes coalesce briefly, so the picture may hold while the new stream starts; closing Settings does not cancel the change. Authentication and the clipboard channel remain in place during this rebuild.
+
+**Adaptive bitrate**, **Forward error correction (FEC)**, **Transport profile**, **Show remote cursor in stream**, and **Thermal throttling** also apply while hosting.
+
+- **Automatic resolution** follows quality tuning. **Native** adds no configured resolution cap. Named resolutions cap the longest edge while preserving aspect ratio. An explicit viewer resolution override takes precedence over the host’s resolution setting.
+- **HEVC (Efficiency)** is the default codec. The encoder can fall back to hardware H.264 if HEVC cannot initialize. **H.264 (Compatibility)** is available directly in Settings.
+- **Auto transport** begins conservatively and uses connection measurements to select Fast LAN behavior on a clean wired link. **Resilient (Wi-Fi)** retains pacing for uneven links. Fast LAN does not require or assume jumbo frames.
+- **FEC** adds parity traffic to recover some missing video fragments. It can help on a lossy link at the cost of extra bandwidth.
+- **Region-aware streaming (experimental)** sends changed areas as lossless tiles and uses full-frame video for large changes. Both peers need support. Keep this distinction in mind when comparing its performance with the default video path.
+
+### Changes that need reconnection or a host restart
+
+**Latency mode**, **Drop to newest frame**, and **Loss-triggered recovery** apply to the next viewer connection.
+
+Changes to **Require authentication**, **Host password**, and **Input rate limit** in Settings apply after stopping and starting hosting. The menu-bar **Require password** switch restarts hosting automatically; editing its password field still needs a host restart.
+
+## Screen Share + App Control
+
+Device details include **Screen Share + App Control** under **Available Services**. This opens macOS Screen Sharing for the picture and a separate TidalDrift panel for app focus and isolation.
+
+The host needs **both** macOS Screen Sharing and LocalCast hosting enabled. LocalCast supplies the app list and control channel, so enabling macOS Screen Sharing alone is insufficient. Authenticated app control uses the saved LocalCast host password. **Isolate** hides other host apps; it does not create a separate remote desktop or an access boundary around one app.
+
+For LocalCast’s own app/window capture, open **Start Cast**, then **Stream Controls → Apps**.
+
+## Connection and security details
+
+LocalCast advertises `_tidaldrift-cast._udp` and listens on **UDP 5904**. Bulk clipboard transfer uses **TCP 5906**, with connections initiated by the viewer. [Bonjour discovery](BONJOUR_DISCOVERY.md) describes discovery and address resolution; [Troubleshooting](TROUBLESHOOTING.md) covers connection failures and permissions.
+
+Authentication is enabled by default and hosting refuses to start without a password when it is required. The host password is stored in the macOS Keychain. Password-protected sessions encrypt video and control traffic with AES-256-GCM. Turning authentication off allows reachable peers to view and control the host without a password and sends session traffic without that encryption.
+
+Bonjour advertisements identify connection candidates, not cryptographically verified hosts. Pairing currently supports a password-stretched v2 handshake and legacy v1 compatibility. Clipboard bulk transfers derive their own key from the authenticated session; see [clipboard protocol and security](CLIPBOARD_SYNC.md#protocol-and-security) for its exact guarantees and remaining protocol limits.
+
+## How the stream works
+
+The default full-frame pipeline is:
+
+1. **ScreenCaptureKit** supplies IOSurface-backed NV12 frames on the host.
+2. **VideoToolbox** hardware encodes H.264 or HEVC.
+3. **UDP transport** encrypts keyed-session packets, fragments frames, and applies pacing and optional FEC.
+4. **VideoToolbox** hardware decodes complete access units on the viewer.
+5. **Metal** converts YUV to display color and presents retained IOSurface textures.
+
+Encode/decode use hardware media engines; Metal handles presentation. Packet handling, encryption, input, and clipboard work still use the CPU. Experimental region tiles add CPU copies and LZFSE compression.
+
+The full-frame video path is **8-bit 4:2:0 SDR**. Audio, HDR, and 4:4:4 video are not implemented. Hardware codecs and Metal rendering are required; there is no software codec fallback. Initialization failures surface as connection/capture errors.
+
+Capture transitions are serialized, including settings changes, target changes, and recovery. A failed listener or system wake triggers a host restart and client reauthentication. Recovery is bounded; a prolonged outage can require reconnecting.
+
+Video loss can trigger a keyframe request. FEC can reconstruct up to two missing full-size data fragments per block, but not the short final fragment without its length. The protocol does not selectively retransmit video or acknowledge every control operation.
+
+**Info** shows connection statistics. Its latency value is heartbeat **network round-trip time**, not capture-to-display or input-to-photon latency. FPS counts received media activity, not guaranteed displayed frames. Those statistics alone do not establish performance relative to macOS Screen Sharing.
+
+## Developer validation
+
+The [module source map](../TidalDrift/LocalCast/README.md) identifies implementation files. The Swift package has deterministic tests for transport, settings, capture recovery, media parsing, color conversion, and clipboard behavior. From the repository root:
+
+```sh
+cd TidalDrift
+swift test
+```
+
+Hardware validation runs on a Mac with the required codecs and Metal support:
+
+```sh
+LOCALCAST_REQUIRE_HARDWARE_TESTS=1 swift test -c release
+```
+
+This enables real H.264/HEVC round trips, codec/resolution recovery, and a synthetic IOSurface NV12 4K benchmark. The benchmark excludes capture, network, and presentation latency and uses a static image with at most three outstanding pictures. Add `LOCALCAST_MIN_4K_FPS=60` only when intentionally enforcing a 60-fps capacity threshold on controlled hardware.
+
+Before shipping streaming changes, test on **two Macs running the same revision**. Record chips, macOS versions, display resolution/scaling/refresh, codec and tuning overrides, network interfaces/MTU, and power/thermal state.
+
+1. **Connect and control:** authenticate; switch focus, minimize, and enter full screen; type and scroll; toggle ⌘⇧I twice; verify remote ⌘W and local Close behavior; revoke host Accessibility and verify the warning.
+2. **Change targets and settings:** switch desktop/app/window, close the shared window, and edit codec, resolution, region mode, and quality while streaming. Close Settings immediately after an edit. Confirm the target, input mapping, authentication, and clipboard remain correct.
+3. **Exercise recovery:** test Wi-Fi and standard-MTU Ethernet, packet loss/bursts, interface changes, sleep/wake, and listener failure. Record recovery time and failures, including any needed reconnect.
+4. **Check clipboard:** use the [clipboard verification cases](CLIPBOARD_SYNC.md#developer-verification), including newer copies during transfers and sync disabled mid-transfer.
+5. **Measure performance:** test small text, gradients, photos, and motion over a sustained session. Measure actual displayed frame intervals, input-to-photon latency, wire bitrate, memory, and thermal load. For comparisons with macOS Screen Sharing, match resolution/frame rate, warm up, repeat runs, and report raw results plus median, p95, worst case, and failures.
+
+Unit tests and the synthetic benchmark complement these checks; they do not replace two-Mac validation or certify a particular resolution/frame-rate target.
+
+[Documentation index](README.md)

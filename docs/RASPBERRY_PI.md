@@ -1,131 +1,178 @@
-# Raspberry Pi and Linux Targets
+# Raspberry Pi and Linux
 
-**Scope:** How TidalDrift connects to non-Mac machines (SSH and Screen
-Share), the `tidaldrift-pi` companion package, and the VNC compatibility
-work that makes macOS Screen Sharing interoperate with Linux VNC servers.
-Shipped across app v1.6.53 and v1.6.54 and package 0.1.2.
+Use TidalDrift on your Mac to open a Linux desktop in macOS Screen Sharing or start an SSH session in Terminal. The `tidaldrift-pi` companion package advertises the Linux machine through Bonjour and supplies a TigerVNC virtual desktop.
 
-## What works
+LocalCast and app-window streaming require a Mac host. The Linux package does not provide a LocalCast host, a TidalDrop receiver, or an SMB file server. The **TD** badge reflects the package's peer advertisement, not support for every TidalDrift feature.
 
-A Raspberry Pi (or any Debian-family machine) running the companion
-package appears in TidalDrift's device list like a Mac, with two working
-connection paths:
+## Before installing
 
-| Path | Transport | Auth |
-|---|---|---|
-| SSH button | `ssh <user>@<host>.local` in Terminal | SSH keys (or the account password) |
-| Screen Share button | macOS Screen Sharing over RFB, port 5900 | Classic VNC password (VncAuth) |
+You need:
 
-LocalCast (the custom Metal streaming pipeline) remains Mac-to-Mac; for a
-Pi's desktop, VNC is the appropriate tier.
+- A Raspberry Pi or Debian-family Linux machine with `apt` and `systemd`, reachable from the Mac.
+- An existing non-root account with a home directory at `/home/<username>`. The packaged VNC service checks for its password file there.
+- A desktop environment that TigerVNC can start. The package installs the VNC server, but does not install or configure a desktop environment. A minimal or Lite OS image needs that additional setup.
+- Access to a terminal on the Linux machine, either locally or over SSH.
 
-## The tidaldrift-pi package
+The package creates an independent **virtual desktop**, 1920 × 1080, on display `:1` and TCP port **5900**. It can work without a monitor once a desktop session is configured. It does not mirror the physical display.
 
-`tidaldrift-pi_<version>_all.deb` is attached to each GitHub release and
-built from `linux/tidaldrift-pi/` (`build-deb.sh`, works on macOS with
-Homebrew dpkg and on Debian).
+Only one `tidaldrift-vnc@<username>` instance can run at a time: every instance uses the same display and port. Another VNC server must not occupy port 5900.
 
-| Piece | Purpose |
-|---|---|
-| `/etc/avahi/services/tidaldrift-ssh.service` | Advertises `_ssh._tcp` (22) over Bonjour, which TidalDrift browses |
-| `/etc/avahi/services/tidaldrift-rfb.service` | Advertises `_rfb._tcp` (5900), producing the Screen Share button |
-| `/etc/avahi/services/tidaldrift-peer.service` | `_tidaldrift._tcp` peer beacon with a persisted `peerId`, generated at install |
-| `tidaldrift-vnc@<user>.service` | TigerVNC virtual desktop, pinned to port 5900 |
-| `tidaldrift-pi-setup` | One-time helper: sets the VNC password, enables the service |
+## Install and start the desktop
 
-Install:
+Download the `.deb` companion asset from a [TidalDrift release](https://github.com/goldberg-consulting/measured.one.tidaldrift/releases) and copy it to the Linux machine. The package currently declares version `0.1.2`; use the filename of the asset you downloaded.
+
+Run on Linux, replacing `youruser` with the existing account that should own the desktop:
 
 ```bash
-sudo apt install -y ./tidaldrift-pi_<version>_all.deb
-sudo tidaldrift-pi-setup <username>
+sudo apt install ./tidaldrift-pi_0.1.2_all.deb
+sudo apt install openssh-server
+sudo systemctl enable --now ssh avahi-daemon
 ```
 
-The peer beacon's stable `peerId` plugs into the credential identity
-system introduced in v1.6.52: saved logins for the machine are keyed by
-identity, not IP or hostname, so they survive DHCP lease changes and
-multi-NIC ambiguity. `apt remove` preserves the ID; `apt purge` discards
-it.
+`avahi-daemon` and `tigervnc-standalone-server` are package dependencies. `openssh-server` is only recommended by the package, so the explicit install above ensures the SSH path is available even when recommended packages are disabled.
 
-## VNC server choices and pitfalls
+Before starting TigerVNC, check whether another server already owns its port:
 
-**TigerVNC virtual desktop (what the package runs).** The unit starts
-`tigervncserver :1 -rfbport 5900 -localhost no -SecurityTypes VncAuth`.
-A virtual desktop works headless (no monitor, no GPU session) and renders
-the Pi's full desktop environment at 1920x1080. Two settings are
-deliberate:
+```bash
+sudo ss -ltnp 'sport = :5900'
+```
 
-- **`-rfbport 5900`**: display `:1` would default to port 5901; pinning
-  5900 matches both the Bonjour advertisement and what `vnc://host`
-  implies, so every path lands on the same server.
-- **`-SecurityTypes VncAuth`**: TigerVNC's default list (`VncAuth,TLSVnc`)
-  makes the server advertise VeNCrypt ahead of classic VncAuth. macOS
-  Screen Sharing does not implement VeNCrypt and, rather than falling
-  back, aborts with "the software on the remote computer appears to be
-  incompatible with this version of Screen Sharing." Pinning VncAuth
-  removes the poison type. (Fixed in package 0.1.1 -> 0.1.2.)
+If you are switching from a system `wayvnc` service, stop that service first:
 
-**wayvnc (Raspberry Pi OS default).** Pi OS ships a `wayvnc.service`
-sharing the physical Wayland desktop, with `Restart=always`. If both are
-enabled, wayvnc crash-loops against TigerVNC's port and can steal 5900
-after a restart race. The setup flow disables it. To share the physical
-display instead of a virtual one, re-enable wayvnc deliberately and
-remove the TigerVNC unit; the Avahi advertisements work for either.
+```bash
+sudo systemctl disable --now wayvnc.service
+```
 
-**vncpasswd shadowing.** On systems where RealVNC coexists with TigerVNC,
-plain `vncpasswd` resolves to RealVNC's incompatible tool; the setup
-helper prefers `tigervncpasswd` (package 0.1.1). Note that classic
-VncAuth uses at most 8 password characters.
+Other VNC services may use different names or run as user services. Stop the actual competing service before continuing. **The setup helper does not disable other VNC servers for you.**
 
-## Client-side compatibility: the RFB security probe (v1.6.54)
+Set the VNC password and start the desktop:
 
-macOS Screen Sharing changes its authentication mode based on whether the
-`vnc://` URL carries a username. With a username present it insists on
-Mac-style authentication; against a password-only server it reports the
-same misleading "incompatible" error. TidalDrift previously always passed
-saved device credentials into the URL, which broke non-Mac targets the
-moment credentials were saved.
+```bash
+sudo tidaldrift-pi-setup youruser
+sudo systemctl status tidaldrift-vnc@youruser.service
+```
 
-Since v1.6.54, `ScreenShareConnectionService` probes the server's RFB
-handshake (server version, client version reply, security-type list;
-2.5 s timeout) before building the URL, and omits the username and
-password when the server offers no username-capable type. Screen Sharing
-then shows its plain password prompt, which authenticates cleanly.
+The helper runs TigerVNC's password tool as that user, enables the VNC service at boot, starts it immediately, and reloads Avahi. Use the password you set here when macOS Screen Sharing asks for a password. It is separate from the Linux account password; classic VNC authentication uses at most eight password characters.
 
-| Offered security types | Username sent | Typical server |
-|---|---|---|
-| 30, 33, 35, 36 (Apple auth family) | Yes | macOS Screen Sharing host (measured on Tahoe) |
-| 5, 6, 129, 130, 133, 134 (RSA-AES family) | Yes | RealVNC |
-| 2 (VncAuth), 1 (None), 16 (Tight), 19 (VeNCrypt) only | No | TigerVNC, wayvnc, x11vnc |
+This VNC configuration uses password authentication without transport encryption and listens on the LAN. Keep port 5900 on a trusted network; do not expose it directly to the internet.
 
-A failed probe (timeout, non-RFB banner, pre-3.7 server) leaves the
-existing behavior untouched, so Mac-to-Mac connections cannot regress.
-The decision table is unit-tested in `RFBSecurityProbeTests` with type
-sets measured from live servers.
+## Connect from the Mac
 
-## Security notes
+1. Open TidalDrift's menu bar panel and choose **Discover Devices**.
+2. Find the Linux hostname under **Nearby Devices** and hover over its row.
+3. Choose the display icon, **Screen Share (VNC)**. Enter the VNC password in macOS Screen Sharing.
+4. For a terminal session, choose **SSH**.
 
-- RFB traffic is password-gated but unencrypted. Treat it as LAN-only;
-  tunnel over SSH for anything else.
-- The VNC password is independent of the account password. Change it on
-  the machine with `tigervncpasswd`, then
-  `sudo systemctl restart tidaldrift-vnc@<user>`.
-- SSH key auth is the recommended posture for the SSH path; disable
-  password authentication in `sshd_config` once keys are installed.
+The menu bar's SSH shortcut uses your current **Mac account name**. If the Linux username differs, run an explicit command in Terminal:
+
+```bash
+ssh youruser@raspberrypi.local
+```
+
+Replace `raspberrypi.local` with the machine's hostname or IP address. SSH uses your SSH keys or asks for the Linux account password in Terminal; the VNC password is not used for SSH.
+
+You can also open Screen Sharing directly:
+
+```bash
+open 'vnc://raspberrypi.local:5900'
+```
+
+A device can appear before its VNC desktop or SSH server is ready: the Avahi service records are static. The connection actions are not service health checks.
+
+## Keep the desktop running
+
+Change the VNC password by signing in as the desktop's Linux user and running:
+
+```bash
+tigervncpasswd
+sudo systemctl restart tidaldrift-vnc@youruser.service
+```
+
+Use `tigervncpasswd` explicitly when RealVNC is also installed; a generic `vncpasswd` command may invoke the wrong password tool. The setup helper prefers `tigervncpasswd` and falls back to `vncpasswd` only if needed.
+
+To stop hosting, disable the selected instance:
+
+```bash
+sudo systemctl disable --now tidaldrift-vnc@youruser.service
+```
+
+The static VNC advertisement remains while the package is installed. If you switch to a different VNC server, keep its port and `/etc/avahi/services/tidaldrift-rfb.service` in agreement, and confirm that it supports macOS Screen Sharing authentication. Sharing a physical Wayland desktop with `wayvnc` is a separate configuration; this package does not configure it.
 
 ## Troubleshooting
 
-| Symptom | Cause | Fix |
-|---|---|---|
-| "Incompatible with this version of Screen Sharing" immediately | Server advertises VeNCrypt/TLS (TigerVNC default list) | Package 0.1.2 pins `-SecurityTypes VncAuth` |
-| Same error, but after a password dialog | Username in the vnc:// URL against a password-only server | App v1.6.54 probes and omits the username; or connect with the username field empty |
-| Auth fails repeatedly | Wrong credential: the prompt wants the VNC password, not the SSH/login password | Use the password set by `tidaldrift-pi-setup` / `tigervncpasswd` |
-| Screen Share button missing in TidalDrift | Avahi advertisement not live | `systemctl reload-or-restart avahi-daemon`; verify with `dns-sd -B _rfb._tcp local.` from the Mac |
-| Port 5900 flapping between servers | wayvnc and TigerVNC both enabled | `sudo systemctl disable --now wayvnc` (or choose wayvnc and remove the TigerVNC unit) |
-| Blank/black desktop in the viewer | No desktop environment installed for the virtual session | Install a desktop (e.g. `raspberrypi-ui-mods`) or share the physical desktop via wayvnc |
+### The machine does not appear
 
-Verification one-liners from the Mac:
+On Linux, check Avahi and reload its records:
 
 ```bash
-dns-sd -B _rfb._tcp local.          # advertisement visible?
-nc -w 3 <host> 5900 </dev/null      # prints "RFB 003.008" if the server is up
+systemctl status avahi-daemon
+sudo systemctl reload-or-restart avahi-daemon
 ```
+
+On the Mac, check whether the VNC advertisement is visible:
+
+```bash
+dns-sd -B _rfb._tcp local.
+```
+
+Press **Control-C** to stop browsing. If the advertisement is absent, check multicast handling, guest-network isolation, and the Linux firewall. See [device discovery](BONJOUR_DISCOVERY.md) for more checks.
+
+### Screen Sharing cannot connect
+
+Check the VNC service, its recent log, and the listener on Linux:
+
+```bash
+systemctl status tidaldrift-vnc@youruser.service
+journalctl -u tidaldrift-vnc@youruser.service -n 80 --no-pager
+sudo ss -ltnp 'sport = :5900'
+```
+
+A missing-password error means the password must be created for the same account as the service instance. A port-in-use error means another VNC process or another `tidaldrift-vnc` instance is running. A session that exits immediately usually requires checking the installed desktop and the user's TigerVNC session configuration.
+
+To check the listener from the Mac:
+
+```bash
+nc -w 3 raspberrypi.local 5900 </dev/null
+```
+
+An `RFB ...` banner confirms a reachable VNC server, but does not test password acceptance or desktop startup.
+
+### “Incompatible with this version of Screen Sharing”
+
+The packaged unit pins TigerVNC to `-SecurityTypes VncAuth` for compatibility with macOS Screen Sharing. If you changed the server configuration, restore that setting and restart the service. The unit deliberately uses `-rfbport 5900`; display `:1` otherwise normally uses 5901.
+
+For password-only VNC servers, connect without a username in the `vnc://` URL. TidalDrift probes the server's advertised authentication types when a username is supplied and omits credentials for password-only servers. If that probe cannot complete, a direct URL with no username is a useful diagnostic.
+
+### Password is rejected
+
+Use the VNC password set by `tidaldrift-pi-setup`, not the SSH or Linux login password. Reset it with the TigerVNC password tool under the correct Linux account, then restart that user's service.
+
+### Blank desktop or immediate disconnect
+
+The package does not select or install a desktop session. Check the service log and the user's TigerVNC logs, then configure a compatible desktop session for the Linux distribution in use. A running VNC listener alone does not establish that a desktop environment started successfully.
+
+## Package contents and identity
+
+The package installs:
+
+- `/etc/avahi/services/tidaldrift-ssh.service`: advertises SSH on TCP 22.
+- `/etc/avahi/services/tidaldrift-rfb.service`: advertises VNC on TCP 5900.
+- `/etc/avahi/services/tidaldrift-peer.service`: generated during installation, advertises `_tidaldrift._tcp` with the machine's model, OS, package version, and stable `peerId`.
+- `/lib/systemd/system/tidaldrift-vnc@.service`: the TigerVNC service template.
+- `/usr/bin/tidaldrift-pi-setup`: the password and service setup helper.
+
+The peer ID lives in `/etc/tidaldrift/peer-id`. It lets TidalDrift associate the machine with saved credentials even after its address changes. It is discovery metadata, not an authentication secret. The peer beacon advertises port 5959 for metadata only; the package does not run a server on that port.
+
+`sudo apt remove tidaldrift-pi` stops the VNC instances and removes the generated peer advertisement, while retaining the peer ID and packaged configuration files. `sudo apt purge tidaldrift-pi` also removes the peer ID and package configuration. User-owned VNC password/session files remain in the user's home directory.
+
+## Build the package from source
+
+With `dpkg-deb` available, run from the repository root:
+
+```bash
+./linux/tidaldrift-pi/build-deb.sh
+```
+
+On macOS, install the build tool with `brew install dpkg`. The script reads the version from [the package control file](../linux/tidaldrift-pi/pkg/DEBIAN/control) and writes `linux/tidaldrift-pi/tidaldrift-pi_<version>_all.deb`. The release workflow builds and uploads this asset after the Mac app release steps.
+
+Implementation references: [setup helper](../linux/tidaldrift-pi/pkg/usr/bin/tidaldrift-pi-setup), [VNC unit](../linux/tidaldrift-pi/pkg/lib/systemd/system/tidaldrift-vnc@.service), [installation script](../linux/tidaldrift-pi/pkg/DEBIAN/postinst), and [Screen Sharing connection service](../TidalDrift/Services/ScreenShareConnectionService.swift).

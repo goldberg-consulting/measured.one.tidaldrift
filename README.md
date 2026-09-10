@@ -1,262 +1,101 @@
+<img src="TidalDrift/PressKit/Screenshots/TidalDrift-Icon-256.png" alt="TidalDrift app icon" width="96">
+
 # TidalDrift
 
-A menu-bar Mac utility for discovering, connecting to, and streaming between Macs on your local network. Built entirely with Apple frameworks; no external dependencies.
+**Screen sharing, app streaming, and file transfer from your Mac’s menu bar.**
 
-TidalDrift replaces the manual workflow of opening System Settings, toggling sharing services, remembering IP addresses, and launching Screen Sharing.app. It lives in your menu bar, discovers advertising Macs on your LAN via Bonjour, and provides one-click access to screen sharing (VNC), file sharing (SMB), SSH, and its own low-latency streaming engine, LocalCast.
+TidalDrift brings the computers on your local network into one place. Find a nearby Mac, open its desktop, work in a remote app, send a file, or start an SSH session—all from the menu bar.
 
-> **Development status:** LocalCast provides desktop and app/window streaming using hardware VideoToolbox encoding/decoding and Metal rendering. Codec and resolution edits rebuild capture while retaining the authenticated session. Performance superiority and full capability parity with Apple's Screen Sharing have not been established. See [LocalCast's current contract and validation procedure](docs/LOCALCAST.md) for settings behavior, clipboard limits, and remaining work.
+[Download](https://github.com/goldberg-consulting/measured.one.tidaldrift/releases/latest) · [Getting started](docs/GETTING_STARTED.md) · [Documentation](docs/README.md) · [Report an issue](https://github.com/goldberg-consulting/measured.one.tidaldrift/issues)
 
-## Features
+## What you can do
 
-**Menu-Bar Command Center**
-- Lives entirely in the menu bar; no main window needed
-- Compact popover shows your Mac's sharing status, all discovered devices, and inline action buttons
-- One-click LocalCast, VNC, SMB, and SSH connections from any device row
-- Drag files onto the Dock icon to send to multiple devices at once
+- **Work on another Mac.** Use LocalCast for desktop and app/window streaming, with remote mouse and keyboard control. You’ll see it called **Metal Streaming** in the app.
+- **Use familiar connections.** Open macOS Screen Sharing for VNC, Finder for shared folders, or Terminal for SSH.
+- **Copy here, paste there.** Sync text, rich text, images, and files during LocalCast sessions. File and large-content transfers require a password-authenticated session.
+- **Send files with TidalDrop.** Keep TidalDrift in the Dock, drop files onto its icon, choose one or more devices, and send. TidalDrop uses an existing mounted share when available or a direct connection to another TidalDrift app.
+- **Find your devices.** Bonjour discovers advertised services; **Discover Devices** also scans the local subnet. Saved credentials live in Keychain, and Wake-on-LAN can help bring a sleeping device back.
+- **Connect to a Raspberry Pi.** The Linux companion sets up a VNC desktop and SSH discovery. See the [Raspberry Pi guide](docs/RASPBERRY_PI.md).
 
-**LocalCast: Low-Latency Screen Streaming**
-- Custom streaming engine: ScreenCaptureKit capture, VideoToolbox HEVC/H.264 encoding, NV12 end to end, Metal rendering, raw UDP transport
-- Low-latency capture, encoding, and presentation; performance depends on the host, viewer, content, and network
-- Stream full display or a single app/window
-- Auto/Resilient/Fast LAN transport profiles, adaptive bitrate, forward error correction, and an adaptive jitter buffer
-- AES-256-GCM session encryption with per-packet authentication once keyed (v2 pairing uses PBKDF2-HMAC-SHA256 then HKDF; password never sent over the wire; legacy v1 compatibility remains)
-- Aspect-preserving resolution controls, including native capture and automatic reduction when frames exceed transport capacity
-- Remote mouse and keyboard input with configurable rate limiting
-- Viewer-to-host live tuning; requested values survive capture rebuilds
-- Clipboard sync during sessions: text, rich text, images, and files paste across machines in both directions, encrypted with the session key; copies marked confidential or transient are excluded
+Built with Swift, SwiftUI, and Apple frameworks. No third-party Swift package dependencies.
 
-**Network Discovery**
-- Bonjour/mDNS service browsing for `_rfb._tcp`, `_smb._tcp`, `_ssh._tcp`, and TidalDrift peers
-- Subnet scanning for devices that do not advertise services
-- Rich peer metadata broadcast (model, CPU, memory, macOS version, uptime)
-- Connection history and saved credentials in Keychain
+## LocalCast: responsive streaming between Macs
 
-**TidalDrop: Peer-to-Peer File Transfer**
-- Drop files onto any device card or use the Dock icon
-- Transfers via mounted SMB share when available; falls back to direct TCP
-- Configurable destination folder
+LocalCast is TidalDrift’s native streaming engine, labeled **Metal Streaming** in the app. It connects directly over your local network and puts another Mac’s desktop, app, or window in a native viewer.
 
-**Raspberry Pi / Linux Targets**
-- `tidaldrift-pi` Debian companion package (attached to each release) makes a Pi a first-class target: SSH and Screen Share buttons work like a Mac's
-- TigerVNC virtual desktop on port 5900 (headless-friendly), advertised over Bonjour, with a stable peer identity so saved logins survive DHCP changes
-- VNC compatibility handled automatically: the client probes RFB security types and adapts to classic VncAuth servers (TigerVNC, wayvnc, x11vnc) vs Mac and RealVNC authentication
-- Details in [docs/RASPBERRY_PI.md](docs/RASPBERRY_PI.md)
+- **Share a desktop, app, or window.** Switch what you’re viewing from the host or the viewer’s app picker.
+- **Work in the remote session.** Use mouse and keyboard control, forward shortcuts, and switch to view-only mode when needed.
+- **Bring your clipboard along.** Copy text, rich text, images, and regular files in either direction. Drop files onto the viewer to make them available on the host’s clipboard.
+- **Adjust the picture as you work.** Tune frame rate, bitrate, quality, resolution, and codec during a session. Choose transport settings for Wi-Fi or a fast wired LAN.
 
-**Other**
-- Wake-on-LAN with MAC auto-discovery
-- Guided setup wizard for Screen Sharing, File Sharing, SSH, and Firewall
-- Built-in integration test suite (22 tests covering Bonjour, networking, crypto, file transfer, and streaming)
+**Built for speed.** ScreenCaptureKit captures the host, VideoToolbox uses hardware H.264/HEVC encoding and decoding, and Metal renders the viewer. Direct UDP transport, adaptive bitrate, and optional forward error correction help balance responsiveness, image quality, and uneven network conditions. Actual frame rate and latency depend on the Macs, resolution, content, and network.
 
-## Installation
+**Password-protected, encrypted sessions.** Authentication is enabled by default. Password-authenticated sessions encrypt video and control traffic with AES-256-GCM; files and large clipboard content use a separately keyed encrypted channel. The host password is stored in Keychain. Turning authentication off also turns off session encryption and makes the host accessible to reachable peers without a password.
 
-### Homebrew (recommended)
+**Still improving.** LocalCast is under active development and can still be unstable at times. If a stream stalls or needs reconnecting, the [troubleshooting guide](docs/TROUBLESHOOTING.md) can help; reproducible reports help improve recovery and reliability.
 
-Homebrew 6 and later requires trusting a third-party tap before installing
-from it (one-time):
+[Set up LocalCast](docs/LOCALCAST.md#start-a-session) · [Quality and speed controls](docs/LOCALCAST.md#tune-picture-quality) · [Security details](docs/LOCALCAST.md#connection-and-security-details) · [Clipboard capabilities and limits](docs/CLIPBOARD_SYNC.md)
+
+## Install
+
+Requires **macOS 13 Ventura or later**. For LocalCast, run TidalDrift on both Macs on the same local network. Standard VNC, SMB, and SSH targets only need the corresponding service enabled.
+
+### Download the app
+
+1. Open the [latest release](https://github.com/goldberg-consulting/measured.one.tidaldrift/releases/latest) and download the DMG. Check its release notes for signing and notarization status.
+2. Open the DMG and drag **TidalDrift** to **Applications**.
+3. Launch TidalDrift and click its menu-bar icon.
+
+### Homebrew
 
 ```bash
-brew trust --tap goldberg-consulting/tap
 brew install --cask goldberg-consulting/tap/tidaldrift
 ```
 
-To update:
+If Homebrew asks you to grant trust, trust the TidalDrift cask and repeat the install command:
+
+```bash
+brew trust --cask goldberg-consulting/tap/tidaldrift
+```
+
+See Homebrew’s [tap trust documentation](https://docs.brew.sh/Tap-Trust) for details. To update an installed copy:
 
 ```bash
 brew upgrade --cask tidaldrift
 ```
 
-### Manual
+## Your first connection
 
-Download the latest signed and notarized DMG from [Releases](https://github.com/goldberg-consulting/measured.one.tidaldrift/releases), open it, and drag TidalDrift to Applications.
+1. **Open TidalDrift.** Allow local network access when macOS asks. The setup wizard walks through the system sharing services; enable the ones you plan to use.
+2. **Prepare the target Mac.** Enable **Screen Sharing** in its system Sharing settings, and allow the account you’ll use to connect. You can also use TidalDrift’s setup wizard on that Mac.
+3. **Connect.** Find the target under **Nearby Devices**, hover over its row, and click **Screen Share (VNC)**. Sign in through macOS Screen Sharing.
 
-## Requirements
+For TidalDrift’s own streaming viewer, follow [Set up LocalCast](docs/GETTING_STARTED.md#set-up-localcast-metal-streaming). It covers the host password, capture permissions, and **Start Cast** action.
 
-- macOS 13.0 (Ventura) or later
-- Xcode 15+ with Swift 5.9+ for building from source
+## Documentation
 
-## Building
+- [Getting started](docs/GETTING_STARTED.md) — first launch, permissions, and everyday connections.
+- [LocalCast](docs/LOCALCAST.md) — stream a desktop or app, control input, and tune picture quality.
+- [Clipboard sync](docs/CLIPBOARD_SYNC.md) — copy and paste between Macs, including files.
+- [File transfer](docs/FILE_TRANSFER.md) — TidalDrop, shared folders, and where received files go.
+- [Discovery and networking](docs/BONJOUR_DISCOVERY.md) — find devices and understand network requirements.
+- [Raspberry Pi and Linux](docs/RASPBERRY_PI.md) — install and configure the companion package.
+- [Troubleshooting](docs/TROUBLESHOOTING.md) — resolve discovery, permissions, and connection problems.
 
-TidalDrift uses Swift Package Manager. The project builds with either `xcodebuild` or `swift build`.
+The [documentation index](docs/README.md) also links to developer references and historical notes.
 
-### Development Build (recommended)
+## Build and contribute
 
-The dev build script handles signing, DMG creation, installation to `/Applications`, and TCC permission resets:
-
-```bash
-cd TidalDrift
-chmod +x build-app.sh
-./build-app.sh
-```
-
-This requires:
-- Xcode selected: `sudo xcode-select -s /Applications/Xcode.app/Contents/Developer`
-- A Developer ID certificate in your Keychain (falls back to ad-hoc signing if unavailable)
-
-### Release Build (signed + notarized)
-
-```bash
-cd TidalDrift
-chmod +x build-release.sh
-./build-release.sh
-```
-
-The release build adds hardened runtime, notarization via Apple's notary service, and ticket stapling. It requires a `.env` file; see [Configuration](#configuration) below.
-
-To skip notarization (sign only):
-
-```bash
-./build-release.sh --skip-notarize
-```
-
-To copy the release DMG to the maintainer SMB share, enable the optional flag:
-
-```bash
-COPY_TO_SHARE=1 ./build-release.sh
-```
-
-By default, network share copy is disabled so OSS builds remain portable.
-
-### Swift Package Manager
+The macOS app is a Swift package in [`TidalDrift/`](TidalDrift). With Xcode and Swift 5.9 or later available:
 
 ```bash
 cd TidalDrift
 swift build
+swift test
 ```
 
-Note: `swift build` compiles the code but does not create an `.app` bundle with the required `Info.plist`, entitlements, or code signing. Use `build-app.sh` for a runnable app.
-
-### Continuous Integration
-
-GitHub Actions validates three paths on every push and pull request to `main`:
-
-- `swiftlint` for style and lint checks
-- `swift build` and `swift test` for SwiftPM compile and test coverage
-- `xcodebuild` on the `TidalDrift` scheme (with code signing disabled) to validate the app target build path
-
-### Releasing
-
-Releases are automated via GitHub Actions. When a GitHub Release is published, the workflow:
-
-1. Builds the app with `xcodebuild` (Release configuration)
-2. Creates the `.app` bundle with correct `Info.plist` and entitlements
-3. Signs with a Developer ID certificate imported from encrypted secrets
-4. Creates and signs the DMG
-5. Notarizes via Apple's notary service and staples the ticket
-6. Uploads the notarized DMG to the GitHub Release
-7. Updates the [Homebrew cask](https://github.com/goldberg-consulting/homebrew-tap) with the new version and SHA256
-
-The release workflow runs in a protected GitHub environment (`release`) that requires approval from a maintainer. Only repository admins can publish releases.
-
-No signing certificates, Apple credentials, or secrets are stored in the repository. All sensitive values are configured as GitHub Actions encrypted secrets.
-
-## Permissions
-
-TidalDrift requests several macOS permissions on first use:
-
-| Permission | Purpose |
-|---|---|
-| **Screen Recording** | Required for LocalCast host to capture the screen |
-| **Accessibility** | Required for remote input injection (mouse/keyboard) on the host |
-| **Local Network** | Required for Bonjour discovery and direct connections |
-
-The build scripts automatically reset TCC permissions on each rebuild, since code signature changes invalidate previous grants.
-
-## Architecture
-
-```
-TidalDrift/
-  App/                    # App entry point, delegate, state management
-  Views/
-    MenuBarView.swift     # Primary UI: menu bar popover
-    DropTargetPicker.swift # Multi-device file send picker
-    Settings/             # Settings window tabs (incl. test suite)
-    Dashboard/            # Device grid/list views
-    DeviceDetail/         # Standalone device detail windows
-    Onboarding/           # First-run setup wizard
-  LocalCast/
-    Core/                 # Configuration, service, permissions
-    Host/                 # Screen capture, video encoding, input injection
-    Client/               # Session management, video decoding
-    Transport/            # UDP transport, packet protocol
-    Security/             # AES-256-GCM crypto, HKDF key derivation
-    Views/                # Viewer window, quality controls, app picker
-  Services/               # Bonjour, TidalDrop, clipboard sync, discovery
-    TestSuite/            # In-app integration tests
-  Models/                 # DiscoveredDevice, ConnectionRecord, AppSettings
-  ViewModels/             # Dashboard/device detail view models
-  Utilities/              # NetworkUtils, ShellExecutor
-linux/
-  tidaldrift-pi/          # Debian companion package for Pi/Linux targets
-```
-
-## Configuration
-
-### Build version metadata (`TidalDrift/version.env`)
-
-Both build scripts load app version values from `TidalDrift/version.env`:
-
-```bash
-APP_VERSION=1.4.3
-BUILD_NUMBER=10403
-```
-
-`APP_VERSION` maps to `CFBundleShortVersionString` and `BUILD_NUMBER` maps to `CFBundleVersion` in generated app bundles.
-
-### Notarization credentials (`TidalDrift/.env`)
-
-The release build script sources `TidalDrift/.env` for Apple notarization credentials. This file is gitignored and must never be committed.
-
-```bash
-cp TidalDrift/.env.template TidalDrift/.env
-```
-
-Then edit `TidalDrift/.env` with your values:
-
-| Variable | Description | Where to get it |
-|---|---|---|
-| `APPLE_ID` | Your Apple Developer account email | [developer.apple.com](https://developer.apple.com) |
-| `TEAM_ID` | Your 10-character Apple Developer Team ID | Xcode > Settings > Accounts > Team ID, or [Membership](https://developer.apple.com/account#MembershipDetailsCard) |
-| `APP_SPECIFIC_PASSWORD` | An app-specific password for notarytool | [appleid.apple.com](https://appleid.apple.com) > Sign-In and Security > App-Specific Passwords |
-| `NOTARY_PROFILE` | Keychain profile name (default: `notarytool-profile`) | Auto-created by the build script on first run |
-
-On the first notarization run, the script stores these credentials in your login keychain under the profile name, so subsequent runs do not need the plaintext values. You can also store them manually:
-
-```bash
-xcrun notarytool store-credentials "notarytool-profile" \
-  --apple-id "you@example.com" \
-  --team-id "XXXXXXXXXX" \
-  --password "xxxx-xxxx-xxxx-xxxx"
-```
-
-### Developer ID certificate
-
-Both build scripts require a **Developer ID Application** certificate in your Keychain. The dev build (`build-app.sh`) falls back to ad-hoc signing if none is found; the release build (`build-release.sh`) exits with an error.
-
-Verify your certificate is installed:
-
-```bash
-security find-identity -v -p codesigning | grep "Developer ID Application"
-```
-
-## Running Tests
-
-Tests run inside the app itself. Launch TidalDrift, open **Settings > Tests**, and click **Run All Tests**. The suite covers:
-
-- **Permissions**: Screen Recording, Accessibility, network availability
-- **Bonjour**: Service advertising, self-discovery, LocalCast UDP browse
-- **Network**: TCP/UDP port binding, loopback echo roundtrips
-- **Security**: Key generation, HKDF derivation, AES-GCM encrypt/decrypt, tamper detection
-- **TidalDrop**: Loopback file transfer (small and large), destination folder validation
-- **LocalCast**: Streaming tuning interpolation, packet protocol serialization, host session lifecycle
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development workflow and guidelines.
+These commands compile and test the package. To create a runnable app bundle, follow [Contributing](CONTRIBUTING.md), which covers the development script’s installation and permission-reset behavior. Maintainers can use the [release guide](RELEASE.md) for packaging and distribution.
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
-
-## Credits
-
-Developed by [Goldberg Consulting, LLC d/b/a Measured.One](https://measured.one).
+[MIT](LICENSE). Developed by [Goldberg Consulting, LLC d/b/a Measured.One](https://measured.one).
