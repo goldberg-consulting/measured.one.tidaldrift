@@ -1,223 +1,88 @@
-# Bonjour Discovery Reliability
+# Device discovery
 
-**Updated:** 2026-09-07
-**Scope:** Discovery lifecycle, connection resolution, settings, and historical peer-advertisement fixes.
-**Status:** Targeted reliability fixes implemented. Native discovery migration and two-Mac recovery qualification remain open.
+TidalDrift finds nearby computers through Bonjour and supplements that with local network probes. Open the menu bar panel to see **Nearby Devices**; choose **Discover Devices** to refresh Bonjour and run a subnet scan.
 
-## Current behavior and engineering review
+A device appearing in the list means TidalDrift has discovered it or retained a recent record. It does not guarantee that every connection option is enabled on that computer. The **TD** badge identifies a TidalDrift peer advertisement, including the Linux companion package; it is not an authentication or security indicator.
 
-TCP services use `NWBrowser`. LocalCast UDP browsing and peer registration
-still use `dns-sd` subprocesses. Bonjour advertisements and TXT records are
-discovery hints, not authenticated device identities. Credentials and stream
-authorization must be verified by the connection protocol.
+## Get a device to appear
 
-The September review addressed these failure modes:
+1. Connect both computers to a network that lets them communicate. Guest Wi-Fi, client isolation, separate VLANs, and VPN routing can prevent discovery or connections.
+2. Enable the service on the destination computer: Screen Sharing for VNC, File Sharing for SMB, or Remote Login for SSH. For a Linux target, follow the [Raspberry Pi and Linux guide](RASPBERRY_PI.md).
+3. To discover another TidalDrift Mac as a peer, leave TidalDrift running there and turn on **Peer Discovery** in both menu bar panels. LocalCast also requires **Metal Streaming Host** on the destination Mac.
+4. Choose **Discover Devices** on the connecting Mac, then hover over the destination in **Nearby Devices** to see its connection actions.
 
-- Starting periodic discovery cancelled its network-path monitor and never
-  restored it. Starting browsing now creates a monitor when needed, including
-  after a full stop. An initial offline path followed by connectivity is handled.
-- Deferred restart callbacks could restart obsolete browsers or launch an
-  untracked LocalCast browse after stopping. TCP retries check the exact browser
-  instance, and delayed browse starts check the current lifecycle generation.
-- DNS timeout tasks cancelled a task group whose lookup continuation could
-  never cancel. The group therefore waited for `getaddrinfo` anyway. A
-  cancellation-aware callback result now releases the waiter at its deadline.
-  The operating-system DNS call can finish later on the existing resolver
-  queue; its result is discarded. TCP probes also release their waiters and
-  cancel their connection when the caller cancels.
-- SMB, AFP, and SSH discovery overwrote the device's VNC port. Screen Sharing
-  keeps its own destination port regardless of the arrival order of other
-  services. Invalid ports are rejected before integer conversion or connection
-  creation.
-- `ip=` TXT values were accepted after a loose numeric prefix match. Discovery
-  now validates the complete address and rejects unspecified, loopback, and
-  IPv4 broadcast destinations. This validation does not authenticate a peer.
-- A deferred startup subnet scan could run after discovery stopped, or scan an
-  assumed `192.168.1.*` network while offline. It is now cancelled on stop and
-  requires an actual local IPv4 address. Cancelling a scan preserves devices
-  that have not been probed yet.
-- LocalCast name matching accepted substrings, so a short instance name could
-  mark a different Mac as a host. Only complete normalized names now match;
-  multiple matching devices require address resolution before any update.
-- Pipe reads can split lines and UTF-8 characters. LocalCast browsing now buffers
-  complete lines, discards lines over 16 KiB, and resumes parsing at the next
-  newline. An incomplete line cannot be mistaken for a complete service name.
-- Generic Bonjour services do not repeatedly announce an unchanged service.
-  Cleanup now refreshes non-peer devices still present in live browser results
-  before applying the age threshold.
-- The GitHub release bundle omitted `_tidaldrift-cast._udp` from
-  `NSBonjourServices`. Its generated list now agrees with `Info.plist` and the
-  local build scripts, so release packaging declares the same discovery types.
+TidalDrift can discover standard VNC, SMB, AFP, and SSH services without TidalDrift installed on the destination. Installing TidalDrift adds its peer information and Mac-specific features.
 
-## Settings contract
+## Discovery settings
 
-Bonjour updates continuously. **Device cleanup interval** controls stale-cache
-maintenance, between 15 seconds and 5 minutes. It does not cause repeated
-subnet scans. Changing this setting updates the running timer. SSH discovery
-controls both Bonjour SSH browsing and active SSH probes; disabling it removes
-the SSH capability from cached devices. The inactive automatic-connection
-control has been removed from Settings because no automatic connection policy
-is implemented.
+Open **Settings… → Network**:
 
-Settings files from older versions retain their saved values when newer fields
-are absent. Unknown themes fall back to the system theme. Out-of-range cleanup
-intervals, Wake-on-LAN ports, and retry counts revert to safe defaults. Wrong
-JSON types still reject the file. Resetting the received-files folder clears
-both its path and its security-scoped bookmark.
+- **Enable Peer Discovery** starts or stops the dedicated TidalDrift peer advertisement and discovery service. The menu bar's **Peer Discovery** switch controls the same preference. This switch does not turn off all standard service discovery.
+- **Enable SSH Discovery** controls SSH Bonjour browsing and active probes of TCP port 22. Turning it off removes SSH capabilities from the discovery cache; peer rows may still offer an SSH shortcut.
+- **Device cleanup interval** controls stale-device maintenance, from 15 seconds to 5 minutes. Bonjour updates continuously, so this is not a network scanning frequency.
 
-`DiscoverySettingsTests` covers settings migration, round trips, invalid values,
-folder reset, VNC port preservation, TXT validation, exact name matching, and
-fragmented or oversized helper output.
-`ConnectionResolverTests` uses a deliberately blocked lookup to verify deadline
-and cancellation behavior without depending on live DNS, and checks invalid
-connection inputs and IPv6 VNC URL construction.
+The app runs one subnet scan shortly after launch when a local IPv4 address is available. Further full subnet scans are initiated through **Discover Devices**. The scan probes ports 5900 (VNC), 445 (SMB), 548 (AFP), and, when enabled, 22 (SSH). It also checks addresses from the local ARP table.
 
-## Remaining qualification
+## Diagnose a missing device
 
-Automated tests do not establish real-network discovery performance. Before a
-release, verify two Macs through Wi-Fi to Ethernet changes, DHCP renewal,
-offline launch followed by connectivity, sleep/wake, mDNSResponder restart,
-and stop/start cycles. Check that one browser exists per enabled service and
-that stopped discovery leaves no LocalCast browse child running.
+### Check the destination service
 
-The following limitations remain:
+First try the connection directly from the Mac. Replace `computer.local` with the destination's hostname or IP address:
 
-- The hostname lookup and subnet scan paths still favor IPv4. IPv6 URL support
-  alone does not establish end-to-end IPv6 discovery or link-local scope support.
-- Subnet discovery assumes a `/24` range. It does not yet derive the scan range
-  from the selected interface's netmask, and multi-interface address selection
-  needs dedicated tests.
-- Generic Bonjour fallback resolution still derives some hostnames from service
-  display names and assumes a default port in the subprocess fallback. Native
-  service-endpoint resolution should preserve the actual target host and port.
-- Discovery still has mixed queue ownership. A native migration must include
-  cancellation, interface scope, removal, and identity regression tests.
-
----
-
-## Symptom
-
-Discovery of other Macs over Bonjour was unreliable: sometimes a Mac appeared
-in the Nearby Devices list within a second or two, sometimes it took ~10s, and
-sometimes it did not appear at all until an app restart or network change.
-
-## How advertising works
-
-TidalDrift advertises two Bonjour services by forking `dns-sd` helper
-processes (there is no native `NWListener`/`NetService` advertising; the
-`listener`/`netService` fields in `TidalDriftPeerService` are vestigial):
-
-| Service | Type | Port | Owner |
-|---|---|---|---|
-| Peer beacon | `_tidaldrift._tcp` | 5959 | `TidalDriftPeerService.launchAdvertiseProcess` |
-| LocalCast host | `_tidaldrift-cast._udp` | 5904 | `LocalCastService.advertiseLocalCast` |
-
-A `dns-sd -R` registration lives only as long as its helper process *and*
-mDNSResponder's acceptance of it. The TXT record carries `ip=<localIP>`, which
-the discovery side uses as a fast path (resolve the IP directly from the TXT
-instead of the slower `dns-sd -L` -> `dns-sd -G` hostname chain).
-
-## Root causes
-
-1. **Registration success was never verified.** The helper's stdout went to
-   `/dev/null` and the 10s watchdog only checked `process.isRunning`. A helper
-   that was alive but had **failed to register** with mDNSResponder (busy at
-   launch, a transient error, or a name-collision rename) looked healthy
-   forever and was never restarted, so the Mac stayed silently un-advertised.
-
-2. **Stale/empty `ip=` in the TXT.** `ip=` was captured once at launch as
-   `getLocalIPAddress() ?? localInfo.ipAddress`. Advertising starts ~0.3s after
-   launch; if the network was not up yet, `ip=` fell back to a value captured at
-   init (possibly `Unknown`). The discovery fast path then keyed on a bad IP,
-   forcing the slow hostname-lookup fallback or failing outright, and it was
-   never refreshed except on a network-path change.
-
-3. **The first network-up event was swallowed.** `setupNetworkMonitor` ignores
-   the first `.satisfied` path event, so the common "launched just before
-   Wi-Fi came up" case never re-advertised with the now-valid IP, locking in
-   the bad `ip=` from cause 2.
-
-4. **0-10s invisibility windows + App Nap.** If the helper did die (sleep/wake,
-   mDNSResponder restart), the Mac was invisible until the next 10s watchdog
-   tick, and App Nap could throttle that watchdog/helper while the menu-bar
-   app was backgrounded.
-
-## Fix (Option A, shipped v1.6.7)
-
-Hardened the peer-beacon advertiser in `TidalDriftPeerService` without changing
-the architecture:
-
-- **Confirm registration.** Parse the helper's stdout for `"registered and
-  active"`; track it in `advertiseRegistered`.
-- **Smarter watchdog (4s).** Restart the advertisement when the helper dies,
-  when registration stays unconfirmed past a grace window, or when the local IP
-  changes (which re-bakes a fresh `ip=` into the TXT). This also covers the
-  swallowed-first-path-event case, since the IP-change check fires regardless of
-  the path monitor.
-- **Re-advertise on wake.** Observe `NSWorkspace.didWakeNotification` and
-  relaunch the advertisement.
-- **Suppress App Nap.** Hold a `ProcessInfo.beginActivity`
-  (`.userInitiatedAllowingIdleSystemSleep`) while advertising so the watchdog
-  and helper stay responsive in the background; idle system sleep is still
-  allowed.
-
-Net effect: the TXT reliably carries a current IP, so the discovery fast path
-hits consistently, and a failed/dropped registration self-heals within a few
-seconds instead of persisting until a restart.
-
-## Verification
-
-The original v1.6.7 notes recorded a successful two-Mac check. Those historical
-observations are not a performance or recovery qualification of the September
-changes. Host-side log signal:
-
+```bash
+open 'vnc://computer.local:5900'
+ssh username@computer.local
 ```
+
+If the direct connection fails, check the destination's service, account permissions, firewall, and address before changing discovery settings. A Bonjour advertisement can exist even when its corresponding server is stopped; the Linux package's static advertisements are one example.
+
+### Check Bonjour from Terminal
+
+Run the command for the missing service on the Mac:
+
+```bash
+dns-sd -B _rfb._tcp local.
+```
+
+Substitute `_ssh._tcp`, `_smb._tcp`, `_tidaldrift._tcp`, `_tidaldrop._tcp`, or `_tidaldrift-cast._udp` as needed. Browsing continues until you press **Control-C**. An `Add` line means the advertisement reached this Mac.
+
+Resolve an instance using the exact name printed in the browse output:
+
+```bash
+dns-sd -L 'Service Instance Name' _rfb._tcp local.
+```
+
+Check the target hostname and advertised port. If Bonjour sees the expected service but TidalDrift does not, choose **Discover Devices** and check the app log. If neither sees it, check the destination advertisement and network's multicast handling. If macOS offers a Local Network permission for TidalDrift, allow it.
+
+### Capture an app log
+
+Run this on the affected Mac, reproduce the problem, then press **Control-C**:
+
+```bash
 log stream --predicate 'subsystem == "com.tidaldrift"' --level info
 ```
 
-Expect `dns-sd advertising ... ip=...` on start and, on changes,
-`Local IP changed ... re-advertising` / `Woke from sleep — re-advertising`.
-Repeated `registration unconfirmed` lines would indicate a deeper mDNS issue.
+Useful context for a report includes the service type, whether direct connection works, whether `dns-sd` sees it, Wi-Fi or Ethernet use, and whether the issue followed sleep, a network change, or an address change. Logs can contain device names and addresses; remove anything you do not want to share.
 
-## Follow-on fixes
+## How discovery is implemented
 
-### Peers aged out after ~1-2 min (v1.6.8)
+The current implementation combines native APIs and `dns-sd` helpers:
 
-`dns-sd -B` emits an Add for a service only once, and mDNS does not re-announce
-existing services often. The earlier CPU pass had replaced the periodic
-`refreshScan()` (which used to restart browsers and re-emit Adds) with
-prune-only maintenance, so discovered peers were never re-confirmed: their
-`lastSeen` aged past the 2-minute peer prune and the device dropped its
-TidalDrift-peer status (red outline). Fix: `TidalDriftPeerService` re-resolves
-known peers every 45s (`reconfirmTimer`); present peers stay fresh, departed
-peers fail to resolve and age out. Peer prune threshold raised to 3 minutes as
-a backstop alongside the Bonjour Remove event.
+- **Standard TCP services:** `NetworkDiscoveryService` uses `NWBrowser` for `_rfb._tcp`, `_smb._tcp`, `_afpovertcp._tcp`, `_ssh._tcp`, `_tidaldrift._tcp`, and `_tidaldrop._tcp`, with fallback resolution where needed.
+- **TidalDrift peers:** `TidalDriftPeerService` advertises `_tidaldrift._tcp` on port 5959 using `dns-sd -R`. It browses through both a `dns-sd` helper and a native `NetServiceBrowser`. The beacon carries identity and hardware metadata; its advertised port is not a remote-control endpoint.
+- **LocalCast hosts:** `_tidaldrift-cast._udp` advertises UDP port 5904. LocalCast advertising and browsing use `dns-sd` helpers. This advertisement exists while the Mac is hosting.
+- **TidalDrop:** its `NWListener` advertises `_tidaldrop._tcp` on TCP port 5902. This is a separate service from the peer beacon.
 
-### 100% CPU spin on dns-sd helper EOF (v1.6.9)
+The peer advertiser checks registration, helper health, and address changes every four seconds, and re-advertises on wake. It re-resolves known peers every 45 seconds and prunes peer records after five minutes without confirmation. The LocalCast host checks its listener and advertisement every five seconds and can restart them after failure or an address change. Unlike the peer advertiser, it does not parse registration confirmation from helper output.
 
-A `sample` of a 99%-CPU TidalDrift pinned it to the
-`com.apple.NSFileHandle.fd_monitoring` queue inside the LocalCast browse
-readability handler. When a `dns-sd` helper process exits, its pipe hits EOF and
-`FileHandle.availableData` returns empty, but the `readabilityHandler` stays
-installed and is re-invoked immediately, forever, spinning a core. The LocalCast
-browse (`startNetServiceBrowserForLocalCast`) had no watchdog, so it spun
-indefinitely. Fix: every dns-sd readability handler now treats empty data as
-EOF, removes itself, and the LocalCast browse relaunches after a short backoff.
-This is a structural argument for Option C: the entire bug class only exists
-because discovery is driven through subprocess pipes and readability handlers.
+Bonjour names and TXT records are unauthenticated discovery hints. A stable `peerId` helps associate device records and saved credentials across address changes; it does not prove that the remote computer is trusted. Connection services must enforce their own access controls.
 
-## Not yet done / follow-up (Option C)
+## Limits and development checks
 
-- The **LocalCast cast advertiser** (`LocalCastService.advertiseLocalCast`) has
-  the same `dns-sd -R` pattern and stale-`ip=`/unverified-registration risk. It
-  was intentionally left for the native migration rather than duplicating the
-  watchdog.
-- **Option C:** migrate advertising and discovery to native
-  `NWListener` + `NWBrowser` (with `NWTXTRecord`), retiring the `dns-sd`
-  subprocesses entirely. Benefits: framework-managed registration/lifecycle
-  (no stdout parsing or watchdogs), structured results (no `-B`/`-L`/`-G` chain
-  or text parsing), lower footprint (no helper processes/pipes), and App
-  Sandbox / Mac App Store compatibility (a sandboxed app cannot fork
-  `dns-sd`). Option A was the low-risk stabilization step that de-risks this
-  rewrite; behavior parity (every current capability preserved) is the success
-  criterion.
+Subnet scanning currently assumes a `/24` IPv4 range rather than deriving a range from the interface's netmask. Hostname resolution and several fallback paths also favor IPv4. Do not treat IPv6 URL handling as complete IPv6 or link-local discovery support. Bonjour discovery normally stays within the local multicast domain unless the network explicitly forwards it.
+
+Browser restarts preserve relevant cached state and reject obsolete delayed callbacks. Discovery helper parsing buffers complete lines, handles EOF, and limits line size. Resolution and connection probes have deadlines and cancellation handling; discovering SMB or SSH preserves the device's VNC port.
+
+When modifying this area, run the discovery and resolver tests, then verify two computers through offline launch, Wi-Fi/Ethernet changes, DHCP renewal, sleep/wake, and repeated stop/start. Unit tests alone do not establish real-network recovery time. Watch for duplicate browsers, stale addresses, or helper processes remaining after discovery stops.
+
+Source references: [network discovery](../TidalDrift/Services/NetworkDiscoveryService.swift), [peer discovery](../TidalDrift/Services/TidalDriftPeerService.swift), [LocalCast service](../TidalDrift/LocalCast/Core/LocalCastService.swift), [discovery tests](../TidalDrift/Tests/TidalDriftTests/DiscoverySettingsTests.swift), and [resolver tests](../TidalDrift/Tests/TidalDriftTests/ConnectionResolverTests.swift).
