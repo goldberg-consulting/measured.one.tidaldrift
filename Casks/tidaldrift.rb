@@ -25,9 +25,10 @@ cask "tidaldrift" do
   # Accessibility, and Input Monitoring grants across upgrades. Resetting on
   # every upgrade wiped those permissions and silently broke hosting/control
   # (e.g. LocalCast capture and remote input) until the user re-granted them.
-  postflight do
-    system_command "/usr/bin/xattr",
-                   args: ["-dr", "com.apple.quarantine", "#{appdir}/TidalDrift.app"]
+  postflight_steps do
+    run "/usr/bin/xattr",
+        args:           ["-dr", "com.apple.quarantine", "{{appdir}}/TidalDrift.app"],
+        writable_paths: ["{{appdir}}/TidalDrift.app"]
   end
 
   uninstall quit: "com.goldbergconsulting.tidaldrift"
