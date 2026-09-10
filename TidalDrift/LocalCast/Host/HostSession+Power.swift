@@ -31,6 +31,8 @@ extension HostSession {
         )
         if result == kIOReturnSuccess {
             networkClientAssertion = id
+        } else {
+            logger.warning("🔋 Failed to hold network-client activity: \(result)")
         }
         logger.info("🔋 Sleep prevention ON (viewer connected, capture active)")
     }
@@ -38,9 +40,10 @@ extension HostSession {
     func endStreamActivity() {
         streamActivityLock.lock()
         defer { streamActivityLock.unlock() }
-        guard let activity = streamActivity else { return }
-        ProcessInfo.processInfo.endActivity(activity)
-        streamActivity = nil
+        if let activity = streamActivity {
+            ProcessInfo.processInfo.endActivity(activity)
+            streamActivity = nil
+        }
         if networkClientAssertion != 0 {
             IOPMAssertionRelease(networkClientAssertion)
             networkClientAssertion = 0
@@ -48,24 +51,35 @@ extension HostSession {
         logger.info("🔋 Sleep prevention OFF")
     }
 
-    /// Declare remote user activity, promoting the system to full wake.
+    /// Declare remote user activity to request framebuffer and GPU availability.
+    /// macOS may keep the physical display asleep or decline a wake request.
     /// Rate-limited internally; safe to call on every inbound client packet.
-    func declareRemoteUserActivity() {
+    func declareRemoteUserActivity(
+        now: Date = Date(),
+        declaration: (inout IOPMAssertionID) -> IOReturn = { assertionID in
+            IOPMAssertionDeclareUserActivity(
+                "TidalDrift LocalCast viewer session" as CFString,
+                kIOPMUserActiveRemote,
+                &assertionID
+            )
+        }
+    ) {
         userActivityLock.lock()
         defer { userActivityLock.unlock() }
-        let now = Date()
         guard now.timeIntervalSince(lastUserActivityDeclaration) >= Self.userActivityMinInterval else { return }
-        lastUserActivityDeclaration = now
+        // Failed requests retry promptly, without doing power-management IPC
+        // for every mouse-movement packet when the system keeps rejecting them.
+        guard now.timeIntervalSince(lastUserActivityAttempt) >= Self.userActivityRetryInterval else { return }
+        lastUserActivityAttempt = now
 
         var id = userActivityAssertionID
-        let result = IOPMAssertionDeclareUserActivity(
-            "TidalDrift LocalCast viewer session" as CFString,
-            kIOPMUserActiveRemote,
-            &id
-        )
+        let result = declaration(&id)
         if result == kIOReturnSuccess {
             userActivityAssertionID = id
-            logger.info("⏰ Declared remote user activity (full-wake promotion)")
+            // An early wake can reject this call while power services recover.
+            // Retry after a second instead of silencing attempts for 30 s.
+            lastUserActivityDeclaration = now
+            logger.info("⏰ Declared remote user activity (graphics access requested)")
         } else {
             logger.warning("⏰ IOPMAssertionDeclareUserActivity failed: \(result)")
         }
@@ -79,5 +93,6 @@ extension HostSession {
             userActivityAssertionID = 0
         }
         lastUserActivityDeclaration = .distantPast
+        lastUserActivityAttempt = .distantPast
     }
 }

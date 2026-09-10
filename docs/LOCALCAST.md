@@ -149,6 +149,8 @@ Before shipping streaming changes, test on **two Macs running the same revision*
 4. **Check clipboard:** use the [clipboard verification cases](CLIPBOARD_SYNC.md#developer-verification), including newer copies during transfers and sync disabled mid-transfer.
 5. **Measure performance:** test small text, gradients, photos, and motion over a sustained session. Measure actual displayed frame intervals, input-to-photon latency, wire bitrate, memory, and thermal load. For comparisons with macOS Screen Sharing, match resolution/frame rate, warm up, repeat runs, and report raw results plus median, p95, worst case, and failures.
 
+For the closed-lid wake regression, connect the host to AC power and enable network wake. Disconnect macOS Screen Sharing completely, leave LocalCast hosting, close the lid, and let the host sleep. Start Cast while its Bonjour entry still looks online, then repeat after it looks offline. Verify authentication, first video, keyboard/mouse control, and continued streaming for at least three minutes. Repeat with a stored MAC address and with only the sleep-proxy wake path available. Also close the lid during an active cast, then disconnect the viewer and confirm LocalCast releases its session power assertions and virtual display. Capture `pmset -g log` and the TidalDrift log timestamps to distinguish network DarkWake, full wake, listener recovery, and first video; the system’s full-wake notification alone does not identify every network wake ([Apple DTS explanation](https://developer.apple.com/forums/thread/770517)).
+
 Unit tests and the synthetic benchmark complement these checks; they do not replace two-Mac validation or certify a particular resolution/frame-rate target.
 
 [Documentation index](README.md)

@@ -136,21 +136,13 @@ class WakeOnLANService {
     func prepareForConnection(to device: DiscoveredDevice, service: DiscoveredDevice.ServiceType, timeout: TimeInterval = 30) async {
         guard shouldAutoWakeBeforeConnect else { return }
 
-        // `isOnline` is lastSeen age, and a sleeping Mac's Bonjour records are
-        // kept alive by the network's sleep proxy, so sleeping hosts routinely
-        // look online here. Always knock the screen-sharing port first: on an
-        // awake host the TCP connect resolves in milliseconds and costs
-        // nothing; on a sleeping host the knock is exactly what prompts the
-        // sleep proxy to wake it (Apple Screen Sharing wakes Macs this way).
-        // The knock is fire-and-forget: sending the SYN is what wakes the host,
-        // so nothing is gained by holding the connect flow until the socket
-        // resolves. Awaiting it here cost up to 1.5s on every connect to a
-        // host that merely looked online. Only the slow wake-and-poll path
-        // stays gated on looking offline.
+        // Bonjour freshness does not prove that the host is awake: a sleep
+        // proxy can keep its records visible. Send both the TCP wake request
+        // and stored-MAC magic packets even when discovery reports it online.
+        // Keep the fast path nonblocking; the requested service handles its
+        // connection retries while the host wakes.
         if device.isOnline {
-            Task.detached { [weak self] in
-                await self?.triggerWakeOnDemand(to: device, timeout: 1.5)
-            }
+            knock(device: device)
             return
         }
 
@@ -559,4 +551,3 @@ extension DiscoveredDevice {
         storedMACAddress != nil
     }
 }
-

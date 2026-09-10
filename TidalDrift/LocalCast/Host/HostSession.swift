@@ -292,24 +292,22 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     /// AC power) while serving network clients. Guarded by streamActivityLock.
     var networkClientAssertion: IOPMAssertionID = 0
 
-    // MARK: - Remote user activity (full-wake promotion)
+    // MARK: - Remote user activity (graphics access)
     //
     // A sleeping host woken by the client's TCP-5900 knock comes up in
     // DarkWake: the network stack and this process run, but there is no
-    // display and the system schedules itself back to sleep within seconds
-    // ("Notification Wake Back to Sleep" in pmset -g log). The idle-sleep
-    // assertions above cannot stop that re-sleep; only a user-activity
-    // declaration can. Declaring kIOPMUserActiveRemote promotes DarkWake to
-    // full wake and resets the idle timers as if a user were present over
-    // the network, which is exactly what screensharingd does when a VNC
-    // client connects (pmset log: "DarkWake to FullWake ... due to
-    // UserActivity Assertion"). Without this, a lid-closed host answered a
-    // couple of heartbeats and then vanished mid-handshake.
+    // display and the system may schedule itself back to sleep within seconds.
+    // NetworkClientActive requests CPU/network availability; Apple's API
+    // directs clients needing the framebuffer/GPU to declare remote user
+    // activity as well. This is a request, not a guarantee of full wake:
+    // clamshell and system power policy can still keep the display asleep.
     // Implementations live in HostSession+Power.swift.
     var userActivityAssertionID: IOPMAssertionID = 0
     var lastUserActivityDeclaration = Date.distantPast
+    var lastUserActivityAttempt = Date.distantPast
     let userActivityLock = NSLock()
     static let userActivityMinInterval: TimeInterval = 30
+    static let userActivityRetryInterval: TimeInterval = 1
 
     // MARK: - Display reconfiguration
     //
@@ -927,18 +925,17 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
 
     /// Stop ScreenCaptureKit when the viewer goes idle but keep UDP listening.
     private func suspendCaptureForIdleClient() {
-        let wasActive = withCaptureState { () -> Bool in
-            guard captureActive else { return false }
-            captureActive = false
-            return true
-        }
-        guard wasActive else { return }
+        withCaptureState { captureActive = false }
+        // Capture failures clear captureActive before the viewer leaves, but
+        // can leave power assertions or a partially prepared display behind.
+        // Those resources belong to the viewer and must always be released.
         endStreamActivity()
+        releaseUserActivityAssertion()
         stopWindowTracking()
 
         Task {
             await captureTransitions.run { [weak self] in
-                guard let self else { return }
+                guard let self, !self.hasActiveClient else { return }
                 await self.captureManager.stopCapture()
                 // A headless-session virtual display has no viewer left;
                 // release it so the machine can sleep normally. The next
@@ -1709,8 +1706,9 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         // Any legitimate client packet counts as remote user presence. This
         // must happen before the auth gate: on a lid-closed, network-woken
         // host the very first packets (authRequest, pre-auth heartbeats)
-        // arrive during DarkWake, and without the promotion the system goes
-        // back to sleep before the handshake can finish. Rate-limited inside.
+        // can arrive during DarkWake. Request graphics availability as early
+        // as possible; system power policy still decides whether to grant it.
+        // Rate-limited inside.
         declareRemoteUserActivity()
 
         // Update client endpoint if not already set

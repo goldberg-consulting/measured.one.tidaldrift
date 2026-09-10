@@ -31,7 +31,7 @@ extension ClientSessionDelegate {
         case streaming = "Streaming"
         case reconnecting = "Reconnecting..."
         case noRoute = "Cannot reach host — check that both Macs are on the same network"
-        case firewallBlocked = "No response from host — check Firewall settings on the host Mac (System Settings → Network → Firewall)"
+        case firewallBlocked = "No response from host. Check that the Mac is awake, LocalCast is running, and its firewall allows connections."
         case videoTimeout = "Connected but no video — host may not have Screen Recording permission"
         case disconnected = "Disconnected"
         case authFailed = "Authentication failed — wrong password"
@@ -321,6 +321,30 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
     /// that window as "check Firewall settings".
     private static let wakeGraceDuration: TimeInterval = 25
 
+    /// Keep connection retries alive for the entire attempt, independently of
+    /// the point at which the status starts suggesting troubleshooting.
+    enum DiagnosticAction: Equatable {
+        case stop
+        case wait
+        case retryConnection(ConnectionPhase)
+        case requestVideo
+    }
+
+    static func diagnosticAction(
+        elapsed: TimeInterval,
+        isConnected: Bool,
+        hasHeartbeat: Bool,
+        hasAuthError: Bool
+    ) -> DiagnosticAction {
+        guard !isConnected, elapsed < maxDiagnosticDuration else { return .stop }
+        guard !hasAuthError else { return .stop }
+        if hasHeartbeat {
+            return elapsed > 10 ? .requestVideo : .wait
+        }
+        guard elapsed > 4 else { return .wait }
+        return .retryConnection(elapsed > wakeGraceDuration ? .firewallBlocked : .waking)
+    }
+
     @MainActor
     private func startDiagnosticTimer() {
         diagnosticTimer?.invalidate()
@@ -329,42 +353,31 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             guard let startTime = self.connectionStartTime else { return }
             let elapsed = Date().timeIntervalSince(startTime)
 
-            if self.isConnected || elapsed > Self.maxDiagnosticDuration {
+            switch Self.diagnosticAction(
+                elapsed: elapsed,
+                isConnected: self.isConnected,
+                hasHeartbeat: self.heartbeatsReceived > 0,
+                hasAuthError: self.authError != nil
+            ) {
+            case .stop:
                 self.diagnosticTimer?.invalidate()
                 self.diagnosticTimer = nil
-                return
-            }
-
-            if self.heartbeatsReceived == 0 {
-                // A definitive auth failure owns the status surface; do not
-                // overwrite it with waking/firewall guesses.
-                if self.authError != nil { return }
-                if elapsed > Self.wakeGraceDuration {
-                    self.connectionPhase = .firewallBlocked
-                    self.connectionStatus = ConnectionPhase.firewallBlocked.rawValue
-                    self.logger.warning("⚠️ No heartbeat responses after \(Int(elapsed))s — likely firewall issue on host")
-                } else if elapsed > 4.0 {
-                    self.connectionPhase = .waking
-                    self.connectionStatus = ConnectionPhase.waking.rawValue
-                    self.logger.info("⏰ No heartbeat responses after \(Int(elapsed))s — re-knocking to wake the host")
-                    // Keep prodding the sleep proxy: the first pre-connect knock
-                    // can be dropped, and heartbeats to our UDP port never
-                    // trigger a wake on their own (only TCP to a registered
-                    // service port does).
-                    WakeOnLANService.shared.knock(device: self.device)
-                    // An auth-enabled connect sends its authRequests in the
-                    // first two seconds; against a still-waking host every one
-                    // of them is lost before the listener exists. Re-drive the
-                    // handshake so the host hears it once it is up.
-                    self.retryAuthHandshakeIfStalled()
-                }
-            } else {
-                if elapsed > 10.0 {
-                    self.connectionPhase = .videoTimeout
-                    self.connectionStatus = ConnectionPhase.videoTimeout.rawValue
-                    self.logger.warning("⚠️ Heartbeats OK but no video after \(Int(elapsed))s")
-                    self.requestKeyFrame()
-                }
+            case .wait:
+                break
+            case .retryConnection(let phase):
+                self.connectionPhase = phase
+                self.connectionStatus = phase.rawValue
+                self.logger.info("No heartbeat responses after \(Int(elapsed))s; retrying wake and authentication")
+                // A sleeping host can outlast the status grace period. Keep
+                // sending wake requests and the same auth nonce until the
+                // full connection deadline so its resumed listener can reply.
+                WakeOnLANService.shared.knock(device: self.device)
+                self.retryAuthHandshakeIfStalled()
+            case .requestVideo:
+                self.connectionPhase = .videoTimeout
+                self.connectionStatus = ConnectionPhase.videoTimeout.rawValue
+                self.logger.warning("Heartbeats OK but no video after \(Int(elapsed))s")
+                self.requestKeyFrame()
             }
         }
     }

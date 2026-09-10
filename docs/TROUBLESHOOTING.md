@@ -85,6 +85,14 @@ Check **Settings → Network → Enable Wake-on-LAN** and the target’s Wake fo
 
 Wake-on-LAN depends on the target’s hardware, power state, and network. A successful wake-packet send does not guarantee that the computer has woken or that its services are ready.
 
+### LocalCast works with the lid closed only while Screen Sharing is connected
+
+A network wake can leave the Mac in **DarkWake**, where network services can run before a usable desktop is available. LocalCast must recover its listener, request remote user activity, and obtain a capturable display. An active macOS Screen Sharing session can mask a failure in that recovery path.
+
+Keep the host connected to power for this test, enable **Wake for network access**, and enable **Wake-on-LAN** and **Auto-wake before connecting** in TidalDrift on the viewer. [Apple’s sleep and wake settings guide](https://support.apple.com/guide/mac-help/mchle41a6ccd/mac) explains the host setting. Leave TidalDrift hosting before closing the lid. Give the connection up to a minute to recover; a device listed as online may still be asleep.
+
+If the viewer reports no response, record whether the host woke and whether the same connection works with the lid open. If it connects but shows no video, record that separately: the network is responding, but capture or display recovery may have failed. LocalCast attempts a virtual display when no usable display is available; closed-lid operation still needs validation on the particular Mac and macOS version. Keeping Screen Sharing connected is a temporary workaround while diagnosing this case.
+
 ## Report a reproducible problem
 
 Open an [issue](https://github.com/goldberg-consulting/measured.one.tidaldrift/issues) with:
