@@ -11,10 +11,34 @@ final class NetworkHandoffTests: XCTestCase {
         return device
     }
 
-    func test_cachedAdaptersRace_withoutWaitingForDeadWiFiOrDNS() async throws {
+    func test_currentAddressConnectsWithoutWaitingForDNS() async throws {
         let resolver = ConnectionResolver(addressLookup: { _, _ in
             Thread.sleep(forTimeInterval: 1)
             return []
+        }, probe: { address, _, _ in
+            XCTAssertEqual(address, "192.0.2.1", "Historical adapters must not be probed as the selected device")
+            return true
+        })
+        let start = Date()
+        let result = try await resolver.resolve(device: device(), strategy: .ipFirst, timeout: 3)
+        XCTAssertEqual(result.address, "192.0.2.1")
+        XCTAssertLessThan(Date().timeIntervalSince(start), 0.5)
+    }
+
+    func test_fasterReassignedHistoricalAddressCannotWinConnectionRace() async throws {
+        let resolver = ConnectionResolver(addressLookup: { _, _ in [] }, probe: { address, _, _ in
+            // A new computer on the former adapter address responds first.
+            if address == "192.0.2.2" { return true }
+            try? await Task.sleep(for: .milliseconds(30))
+            return address == "192.0.2.1"
+        })
+        let result = try await resolver.resolve(device: device(), strategy: .ipFirst, timeout: 1)
+        XCTAssertEqual(result.address, "192.0.2.1")
+    }
+
+    func test_freshlyResolvedSecondaryAdapterCanWinOverDeadCurrentAddress() async throws {
+        let resolver = ConnectionResolver(addressLookup: { hostname, port in
+            [.init(address: "192.0.2.2", port: port, method: .mDNSHostname, hostname: hostname)]
         }, probe: { address, _, _ in
             if address == "192.0.2.2" { return true }
             do { try await Task.sleep(for: .seconds(2)) } catch { return false }
@@ -23,7 +47,21 @@ final class NetworkHandoffTests: XCTestCase {
         let start = Date()
         let result = try await resolver.resolve(device: device(), strategy: .ipFirst, timeout: 3)
         XCTAssertEqual(result.address, "192.0.2.2")
+        XCTAssertEqual(result.method, .mDNSHostname)
         XCTAssertLessThan(Date().timeIntervalSince(start), 0.5)
+    }
+
+    func test_noDNSDoesNotFallBackToReachableHistoricalAdapter() async {
+        let resolver = ConnectionResolver(addressLookup: { _, _ in [] }, probe: { address, _, _ in
+            XCTAssertEqual(address, "192.0.2.1")
+            return address == "192.0.2.2"
+        })
+        for strategy in [ConnectionResolver.ResolutionStrategy.ipFirst, .ipOnly] {
+            do {
+                _ = try await resolver.resolve(device: device(), strategy: strategy, timeout: 0.1)
+                XCTFail("An old adapter may now belong to a different computer")
+            } catch {}
+        }
     }
 
     func test_dnsChecksAllAddresses_andDoesNotAcceptDeadFirstResult() async throws {
@@ -80,7 +118,28 @@ final class NetworkHandoffTests: XCTestCase {
             return false
         })
         let addresses = await resolver.connectionCandidates(for: device())
-        XCTAssertEqual(addresses, ["192.0.2.1", "192.0.2.2", "192.0.2.3"])
+        XCTAssertEqual(addresses, ["192.0.2.1", "192.0.2.3"])
+    }
+
+    func test_udpHistoricalAdapterIsIncludedOnlyWhenFreshlyResolved() async {
+        let resolver = ConnectionResolver(addressLookup: { host, port in
+            ["192.0.2.1", "192.0.2.2", "192.0.2.2"].map {
+                .init(address: $0, port: port, method: .mDNSHostname, hostname: host)
+            }
+        })
+        let addresses = await resolver.connectionCandidates(for: device())
+        XCTAssertEqual(addresses, ["192.0.2.1", "192.0.2.2"])
+    }
+
+    func test_udpBlockedDNSFallsBackToCurrentAddressWithinDeadline() async {
+        let resolver = ConnectionResolver(addressLookup: { _, _ in
+            Thread.sleep(forTimeInterval: 1)
+            return []
+        })
+        let start = Date()
+        let addresses = await resolver.connectionCandidates(for: device(), timeout: 0.03)
+        XCTAssertEqual(addresses, ["192.0.2.1"])
+        XCTAssertLessThan(Date().timeIntervalSince(start), 0.5)
     }
 
     func test_savedDevicesFromPreviousVersionDecode_andIdentitySurvivesHandoff() throws {

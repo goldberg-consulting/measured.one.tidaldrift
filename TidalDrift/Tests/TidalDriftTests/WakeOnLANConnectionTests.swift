@@ -21,7 +21,9 @@ final class WakeOnLANConnectionTests: XCTestCase {
     }
 
     func test_screenSharingReadinessUsesWorkingAdapterAndCustomVNCPort() async {
-        let resolver = ConnectionResolver(addressLookup: { _, _ in [] }, probe: { address, port, _ in
+        let resolver = ConnectionResolver(addressLookup: { hostname, port in
+            [.init(address: "192.0.2.2", port: port, method: .mDNSHostname, hostname: hostname)]
+        }, probe: { address, port, _ in
             XCTAssertEqual(port, 5999)
             return address == "192.0.2.2"
         })
@@ -69,7 +71,9 @@ final class WakeOnLANConnectionTests: XCTestCase {
     }
 
     func test_manualWakeCanUseOptionalVNCResponseForLocalCastOnlyDiscovery() async {
-        let resolver = ConnectionResolver(addressLookup: { _, _ in [] }, probe: { address, port, _ in
+        let resolver = ConnectionResolver(addressLookup: { hostname, port in
+            [.init(address: "192.0.2.2", port: port, method: .mDNSHostname, hostname: hostname)]
+        }, probe: { address, port, _ in
             XCTAssertEqual(port, 5900)
             return address == "192.0.2.2"
         })

@@ -33,7 +33,7 @@ Both Macs need a reachable network path and compatible TidalDrift builds. A host
 
 Enable TidalDrift's **Wake-on-LAN** and **Auto-wake before connecting** settings, and enable network wake on the host. A saved MAC address allows magic-packet wake requests. Bonjour sleep-proxy wake can work without a saved MAC address when the network and host support it.
 
-The device's online badge can remain visible while a sleep proxy answers discovery requests. TidalDrift checks the requested service and retries wake requests within a bounded connection attempt. It considers the known adapter addresses and hostname, so a stale Wi-Fi address need not block a reachable Ethernet connection.
+The device's online badge can remain visible while a sleep proxy answers discovery requests. TidalDrift checks the requested service and retries wake requests within a bounded connection attempt. Wake requests consider remembered adapter addresses and the hostname. Connections use the current address and freshly resolved hostname addresses; a historical address alone is insufficient because DHCP may have reassigned it to another computer.
 
 **Screen Share** waits for its Screen Sharing service to respond. **Start Cast** starts LocalCast's UDP handshake immediately and uses that response to establish readiness; macOS Screen Sharing on TCP 5900 is not a prerequisite. Screen Sharing connection attempts and magic packets are additional wake mechanisms, not proof that LocalCast is ready. A host that does not resume or start its requested service can still time out.
 

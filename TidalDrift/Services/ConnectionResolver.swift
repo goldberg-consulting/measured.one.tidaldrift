@@ -15,7 +15,7 @@ actor ConnectionResolver {
         case hostnameFirst    // Prefer .local hostname (most reliable)
         case ipFirst          // Try cached IP first (faster if valid)
         case hostnameOnly     // Only use hostname resolution
-        case ipOnly           // Only use cached adapter addresses
+        case ipOnly           // Only use the device's current cached address
     }
     
     /// Result of address resolution
@@ -155,7 +155,8 @@ actor ConnectionResolver {
     }
     
     /// UDP callers must verify the application response, not TCP readiness.
-    /// Supply all candidates with a bounded DNS wait for their handshake retries.
+    /// Use the current address plus fresh DNS, with a bounded lookup wait.
+    /// Historical adapters may have been reassigned to a different computer.
     func connectionCandidates(for device: DiscoveredDevice, timeout: TimeInterval = 0.5) async -> [String] {
         guard timeout.isFinite, timeout > 0, !Task.isCancelled else { return [] }
         let hostname = cleanHostname(device.hostname)
@@ -175,8 +176,8 @@ actor ConnectionResolver {
         guard !Task.isCancelled else { return [] }
         let local = Set(NetworkUtils.localNetworkAddresses().map(\.address))
         var seen = Set<String>()
-        return (device.connectionAddresses + fresh.map(\.address)).filter {
-            !local.contains($0) && seen.insert($0).inserted
+        return ([device.ipAddress] + fresh.map(\.address)).filter {
+            NetworkUtils.isValidIPAddress($0) && !local.contains($0) && seen.insert($0).inserted
         }
     }
 
@@ -254,15 +255,16 @@ actor ConnectionResolver {
         return await resolveHostnameToIP(localHostname, port: device.port, timeout: timeout)
     }
     
-    /// Race cached adapter addresses after verifying service connectivity.
+    /// Only the current cached address may be used without a fresh lookup.
+    /// A remembered adapter answering TCP proves service availability, not that
+    /// it still belongs to this device; forwarding saved credentials is unsafe.
     private func tryCachedIP(device: DiscoveredDevice, timeout: TimeInterval) async -> ResolvedAddress? {
-        let addresses = device.connectionAddresses.map {
-            ResolvedAddress(address: $0, port: device.port, method: .cachedIP, hostname: device.hostname)
-        }
-        return await firstReachable(addresses, timeout: timeout)
+        guard NetworkUtils.isValidIPAddress(device.ipAddress) else { return nil }
+        let address = ResolvedAddress(address: device.ipAddress, port: device.port, method: .cachedIP, hostname: device.hostname)
+        return await firstReachable([address], timeout: timeout)
     }
 
-    /// Race all adapters. A stale Wi-Fi address cannot hold up Ethernet.
+    /// Race freshly resolved adapters, or the single current cached address.
     private func firstReachable(_ addresses: [ResolvedAddress], timeout: TimeInterval) async -> ResolvedAddress? {
         let localIPs = Set(NetworkUtils.localNetworkAddresses().map(\.address))
         return await withTaskGroup(of: ResolvedAddress?.self) { group in
