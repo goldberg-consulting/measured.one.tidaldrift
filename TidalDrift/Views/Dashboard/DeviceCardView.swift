@@ -7,6 +7,7 @@ struct DeviceCardView: View {
     
     @State private var isPressed = false
     @State private var isTargetedForDrop = false
+    @State private var showNetworkAddresses = false
     @State private var showPINEntry = false
     @State private var showLocalCastError = false
     
@@ -14,7 +15,7 @@ struct DeviceCardView: View {
     
     /// Active transfer to/from this device
     private var activeTransfer: TidalDropService.DropTransfer? {
-        dropService.activeTransfers.values.first { $0.remoteEndpoint == device.ipAddress }
+        dropService.activeTransfers.values.first { device.connectionAddresses.contains($0.remoteEndpoint) }
     }
     
     var body: some View {
@@ -23,6 +24,7 @@ struct DeviceCardView: View {
             deviceInfoSection
             serviceBadgeSection
             peerInfoSection
+            networkAddressSection
             
             // Show transfer progress if active
             if let transfer = activeTransfer {
@@ -293,6 +295,47 @@ struct DeviceCardView: View {
         }
     }
     
+    private var networkAddressSection: some View {
+        VStack(spacing: 3) {
+            if let address = device.lastConnectedAddress {
+                let kind = device.networkAddresses?.first { $0.address == address }?.kind
+                Text("Last used: \(kind?.label ?? address)")
+                    .font(.system(size: 9))
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+            }
+            if !device.connectionAddresses.isEmpty {
+                Button { showNetworkAddresses.toggle() } label: {
+                    Label("Connections (\(device.connectionAddresses.count))", systemImage: "network")
+                        .font(.system(size: 9))
+                }
+                .buttonStyle(.borderless)
+                .popover(isPresented: $showNetworkAddresses) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("\(device.displayName) connections").font(.headline)
+                        Text("TidalDrift automatically uses a reachable address.")
+                            .font(.caption).foregroundColor(.secondary)
+                        ForEach(device.connectionAddresses, id: \.self) { address in
+                            let kind = device.networkAddresses?.first { $0.address == address }?.kind ?? .other
+                            HStack {
+                                Image(systemName: kind == .wifi ? "wifi" : "network")
+                                Text(kind.label)
+                                Spacer()
+                                Text(address).monospaced()
+                                if device.lastConnectedAddress == address {
+                                    Image(systemName: "checkmark").help("Last used connection")
+                                }
+                            }
+                            .font(.caption)
+                        }
+                    }
+                    .padding(16)
+                    .frame(minWidth: 300)
+                }
+            }
+        }
+    }
+
     /// Clean up model name and convert raw identifiers to friendly names
     private func cleanModelName(_ name: String) -> String {
         var cleaned = name.trimmingCharacters(in: .whitespacesAndNewlines)

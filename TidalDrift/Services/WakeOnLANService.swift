@@ -5,7 +5,11 @@ import Network
 class WakeOnLANService {
     static let shared = WakeOnLANService()
 
-    private init() {}
+    private let resolver: ConnectionResolver
+
+    init(resolver: ConnectionResolver = .shared) {
+        self.resolver = resolver
+    }
 
     struct WakePacketTarget: Hashable {
         let address: String
@@ -31,14 +35,15 @@ class WakeOnLANService {
             return false
         }
 
-        let wolPort = port ?? UInt16(settings.wakeOnLANPort)
+        guard let wolPort = port ?? UInt16(exactly: settings.wakeOnLANPort), wolPort > 0 else { return false }
         let retries = settings.wakeOnLANRetries
 
         let magicPacket = createMagicPacket(macBytes: macBytes)
 
         // Send multiple packets based on retry setting
         var success = false
-        for _ in 0..<retries {
+        for _ in 0..<max(0, retries) {
+            guard !Task.isCancelled else { return success }
             if await sendPacket(magicPacket, to: broadcastAddress, port: wolPort) {
                 success = true
             }
@@ -61,10 +66,12 @@ class WakeOnLANService {
         }
 
         let magicPacket = createMagicPacket(macBytes: macBytes)
-        let targets = wakePacketTargets(primaryPort: UInt16(settings.wakeOnLANPort))
+        guard let port = UInt16(exactly: settings.wakeOnLANPort), port > 0 else { return false }
+        let targets = wakePacketTargets(primaryPort: port)
         var success = false
 
-        for _ in 0..<settings.wakeOnLANRetries {
+        for _ in 0..<max(0, settings.wakeOnLANRetries) {
+            guard !Task.isCancelled else { return success }
             for target in targets {
                 if await sendPacket(magicPacket, to: target.address, port: target.port) {
                     success = true
@@ -90,7 +97,7 @@ class WakeOnLANService {
 
         // Wait for device to come online
         let startTime = Date()
-        while Date().timeIntervalSince(startTime) < timeout {
+        while !Task.isCancelled, Date().timeIntervalSince(startTime) < timeout {
             // Check if device is responding
             if await NetworkDiscoveryService.shared.scanIP(ipAddress, port: 5900) {
                 return true
@@ -112,7 +119,7 @@ class WakeOnLANService {
         }
 
         let startTime = Date()
-        while Date().timeIntervalSince(startTime) < timeout {
+        while !Task.isCancelled, Date().timeIntervalSince(startTime) < timeout {
             if await isDeviceReachableAfterWake(device, service: service) {
                 return true
             }
@@ -134,44 +141,57 @@ class WakeOnLANService {
     }
 
     func prepareForConnection(to device: DiscoveredDevice, service: DiscoveredDevice.ServiceType, timeout: TimeInterval = 30) async {
-        guard shouldAutoWakeBeforeConnect else { return }
+        guard shouldAutoWakeBeforeConnect, !Task.isCancelled else { return }
 
-        // Bonjour freshness does not prove that the host is awake: a sleep
-        // proxy can keep its records visible. Send both the TCP wake request
-        // and stored-MAC magic packets even when discovery reports it online.
-        // Keep the fast path nonblocking; the requested service handles its
-        // connection retries while the host wakes.
-        if device.isOnline {
-            knock(device: device)
+        // LocalCast establishes readiness through its authenticated UDP
+        // handshake. Waiting for TCP 5900 here delays UDP-only hosts for the
+        // entire timeout, and prevents their real service traffic from waking
+        // a sleep proxy. Start the viewer's handshake immediately.
+        if service == .localCast {
+            knock(device: device, service: service)
             return
         }
 
-        // Surface the wait in the UI so the user does not perceive a 30s freeze.
+        // A sleep proxy keeps Bonjour records fresh while the Mac sleeps.
+        // Check the requested service rather than trusting `isOnline`.
+        if await probe(device: device, service: service, timeout: 0.5) { return }
+
         let token = await WakeProgressTracker.shared.begin(device: device, service: service)
         defer {
             Task { @MainActor in WakeProgressTracker.shared.end(token) }
         }
 
-        // Replicate Apple Screen Sharing: a TCP knock on the screen-sharing port
-        // prompts the network's Bonjour sleep proxy to wake the host. This works
-        // even with no stored MAC, which is the common case for a Mac that has
-        // been asleep (its ARP entry has aged out, so we never learned the MAC).
-        await triggerWakeOnDemand(to: device)
+        _ = await Self.waitForReadiness(timeout: timeout, probe: { remaining in
+            await self.probe(device: device, service: service, timeout: remaining)
+        }, requestWake: {
+            self.knock(device: device, service: service)
+        })
+    }
 
-        // When we do know the MAC, also send a WOL magic packet as a fallback for
-        // networks without a sleep proxy.
-        if let macAddress = device.storedMACAddress {
-            _ = await wakeBroadly(macAddress: macAddress)
-        }
-
-        // Poll until the host is reachable for the requested service.
-        let startTime = Date()
-        while Date().timeIntervalSince(startTime) < timeout {
-            if await isDeviceReachableAfterWake(device, service: service) {
-                return
+    /// Keep wake requests and service checks alive for the bounded connection
+    /// attempt. Cancellation ends the wait, including its retry delay.
+    static func waitForReadiness(
+        timeout: TimeInterval,
+        retryInterval: TimeInterval = 2,
+        probe: (TimeInterval) async -> Bool,
+        requestWake: () -> Void
+    ) async -> Bool {
+        guard timeout.isFinite, timeout > 0, retryInterval.isFinite, retryInterval > 0 else { return false }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(timeout))
+        while !Task.isCancelled, ContinuousClock.now < deadline {
+            requestWake()
+            let remaining = ContinuousClock.now.duration(to: deadline)
+            let seconds = Double(remaining.components.seconds) + Double(remaining.components.attoseconds) / 1e18
+            guard seconds > 0 else { return false }
+            if await probe(min(2, seconds)), !Task.isCancelled { return true }
+            let nextProbe = min(deadline, ContinuousClock.now.advanced(by: .seconds(retryInterval)))
+            do {
+                try await Task.sleep(until: nextProbe, clock: .continuous)
+            } catch {
+                return false
             }
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
         }
+        return false
     }
 
     // MARK: - Wake on Demand (Bonjour sleep proxy)
@@ -181,23 +201,23 @@ class WakeOnLANService {
     /// this port, which is how Apple Screen Sharing wakes a sleeping Mac.
     private static let screenSharingPort: UInt16 = 5900
 
-    /// Fire-and-forget wake prod for an in-flight connection that is getting no
-    /// answer: re-knock the sleep proxy (TCP 5900) and resend the WOL magic
-    /// packet when a MAC is known. Safe to call repeatedly; each knock is a
-    /// single SYN and the wake path on an already-awake host is a no-op.
+    /// Prod all known adapters and the current hostname while the actual
+    /// service handshake retries. LocalCast's UDP traffic supplies its own
+    /// sleep-proxy wake trigger; TCP screen sharing and WOL are fallbacks.
     /// Respects the same auto-wake setting as `prepareForConnection`.
-    func knock(device: DiscoveredDevice) {
+    func knock(device: DiscoveredDevice, service: DiscoveredDevice.ServiceType = .localCast) {
         guard shouldAutoWakeBeforeConnect else { return }
         Task.detached { [weak self] in
             guard let self else { return }
-            await self.triggerWakeOnDemand(to: device, timeout: 1.5)
-            if let macAddress = device.storedMACAddress {
-                _ = await self.wakeBroadly(macAddress: macAddress)
+            // Do not serialize magic packets behind a dead TCP address.
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask { await self.triggerWakeOnDemand(to: device, service: service, timeout: 1.5) }
+                if let macAddress = device.storedMACAddress {
+                    group.addTask { _ = await self.wakeBroadly(macAddress: macAddress) }
+                }
             }
         }
     }
-
-    private let wakeOnDemandQueue = DispatchQueue(label: "com.tidaldrift.wakeOnDemand")
 
     /// Trigger a Bonjour Wake on Demand by briefly opening a TCP connection to
     /// the host's screen-sharing port. The act of attempting the connection is
@@ -205,34 +225,30 @@ class WakeOnLANService {
     /// does not need to fully succeed and no stored MAC address is required.
     /// The connection is always cancelled once it becomes ready, fails, or the
     /// timeout elapses, so it never blocks the connect flow.
-    private func triggerWakeOnDemand(to device: DiscoveredDevice, port: UInt16 = WakeOnLANService.screenSharingPort, timeout: TimeInterval = 3) async {
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            guard let nwPort = NWEndpoint.Port(rawValue: port) else {
-                continuation.resume()
-                return
-            }
-
-            let connection = NWConnection(host: NWEndpoint.Host(device.ipAddress), port: nwPort, using: .tcp)
-            let didResume = AtomicFlag()
-
-            let finish: @Sendable () -> Void = {
-                guard didResume.compareAndSwap(expected: false, desired: true) else { return }
-                connection.cancel()
-                continuation.resume()
-            }
-
-            connection.stateUpdateHandler = { state in
-                switch state {
-                case .ready, .failed, .cancelled:
-                    finish()
-                default:
-                    break
+    private func triggerWakeOnDemand(to device: DiscoveredDevice, service: DiscoveredDevice.ServiceType, timeout: TimeInterval) async {
+        let ports = Set([Int(Self.screenSharingPort), Self.readinessPort(for: service, device: device)].compactMap { $0 })
+        await withTaskGroup(of: Void.self) { group in
+            for host in Self.wakeHosts(for: device) {
+                for port in ports {
+                    group.addTask {
+                        _ = await self.resolver.testConnection(address: host, port: port, timeout: timeout)
+                    }
                 }
             }
-
-            connection.start(queue: wakeOnDemandQueue)
-            wakeOnDemandQueue.asyncAfter(deadline: .now() + timeout, execute: finish)
         }
+    }
+
+    static func wakeHosts(for device: DiscoveredDevice) -> [String] {
+        var hosts = device.connectionAddresses
+        let rawHostname = device.hostname.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hostname = rawHostname
+            .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        if !hostname.isEmpty, rawHostname.lowercased() != "unknown", rawHostname.lowercased() != "resolving..." {
+            hosts.append(hostname.contains(".") ? hostname : "\(hostname).local")
+        }
+        let local = Set(NetworkUtils.localNetworkAddresses().map(\.address))
+        var seen = Set<String>()
+        return hosts.filter { !local.contains($0) && seen.insert($0).inserted }
     }
 
     // MARK: - MAC Address Parsing
@@ -384,12 +400,13 @@ class WakeOnLANService {
             guard flags & IFF_UP != 0,
                   flags & IFF_RUNNING != 0,
                   flags & IFF_LOOPBACK == 0,
-                  interface.ifa_addr.pointee.sa_family == UInt8(AF_INET),
+                  let addressPointer = interface.ifa_addr,
+                  addressPointer.pointee.sa_family == UInt8(AF_INET),
                   let netmaskPointer = interface.ifa_netmask else {
                 continue
             }
 
-            let addr = interface.ifa_addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
+            let addr = addressPointer.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
             let mask = netmaskPointer.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
             var ipBuffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
             var maskBuffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
@@ -410,40 +427,54 @@ class WakeOnLANService {
         return addresses
     }
 
-    private func isDeviceReachableAfterWake(_ device: DiscoveredDevice, service: DiscoveredDevice.ServiceType?) async -> Bool {
+    func isDeviceReachableAfterWake(_ device: DiscoveredDevice, service: DiscoveredDevice.ServiceType?) async -> Bool {
         if let service {
             return await probe(device: device, service: service)
         }
 
-        for service in device.services where await probe(device: device, service: service) {
-            return true
+        // Manual Wake Device may use an optional VNC response as evidence that
+        // the Mac resumed, even if only LocalCast was discovered. This is not
+        // a prerequisite for starting LocalCast's own UDP handshake.
+        var services = device.services
+        if services.contains(.localCast) { services.insert(.screenSharing) }
+        // An ARP cache entry can survive sleep or belong to a sleep proxy. It
+        // is not proof that the Mac or one of its services has resumed.
+        return await withTaskGroup(of: Bool.self) { group in
+            for service in services {
+                group.addTask { await self.probe(device: device, service: service) }
+            }
+            for await ready in group where ready {
+                group.cancelAll()
+                return true
+            }
+            return false
         }
-
-        if getMACAddress(for: device.ipAddress) != nil {
-            return true
-        }
-
-        return false
     }
 
-    private func probe(device: DiscoveredDevice, service: DiscoveredDevice.ServiceType) async -> Bool {
+    static func readinessPort(for service: DiscoveredDevice.ServiceType, device: DiscoveredDevice) -> Int? {
         switch service {
         case .screenSharing, .tidalDrift:
-            return await NetworkDiscoveryService.shared.scanIP(device.ipAddress, port: 5900)
+            return device.port
         case .fileSharing:
-            return await NetworkDiscoveryService.shared.scanIP(device.ipAddress, port: 445)
+            return 445
         case .afp:
-            return await NetworkDiscoveryService.shared.scanIP(device.ipAddress, port: 548)
+            return 548
         case .ssh:
-            return await NetworkDiscoveryService.shared.scanIP(device.ipAddress, port: 22)
+            return 22
         case .localCast:
-            // LocalCast listens on UDP 5904, which a TCP scan can never confirm.
-            // Once the Mac is awake its LocalCast host resumes and screensharingd
-            // is reachable, so TCP 5900 is the reliable "host is awake" signal.
-            return await NetworkDiscoveryService.shared.scanIP(device.ipAddress, port: Int(WakeOnLANService.screenSharingPort))
+            return nil
         case .tidalDrop:
-            return await NetworkDiscoveryService.shared.scanIP(device.ipAddress, port: 5902)
+            return 5902
         }
+    }
+
+    func probe(device: DiscoveredDevice, service: DiscoveredDevice.ServiceType, timeout: TimeInterval = 2) async -> Bool {
+        guard let port = Self.readinessPort(for: service, device: device), !Task.isCancelled else { return false }
+        var target = device
+        target.port = port
+        // Resolve and race all adapters; the cached primary IP may belong to
+        // Wi-Fi that was disconnected while Ethernet is already awake.
+        return (try? await resolver.resolve(device: target, strategy: .ipFirst, timeout: timeout)) != nil
     }
 
     // MARK: - MAC Address Discovery

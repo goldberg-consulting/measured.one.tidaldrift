@@ -125,6 +125,8 @@ class TidalDriftPeerService: NSObject, ObservableObject {
         let screenSharingEnabled: Bool
         let fileSharingEnabled: Bool
         var tidalDriftName: String?
+        var networkAddresses: [DeviceNetworkAddress]?
+        var resolvedHostname: String?
     }
     
     private override init() {
@@ -207,7 +209,8 @@ class TidalDriftPeerService: NSObject, ObservableObject {
     private var advertiseActivity: NSObjectProtocol?
     private var sleepWakeObserved = false
 
-    private static let advertiseWatchdogInterval: TimeInterval = 4
+    private static let advertiseWatchdogInterval: TimeInterval = 1
+    private var advertisedAddresses: [DeviceNetworkAddress] = []
     private static let advertiseRegistrationGrace: TimeInterval = 3
 
     func startAdvertising() {
@@ -229,7 +232,8 @@ class TidalDriftPeerService: NSObject, ObservableObject {
     }
 
     private func launchAdvertiseProcess() {
-        let currentIP = NetworkUtils.getLocalIPAddress() ?? localInfo.ipAddress
+        let currentAddresses = NetworkUtils.localNetworkAddresses()
+        let currentIP = currentAddresses.first?.address ?? "Unknown"
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/dns-sd")
@@ -246,7 +250,8 @@ class TidalDriftPeerService: NSObject, ObservableObject {
             "version=\(localInfo.tidalDriftVersion)",
             "screen=\(localInfo.screenSharingEnabled ? "1" : "0")",
             "file=\(localInfo.fileSharingEnabled ? "1" : "0")",
-            "ip=\(currentIP)"
+            "ip=\(currentIP)",
+            "addrs=\(DeviceNetworkAddress.txtValue(currentAddresses))"
         ]
         if !customName.isEmpty {
             txtParts.append("tdname=\(customName)")
@@ -282,6 +287,7 @@ class TidalDriftPeerService: NSObject, ObservableObject {
         advertiseRegistered = false
         advertiseLaunchedAt = Date()
         advertisedIP = currentIP
+        advertisedAddresses = currentAddresses
 
         do {
             try process.run()
@@ -325,9 +331,10 @@ class TidalDriftPeerService: NSObject, ObservableObject {
             return
         }
 
-        if let current = NetworkUtils.getLocalIPAddress(), current != advertisedIP {
-            Self.log("🌐 Local IP changed (\(self.advertisedIP ?? "nil") → \(current)), re-advertising")
+        if NetworkUtils.localNetworkAddresses() != advertisedAddresses {
+            Self.log("Network adapters changed, refreshing advertisement and discovery")
             relaunchAdvertise()
+            reconfirmKnownPeers()
         }
     }
 
@@ -560,6 +567,11 @@ class TidalDriftPeerService: NSObject, ObservableObject {
         
         netServiceBrowser?.stop()
         netServiceBrowser = nil
+        for service in resolvingNetServices.values {
+            service.stopMonitoring()
+            service.stop()
+            service.delegate = nil
+        }
         resolvingNetServices.removeAll()
         
         browseOutputPipe?.fileHandleForReading.readabilityHandler = nil
@@ -780,6 +792,10 @@ class TidalDriftPeerService: NSObject, ObservableObject {
         // then fell back to dns-sd -G. Parse the whole chunk first so the
         // advertised IP wins deterministically.
         txtRecordsLock.lock()
+        if let resolvedHostname {
+            if resolvedTXTRecords[name] == nil { resolvedTXTRecords[name] = [:] }
+            resolvedTXTRecords[name]?["resolvedHost"] = resolvedHostname
+        }
         let txtIP = resolvedTXTRecords[name]?["ip"]
         let txt = resolvedTXTRecords[name]
         txtRecordsLock.unlock()
@@ -902,7 +918,7 @@ class TidalDriftPeerService: NSObject, ObservableObject {
         txtRecordsLock.unlock()
         
         // For self, use our detailed local info
-        let peer: PeerInfo
+        var peer: PeerInfo
         if isSelf {
             Self.log("✅ Found self: \(name) at \(actualIP)")
             peer = localInfo
@@ -936,13 +952,16 @@ class TidalDriftPeerService: NSObject, ObservableObject {
             )
         }
         
+        peer.networkAddresses = isSelf ? NetworkUtils.localNetworkAddresses() : DeviceNetworkAddress.fromTXT(txt?["addrs"])
+        peer.resolvedHostname = txt?["resolvedHost"]
+        let updatedPeer = peer
         DispatchQueue.main.async {
             // Always notify network discovery to mark as TidalDrift peer
             // (even for self - this ensures the red outline shows)
-            self.notifyNetworkDiscovery(peer: peer)
+            self.notifyNetworkDiscovery(peer: updatedPeer)
             
             if !isSelf {
-                self.discoveredPeers[actualIP] = peer
+                self.discoveredPeers[actualIP] = updatedPeer
                 self.peerLastSeen[actualIP] = Date()
             }
             
@@ -1052,7 +1071,8 @@ class TidalDriftPeerService: NSObject, ObservableObject {
             tidalDriftVersion: txt?["version"] ?? "1.0",
             screenSharingEnabled: txt?["screen"] == "1",
             fileSharingEnabled: txt?["file"] == "1",
-            tidalDriftName: txt?["tdname"]
+            tidalDriftName: txt?["tdname"],
+            networkAddresses: DeviceNetworkAddress.fromTXT(txt?["addrs"])
         )
         
         DispatchQueue.main.async {
@@ -1211,13 +1231,15 @@ extension TidalDriftPeerService: NetServiceBrowserDelegate {
         
         // Resolve the service to get IP address and TXT record
         service.delegate = self
+        resolvingNetServices[service.name]?.stopMonitoring()
         resolvingNetServices[service.name] = service
+        service.startMonitoring()
         service.resolve(withTimeout: 5.0)
     }
     
     func netServiceBrowser(_ browser: NetServiceBrowser, didRemove service: NetService, moreComing: Bool) {
         Self.log("Service removed: \(service.name)")
-        // Could remove from discoveredPeers here if needed
+        resolvingNetServices.removeValue(forKey: service.name)?.stopMonitoring()
     }
     
     func netServiceBrowser(_ browser: NetServiceBrowser, didNotSearch errorDict: [String : NSNumber]) {
@@ -1229,36 +1251,38 @@ extension TidalDriftPeerService: NetServiceBrowserDelegate {
         Self.log("NetServiceBrowser stopped searching")
     }
     
+    func netService(_ sender: NetService, didUpdateTXTRecord data: Data) {
+        guard resolvingNetServices[sender.name] === sender else { return }
+        // New peers include the full adapter snapshot in TXT. Use it at once;
+        // resolving the service again here can race an in-progress resolve.
+        if sender.addresses?.isEmpty == false {
+            netServiceDidResolveAddress(sender)
+        }
+    }
+
     // NetService resolution
     func netServiceDidResolveAddress(_ sender: NetService) {
+        guard resolvingNetServices[sender.name] === sender else { return }
         guard let addresses = sender.addresses, !addresses.isEmpty else {
             Self.log("Resolved \(sender.name) but no addresses found")
             return
         }
         
-        // Extract IP address from the first address
-        var ipAddress = ""
-        for addressData in addresses {
-            addressData.withUnsafeBytes { ptr in
-                let sockaddr = ptr.load(as: sockaddr.self)
-                if sockaddr.sa_family == UInt8(AF_INET) {
-                    // IPv4
-                    let sockaddr_in = ptr.load(as: sockaddr_in.self)
-                    var addr = sockaddr_in.sin_addr
-                    var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
-                    if inet_ntop(AF_INET, &addr, &buffer, socklen_t(INET_ADDRSTRLEN)) != nil {
-                        ipAddress = String(cString: buffer)
-                    }
-                }
-            }
-            if !ipAddress.isEmpty { break }
+        // Keep every IPv4 endpoint, not just the first adapter returned by mDNS.
+        let resolvedAddresses: [DeviceNetworkAddress] = addresses.compactMap { data in
+            guard data.count >= MemoryLayout<sockaddr_in>.size else { return nil }
+            var address = sockaddr_in()
+            _ = withUnsafeMutableBytes(of: &address) { data.copyBytes(to: $0) }
+            guard address.sin_family == UInt8(AF_INET) else { return nil }
+            var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+            guard inet_ntop(AF_INET, &address.sin_addr, &buffer, socklen_t(INET_ADDRSTRLEN)) != nil else { return nil }
+            return DeviceNetworkAddress(address: String(cString: buffer), kind: .other)
         }
-        
-        guard !ipAddress.isEmpty else {
+        guard let ipAddress = resolvedAddresses.first?.address else {
             Self.log("Could not extract IP for \(sender.name)")
             return
         }
-        
+
         // Parse TXT record
         var txtValues: [String: String] = [:]
         if let txtData = sender.txtRecordData() {
@@ -1286,21 +1310,24 @@ extension TidalDriftPeerService: NetServiceBrowserDelegate {
             tidalDriftVersion: txtValues["version"] ?? "1.0",
             screenSharingEnabled: txtValues["screen"] == "1",
             fileSharingEnabled: txtValues["file"] == "1",
-            tidalDriftName: txtValues["tdname"]
+            tidalDriftName: txtValues["tdname"],
+            networkAddresses: DeviceNetworkAddress.fromTXT(txtValues["addrs"]) ?? resolvedAddresses,
+            resolvedHostname: sender.hostName
         )
         
         DispatchQueue.main.async {
+            guard self.resolvingNetServices[sender.name] === sender else { return }
             self.discoveredPeers[ipAddress] = peer
             self.peerLastSeen[ipAddress] = Date()
             self.notifyNetworkDiscovery(peer: peer)
-            self.resolvingNetServices.removeValue(forKey: sender.name)
+            // Retain and monitor TXT updates so adapter changes refresh immediately.
         }
     }
     
     func netService(_ sender: NetService, didNotResolve errorDict: [String : NSNumber]) {
         let errorCode = errorDict[NetService.errorCode]?.intValue ?? -1
         Self.log("❌ Failed to resolve \(sender.name): code=\(errorCode)")
-        resolvingNetServices.removeValue(forKey: sender.name)
+        resolvingNetServices.removeValue(forKey: sender.name)?.stopMonitoring()
     }
 }
 

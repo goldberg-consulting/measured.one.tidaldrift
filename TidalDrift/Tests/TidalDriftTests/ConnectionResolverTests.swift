@@ -56,6 +56,25 @@ final class ConnectionResolverTests: XCTestCase {
         }
     }
 
+    func test_udpCandidatesWhenCancelledDoNotReturnCachedOrLateDNSAddresses() async {
+        let started = expectation(description: "UDP lookup started")
+        let release = DispatchSemaphore(value: 0)
+        let resolver = ConnectionResolver(addressLookup: { hostname, port in
+            started.fulfill()
+            _ = release.wait(timeout: .now() + 3)
+            return [.init(address: "192.0.2.3", port: port, method: .mDNSHostname, hostname: hostname)]
+        })
+        defer { release.signal() }
+        let target = device()
+        let task = Task { await resolver.connectionCandidates(for: target, timeout: 10) }
+        await fulfillment(of: [started], timeout: 1)
+        task.cancel()
+        let start = Date()
+        let addresses = await task.value
+        XCTAssertTrue(addresses.isEmpty)
+        XCTAssertLessThan(Date().timeIntervalSince(start), 1)
+    }
+
     func test_callbackResult_whenCancelledBeforeWait_ignoresLateSuccess() async {
         let result = AsyncCallbackResult<String>()
         await result.finish(nil)

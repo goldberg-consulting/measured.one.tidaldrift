@@ -79,6 +79,12 @@ class ScreenShareConnectionService: @unchecked Sendable {
     
     func connect(to device: DiscoveredDevice, mode: ScreenShareMode = .control, username: String? = nil, password: String? = nil) async throws {
         logger.info("🔌 Connecting to '\(device.name)'...")
+
+        // Some callers (including the app-control panel) bypass the dashboard's
+        // wake preparation. A fresh Bonjour record can still be a sleep proxy;
+        // allow the real service time to wake before the short resolver budget.
+        await WakeOnLANService.shared.prepareForConnection(to: device, service: .screenSharing)
+        try Task.checkCancellation()
         
         // Step 1: Resolve the best address using hostname-first strategy
         // This handles stale IPs and DHCP changes automatically
@@ -89,6 +95,7 @@ class ScreenShareConnectionService: @unchecked Sendable {
                 strategy: .ipFirst,
                 timeout: 5.0
             )
+            await NetworkDiscoveryService.shared.recordConnection(to: device, address: resolved.address)
             logger.info("🔌 Resolved address: \(resolved.address) via \(resolved.method.rawValue)")
         } catch let error as ConnectionResolver.ResolutionError {
             logger.error("🔌 Resolution failed: \(error.localizedDescription)")
@@ -343,6 +350,12 @@ class ScreenShareConnectionService: @unchecked Sendable {
         }
     }
     
+    private func deviceForService(_ device: DiscoveredDevice, port: Int) -> DiscoveredDevice {
+        var target = device
+        target.port = port
+        return target
+    }
+
     func connectToFileShare(device: DiscoveredDevice, username: String? = nil) async throws {
         // Check if already mounted
         if let mountedURL = findMountedShare(for: device) {
@@ -357,7 +370,7 @@ class ScreenShareConnectionService: @unchecked Sendable {
         let resolved: ConnectionResolver.ResolvedAddress
         do {
             resolved = try await ConnectionResolver.shared.resolve(
-                device: device,
+                device: deviceForService(device, port: 445),
                 strategy: .ipFirst,
                 timeout: 5.0
             )
@@ -365,15 +378,9 @@ class ScreenShareConnectionService: @unchecked Sendable {
             throw ConnectionError.resolutionFailed(error.localizedDescription)
         }
         
-        // Use hostname.local for SMB if available (better for macOS file sharing)
-        let connectionAddress: String
-        if let hostname = resolved.hostname, resolved.method == .mDNSHostname {
-            let cleanHost = hostname.hasSuffix(".local") ? hostname : "\(hostname).local"
-            connectionAddress = cleanHost
-        } else {
-            connectionAddress = resolved.address
-        }
-        
+        let connectionAddress = resolved.address
+        await NetworkDiscoveryService.shared.recordConnection(to: device, address: resolved.address)
+
         let urlString: String
         if let username = username {
             let escapedUser = username.addingPercentEncoding(withAllowedCharacters: .urlUserAllowed) ?? username
@@ -411,7 +418,7 @@ class ScreenShareConnectionService: @unchecked Sendable {
         let resolved: ConnectionResolver.ResolvedAddress
         do {
             resolved = try await ConnectionResolver.shared.resolve(
-                device: device,
+                device: deviceForService(device, port: 548),
                 strategy: .ipFirst,
                 timeout: 5.0
             )
@@ -419,15 +426,9 @@ class ScreenShareConnectionService: @unchecked Sendable {
             throw ConnectionError.resolutionFailed(error.localizedDescription)
         }
         
-        // Use hostname.local for AFP if available
-        let connectionAddress: String
-        if let hostname = resolved.hostname, resolved.method == .mDNSHostname {
-            let cleanHost = hostname.hasSuffix(".local") ? hostname : "\(hostname).local"
-            connectionAddress = cleanHost
-        } else {
-            connectionAddress = resolved.address
-        }
-        
+        let connectionAddress = resolved.address
+        await NetworkDiscoveryService.shared.recordConnection(to: device, address: resolved.address)
+
         let urlString: String
         if let username = username {
             let escapedUser = username.addingPercentEncoding(withAllowedCharacters: .urlUserAllowed) ?? username
@@ -496,16 +497,12 @@ class ScreenShareConnectionService: @unchecked Sendable {
             do {
                 // Try to resolve using hostname-first strategy
                 let resolved = try await ConnectionResolver.shared.resolve(
-                    device: device,
+                    device: deviceForService(device, port: 22),
                     strategy: .ipFirst,
                     timeout: 5.0
                 )
-                // Use hostname.local for SSH if available (more reliable)
-                if let hostname = resolved.hostname, resolved.method == .mDNSHostname {
-                    host = hostname.hasSuffix(".local") ? hostname : "\(hostname).local"
-                } else {
-                    host = resolved.address
-                }
+                host = resolved.address
+                await NetworkDiscoveryService.shared.recordConnection(to: device, address: resolved.address)
                 logger.info("🔌 SSH: Resolved host: \(host)")
             } catch {
                 // Fall back to cached IP

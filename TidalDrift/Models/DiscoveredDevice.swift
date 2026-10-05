@@ -5,6 +5,24 @@ struct DiscoveredDevice: Identifiable, Codable, Hashable {
     var name: String
     var hostname: String
     var ipAddress: String
+    /// Optional for compatibility with devices saved by earlier versions.
+    var networkAddresses: [DeviceNetworkAddress]?
+    var lastConnectedAddress: String?
+
+    var connectionAddresses: [String] {
+        var seen = Set<String>()
+        return ((networkAddresses ?? []).map(\.address) + [ipAddress])
+            .filter { NetworkUtils.isValidIPAddress($0) && seen.insert($0).inserted }
+    }
+
+    mutating func rememberAddress(_ address: String) {
+        guard NetworkUtils.isValidIPAddress(address) else { return }
+        var addresses = networkAddresses ?? []
+        if !addresses.contains(where: { $0.address == address }) {
+            addresses.append(DeviceNetworkAddress(address: address, kind: .other))
+        }
+        networkAddresses = Array(addresses.suffix(16))
+    }
     var services: Set<ServiceType>
     var lastSeen: Date
     var isTrusted: Bool

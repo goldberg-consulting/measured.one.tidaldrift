@@ -420,6 +420,10 @@ class LocalCastService: ObservableObject {
         hostingGeneration &+= 1
         pendingSettingsApply?.cancel()
         pendingSettingsApply = nil
+        if wakeGraceAssertion != 0 {
+            IOPMAssertionRelease(wakeGraceAssertion)
+            wakeGraceAssertion = 0
+        }
         guard isHosting || isStartingHosting else { return }
         self.isHosting = false
         self.isAuthEnabled = false
@@ -533,6 +537,7 @@ class LocalCastService: ObservableObject {
 
     func connect(to device: DiscoveredDevice, password: String? = nil) async throws -> LocalCastViewerWindowController {
         logger.info("Connecting to \(device.name)")
+        WakeOnLANService.shared.knock(device: device)
         
         // Only send a password when the host advertises LocalCast auth. Saved
         // VNC credentials are not necessarily the LocalCast host password, and
@@ -595,6 +600,7 @@ class LocalCastService: ObservableObject {
     /// Screen Sharing view shows just the chosen app.
     @discardableResult
     func openAppControl(for device: DiscoveredDevice, password: String? = nil) async throws -> AppControlPanelController {
+        WakeOnLANService.shared.knock(device: device)
         // Pixels come from macOS Screen Sharing.
         try? await ScreenShareConnectionService.shared.connect(to: device)
 
@@ -640,6 +646,7 @@ class LocalCastService: ObservableObject {
 enum LocalCastError: LocalizedError {
     case permissionDenied(Permission)
     case connectionFailed(String)
+    case clipboardActionFailed(String)
     case encoderInitializationFailed
     case decoderInitializationFailed
     case noDisplayAvailable
@@ -658,6 +665,8 @@ enum LocalCastError: LocalizedError {
             return "Accessibility permission required for input control. Open System Settings > Privacy & Security > Accessibility and enable TidalDrift."
         case .connectionFailed(let reason):
             return "Connection failed: \(reason)"
+        case .clipboardActionFailed(let reason):
+            return reason
         case .encoderInitializationFailed:
             return "Hardware video encoding is unavailable for this stream. Try H.264 or a lower resolution."
         case .decoderInitializationFailed:

@@ -74,7 +74,10 @@ class DeviceDetailViewModel: ObservableObject {
         }
 
         do {
-            await WakeOnLANService.shared.prepareForConnection(to: device, service: service)
+            // ScreenShareConnectionService owns its wake wait for every caller.
+            if service != .screenSharing && service != .tidalDrift {
+                await WakeOnLANService.shared.prepareForConnection(to: device, service: service)
+            }
 
             switch service {
             case .screenSharing, .tidalDrift:

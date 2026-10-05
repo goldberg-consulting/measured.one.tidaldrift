@@ -45,13 +45,44 @@ jobs:
           curl --fail --location --output /tmp/TidalDrift.dmg "$URL"
           echo "${SHA}  /tmp/TidalDrift.dmg" | shasum -a 256 --check
 
-      - name: Dry-run cask install
+      - name: Install cask in temporary app directory
         run: |
           brew tap-new local/tidaldrift
           mkdir -p "$(brew --repository)/Library/Taps/local/homebrew-tidaldrift/Casks"
           cp Casks/tidaldrift.rb "$(brew --repository)/Library/Taps/local/homebrew-tidaldrift/Casks/tidaldrift.rb"
-          brew install --cask --dry-run local/tidaldrift/tidaldrift
-          brew untap --force local/tidaldrift
+          brew trust --cask local/tidaldrift/tidaldrift
+          mkdir -p "$RUNNER_TEMP/tidaldrift-applications"
+          brew install --cask --appdir="$RUNNER_TEMP/tidaldrift-applications" local/tidaldrift/tidaldrift
+
+      - name: Verify installed app version and signature
+        run: |
+          APP="$RUNNER_TEMP/tidaldrift-applications/TidalDrift.app"
+          VERSION=$(ruby -ne 'puts $1 if /^\s*version "([^"]+)"/' Casks/tidaldrift.rb)
+          INSTALLED_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist")
+          echo "Installed TidalDrift ${INSTALLED_VERSION}; cask expects ${VERSION}"
+          test "$INSTALLED_VERSION" = "$VERSION"
+          test "$BUNDLE_ID" = "com.goldbergconsulting.tidaldrift"
+          test -x "$APP/Contents/MacOS/TidalDrift"
+          # Require Apple's Developer ID certificate chain, including its application leaf.
+          REQUIREMENT='anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists'
+          REQUIREMENT+=' and certificate leaf[field.1.2.840.113635.100.6.1.13] exists'
+          codesign --verify --deep --strict --test-requirement="=$REQUIREMENT" "$APP"
+
+      - name: Uninstall test cask
+        if: always()
+        run: |
+          if brew list --cask local/tidaldrift/tidaldrift >/dev/null 2>&1; then
+            brew uninstall --cask local/tidaldrift/tidaldrift
+          fi
+          test ! -e "$RUNNER_TEMP/tidaldrift-applications/TidalDrift.app"
+
+      - name: Remove temporary tap
+        if: always()
+        run: |
+          if brew tap | grep -Fxq local/tidaldrift; then
+            brew untap --force local/tidaldrift
+          fi
 
   lint:
     name: SwiftLint

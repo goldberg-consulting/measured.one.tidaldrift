@@ -3,10 +3,30 @@ import MetalKit
 import Combine
 
 private final class LocalCastDropView<Content: View>: NSHostingView<Content> {
-    var receiveDrop: ((NSPasteboard) -> Bool)?
-    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { .copy }
+    var acceptsDrop: ((NSDraggingInfo) -> Bool)?
+    var receiveDrop: ((NSDraggingInfo) -> Bool)?
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        acceptsDrop?(sender) == true ? .copy : []
+    }
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        draggingEntered(sender)
+    }
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        receiveDrop?(sender.draggingPasteboard) ?? false
+        guard acceptsDrop?(sender) == true else { return false }
+        return receiveDrop?(sender) ?? false
+    }
+}
+
+/// Drops must land on visible video, rather than a letterbox or local control.
+/// Coordinates use the same top-left normalized space as remote pointer input.
+enum LocalCastDropCoordinates {
+    static func normalized(_ point: CGPoint, videoRect: CGRect, flipped: Bool) -> ClipboardDropPoint? {
+        guard videoRect.width > 0, videoRect.height > 0,
+              point.x.isFinite, point.y.isFinite,
+              videoRect.contains(point) else { return nil }
+        let x = (point.x - videoRect.minX) / videoRect.width
+        let y = (point.y - videoRect.minY) / videoRect.height
+        return ClipboardDropPoint(x: x, y: flipped ? y : 1 - y)
     }
 }
 
@@ -28,6 +48,7 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
     private var remoteResolution: CGSize = CGSize(width: 1280, height: 720)
     private var hasSizedToRemote = false
     private var didCleanup = false
+    private var interceptedPasteKey = false
     
     /// Called when the window is closed so the owner can release its strong reference.
     var onClose: ((LocalCastViewerWindowController) -> Void)?
@@ -67,13 +88,23 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
         )
         let hostingView = LocalCastDropView(rootView: contentView)
         hostingView.registerForDraggedTypes([.fileURL, .string, .rtf, .html, .png, .tiff])
-        hostingView.receiveDrop = { [weak session] pasteboard in
-            guard let session else { return false }
-            return session.receiveDrop(from: pasteboard)
-        }
         window.contentView = hostingView
         
         super.init(window: window)
+
+        hostingView.acceptsDrop = { [weak self] sender in
+            guard let self, self.clientSession.isConnected,
+                  self.clientSession.inputCaptureEnabled,
+                  !self.clientSession.isOverlayActive,
+                  self.clientSession.remoteSupportsDrops,
+                  self.dropPoint(for: sender.draggingLocation) != nil else { return false }
+            let containsFiles = sender.draggingPasteboard.types?.contains(.fileURL) == true
+            return !containsFiles || self.clientSession.remoteSupportsTargetedDrops
+        }
+        hostingView.receiveDrop = { [weak self] sender in
+            guard let self, let point = self.dropPoint(for: sender.draggingLocation) else { return false }
+            return self.clientSession.receiveDrop(from: sender.draggingPasteboard, at: point)
+        }
         
         window.delegate = self
         guard let renderer = MetalRenderer(mtkView: mtkView) else {
@@ -152,6 +183,15 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
     private var overlayFrames: [CGRect] { overlayFrameStore.frames }
     
     private var diagCount = 0
+
+    private func dropPoint(for windowPoint: CGPoint) -> ClipboardDropPoint? {
+        guard let contentView = window?.contentView, let renderer = clientSession.renderer else { return nil }
+        let contentPoint = contentView.convert(windowPoint, from: nil)
+        guard !overlayFrames.contains(where: { $0.insetBy(dx: -4, dy: -4).contains(contentPoint) }) else { return nil }
+        return LocalCastDropCoordinates.normalized(
+            renderer.viewPoint(fromWindowPoint: windowPoint),
+            videoRect: renderer.videoRect, flipped: renderer.isViewFlipped)
+    }
     
     private func setupInputCapture() {
         if Self.openViewerCount == 0 {
@@ -251,6 +291,8 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
         }
         keyboardTap.onKey = { [weak self] keyCode, modifiers, down in
             guard let self else { return }
+            if self.handlePasteKey(keyCode: keyCode, modifiers: modifiers, down: down) { return }
+            if down { self.noteCopyKey(keyCode: keyCode, modifiers: modifiers) }
             if down {
                 self.clientSession.sendInput(.keyDown(keyCode: keyCode, modifiers: modifiers))
             } else {
@@ -360,9 +402,14 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
         // CGEventFlags on the host; passing the full rawValue can include
         // device-dependent low bits that set spurious flags.
         let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask).rawValue
+        if event.type == .keyDown || event.type == .keyUp,
+           handlePasteKey(keyCode: keyCode, modifiers: UInt64(modifiers), down: event.type == .keyDown) {
+            return
+        }
         
         switch event.type {
         case .keyDown:
+            noteCopyKey(keyCode: keyCode, modifiers: UInt64(modifiers))
             clientSession.sendInput(.keyDown(keyCode: keyCode, modifiers: UInt64(modifiers)))
         case .keyUp:
             clientSession.sendInput(.keyUp(keyCode: keyCode, modifiers: UInt64(modifiers)))
@@ -385,9 +432,33 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
         }
     }
 
+    /// Send the clipboard and paste intent together. Forwarding Cmd-V as a
+    /// separate input datagram races both the poll timer and bulk transfers.
+    private func handlePasteKey(keyCode: UInt16, modifiers: UInt64, down: Bool) -> Bool {
+        guard keyCode == 9 else { return false }
+        if !down, interceptedPasteKey {
+            interceptedPasteKey = false
+            return true
+        }
+        guard down, CGEventFlags(rawValue: modifiers).contains(.maskCommand) else { return false }
+        // A held V produces key repeats; one physical paste is one action.
+        if !interceptedPasteKey {
+            interceptedPasteKey = true
+            clientSession.sendPaste(modifiers: modifiers)
+        }
+        return true
+    }
+
+    private func noteCopyKey(keyCode: UInt16, modifiers: UInt64) {
+        if (keyCode == 8 || keyCode == 7), CGEventFlags(rawValue: modifiers).contains(.maskCommand) {
+            clientSession.noteRemoteCopy()
+        }
+    }
+
     /// Send a release for every modifier either keyboard path reported as
     /// pressed. Called when capture disengages for any reason.
     private func releaseHeldModifiers() {
+        interceptedPasteKey = false
         keyboardTap.releaseHeldModifiers()
         let stuck = fallbackHeldModifiers
         fallbackHeldModifiers.removeAll()

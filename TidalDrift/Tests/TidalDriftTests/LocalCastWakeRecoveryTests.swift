@@ -2,6 +2,47 @@ import XCTest
 @testable import TidalDrift
 
 final class LocalCastWakeRecoveryTests: XCTestCase {
+    func test_candidateRefreshRetriesDNSWhileWakeOutlastsInitialLookup() throws {
+        var refresh = ClientSession.CandidateRefreshState()
+        XCTAssertNil(refresh.beginRefresh(elapsed: 7.9, hasHostResponse: false))
+        let generation = try XCTUnwrap(refresh.beginRefresh(elapsed: 8, hasHostResponse: false))
+        XCTAssertNil(refresh.beginRefresh(elapsed: 10, hasHostResponse: false))
+        XCTAssertEqual(refresh.beginRefresh(elapsed: 16, hasHostResponse: false), generation)
+        XCTAssertEqual(refresh.beginRefresh(elapsed: 40, hasHostResponse: false), generation)
+        XCTAssertNil(refresh.beginRefresh(elapsed: 60, hasHostResponse: false))
+    }
+
+    func test_candidateRefreshCannotChangeAnAnsweredSessionOrExpiredAttempt() throws {
+        var refresh = ClientSession.CandidateRefreshState()
+        XCTAssertNil(refresh.beginRefresh(elapsed: 8, hasHostResponse: true))
+        let generation = try XCTUnwrap(refresh.beginRefresh(elapsed: 8, hasHostResponse: false))
+        XCTAssertTrue(refresh.acceptsResult(generation: generation, elapsed: 8.5, hasHostResponse: false))
+        XCTAssertFalse(refresh.acceptsResult(generation: generation, elapsed: 8.5, hasHostResponse: true))
+        XCTAssertFalse(refresh.acceptsResult(generation: generation, elapsed: 60, hasHostResponse: false))
+    }
+
+    func test_candidateRefreshDiscardsDNSResultAfterDisconnectOrNewAttempt() throws {
+        var refresh = ClientSession.CandidateRefreshState()
+        let oldGeneration = try XCTUnwrap(refresh.beginRefresh(elapsed: 8, hasHostResponse: false))
+        refresh.invalidate()
+        XCTAssertFalse(refresh.acceptsResult(generation: oldGeneration, elapsed: 9, hasHostResponse: false))
+        let newGeneration = try XCTUnwrap(refresh.beginRefresh(elapsed: 8, hasHostResponse: false))
+        XCTAssertNotEqual(newGeneration, oldGeneration)
+        XCTAssertTrue(refresh.acceptsResult(generation: newGeneration, elapsed: 8.5, hasHostResponse: false))
+    }
+
+    func test_newAddressLearnedAfterWakeIsTriedBeforeStaleAdapters() {
+        let existing = ["192.0.2.1", "192.0.2.2", "192.0.2.3"]
+        XCTAssertEqual(ClientSession.mergingConnectionCandidates(
+            existing: existing,
+            refreshed: ["192.0.2.1", "192.0.2.4", "192.0.2.4"],
+            currentAddress: "192.0.2.2"
+        ), ["192.0.2.2", "192.0.2.4", "192.0.2.1", "192.0.2.3"])
+        XCTAssertEqual(ClientSession.mergingConnectionCandidates(
+            existing: existing, refreshed: ["192.0.2.3", "192.0.2.2"], currentAddress: "192.0.2.2"
+        ), existing, "An unchanged DNS result must not restart the transport")
+    }
+
     func test_connectionRetries_whenWakeOutlastsGracePeriod_expectsRetriesUntilDeadline() {
         // The host may not resume its listener until after 25 seconds. The
         // troubleshooting status must not end the wake/auth retry loop.

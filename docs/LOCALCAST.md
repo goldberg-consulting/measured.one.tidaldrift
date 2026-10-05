@@ -10,7 +10,7 @@ This guide covers everyday use first, then settings and implementation details. 
 
 ## Start a session
 
-On the **host Mac** — the Mac you want to view:
+On the **host Mac**, the Mac you want to view:
 
 1. Open **Settings → Metal Streaming**.
 2. Leave **Require authentication** enabled and set a **Host password**. This is the TidalDrift hosting password; it does not have to match the Mac’s login password.
@@ -29,6 +29,14 @@ Then connect from the viewer:
 
 Both Macs need a reachable network path and compatible TidalDrift builds. A host serves one active viewer at a time. To end sharing, turn off **Host this Mac** or **Metal Streaming Host**. **Auto-host on launch** starts hosting whenever TidalDrift launches.
 
+### Connect to a sleeping Mac
+
+Enable TidalDrift's **Wake-on-LAN** and **Auto-wake before connecting** settings, and enable network wake on the host. A saved MAC address allows magic-packet wake requests. Bonjour sleep-proxy wake can work without a saved MAC address when the network and host support it.
+
+The device's online badge can remain visible while a sleep proxy answers discovery requests. TidalDrift checks the requested service and retries wake requests within a bounded connection attempt. Wake requests consider remembered adapter addresses and the hostname. Connections use the current address and freshly resolved hostname addresses; a historical address alone is insufficient because DHCP may have reassigned it to another computer.
+
+**Screen Share** waits for its Screen Sharing service to respond. **Start Cast** starts LocalCast's UDP handshake immediately and uses that response to establish readiness; macOS Screen Sharing on TCP 5900 is not a prerequisite. Screen Sharing connection attempts and magic packets are additional wake mechanisms, not proof that LocalCast is ready. A host that does not resume or start its requested service can still time out.
+
 ## Choose what to share
 
 On the host, open the menu-bar **Sharing:** menu and choose **Entire Desktop** or an app. Use **Refresh App List** after opening an app if it is missing.
@@ -46,6 +54,8 @@ The bottom status bar switches between **Remote Control** and **View Only**. Pre
 While control is enabled and the viewer is focused, typing and pointer actions go to the host. Host Accessibility permission enables input injection. Viewer Accessibility permission enables capture of system shortcuts; without it, ordinary keys use a fallback handler.
 
 - **⌘⇧I:** release or resume remote control.
+- **⌘C / ⌘X:** copy or cut in the remote app while controlling the viewer.
+- **⌘V:** send the current local clipboard and wait for transfer before remote Paste. After a remote copy or cut, use that host clipboard until a new local copy replaces it.
 - **⌘W while controlling:** close the remote app’s window.
 - **⌘W after releasing control:** close the local viewer when Stream Controls is closed. The title-bar Close button also closes the viewer.
 - **⌘Tab** and **⌘⌥Escape:** remain local so you can switch apps or open Force Quit.
@@ -58,9 +68,13 @@ The stream omits the host’s cursor by default so the viewer uses its local poi
 
 Enable **Clipboard Sync** on both Macs. You can also find it at **Settings → General → Sync clipboard during LocalCast sessions**.
 
-Copy text, rich text, HTML, an image, or regular files on either Mac, then paste on the other. Files transfer when the receiving app requests them on paste. Password-protected sessions support files and large content; passwordless sessions support only small inline clipboard content.
+Copy text, rich text, HTML, an image, or regular files on either Mac, then paste on the other. Pressing **⌘V in the viewer** explicitly sends the current local clipboard, including a copy made before connecting. The host verifies and applies the content before sending Paste. For files, it downloads the bytes first and supplies host file URLs. Automatic background file sync still uses file promises, with bytes fetched when the receiving app requests them.
 
-You can also drop regular files, text, or images onto the viewer. This sends content to the **host’s clipboard**; paste it into the remote app after transfer. Files dropped onto the viewer transfer immediately. This workflow requires a password, Clipboard Sync on both Macs, and builds that support viewer drops. The “Drop offered” message confirms the offer, not completed delivery.
+If the remote app, window, or focused field changes during transfer, the host cancels the delayed Paste. The viewer shows a success or failure result. **Clipboard ready; Paste sent to the remote app** confirms that the command was sent; the app determines whether it accepts the content.
+
+Drop regular files onto an **open Finder folder in the streamed image** to save them in that folder. The host captures the destination before downloading, preserves existing files by choosing numbered names on collision, and reports delivery only after saving. A shared app/window must be uncovered at the drop point on the host. The Desktop and arbitrary app targets are unsupported. Text/image drops continue to offer content to the host clipboard for a later paste. An offer message does not confirm completed delivery.
+
+Install the updated build on **both Macs** for synchronized viewer Paste and file drops at a remote destination; older hosts require an upgrade. The host needs Accessibility permission. Password-protected sessions support files and large content, and all viewer drops require a password. Passwordless sessions support only small inline clipboard content.
 
 The limit is **100 MiB total and 64 regular files**. Folders and app bundles are unsupported. [Clipboard sync](CLIPBOARD_SYNC.md) explains privacy, supported formats, file promises, and retry behavior. TidalDrop is a separate file-transfer feature; it does not use this clipboard channel.
 
@@ -118,7 +132,7 @@ Encode/decode use hardware media engines; Metal handles presentation. Packet han
 
 The full-frame video path is **8-bit 4:2:0 SDR**. Audio, HDR, and 4:4:4 video are not implemented. Hardware codecs and Metal rendering are required; there is no software codec fallback. Initialization failures surface as connection/capture errors.
 
-Capture transitions are serialized, including settings changes, target changes, and recovery. A failed listener or system wake triggers a host restart and client reauthentication. Recovery is bounded; a prolonged outage can require reconnecting.
+Capture transitions are serialized, including settings changes, target changes, and recovery. A failed listener or system wake triggers a host restart and client reauthentication. Recovery cancels pending clipboard transfers and Paste/drop requests; request the action again after reconnecting. Check the destination first if a file drop had already started saving. Recovery is bounded; a prolonged outage can require reconnecting.
 
 Video loss can trigger a keyframe request. FEC can reconstruct up to two missing full-size data fragments per block, but not the short final fragment without its length. The protocol does not selectively retransmit video or acknowledge every control operation.
 
@@ -145,11 +159,18 @@ Before shipping streaming changes, test on **two Macs running the same revision*
 
 1. **Connect and control:** authenticate; switch focus, minimize, and enter full screen; type and scroll; toggle ⌘⇧I twice; verify remote ⌘W and local Close behavior; revoke host Accessibility and verify the warning.
 2. **Change targets and settings:** switch desktop/app/window, close the shared window, and edit codec, resolution, region mode, and quality while streaming. Close Settings immediately after an edit. Confirm the target, input mapping, authentication, and clipboard remain correct.
-3. **Exercise recovery:** test Wi-Fi and standard-MTU Ethernet, packet loss/bursts, interface changes, sleep/wake, and listener failure. Record recovery time and failures, including any needed reconnect.
+3. **Exercise recovery:** test Wi-Fi and standard-MTU Ethernet, packet loss/bursts, interface changes, sleep/wake, and listener failure. Record recovery time and failures, including any needed reconnect. Confirm pending Paste requests cannot fire after reauthentication.
 4. **Check clipboard:** use the [clipboard verification cases](CLIPBOARD_SYNC.md#developer-verification), including newer copies during transfers and sync disabled mid-transfer.
 5. **Measure performance:** test small text, gradients, photos, and motion over a sustained session. Measure actual displayed frame intervals, input-to-photon latency, wire bitrate, memory, and thermal load. For comparisons with macOS Screen Sharing, match resolution/frame rate, warm up, repeat runs, and report raw results plus median, p95, worst case, and failures.
 
-For the closed-lid wake regression, connect the host to AC power and enable network wake. Disconnect macOS Screen Sharing completely, leave LocalCast hosting, close the lid, and let the host sleep. Start Cast while its Bonjour entry still looks online, then repeat after it looks offline. Verify authentication, first video, keyboard/mouse control, and continued streaming for at least three minutes. Repeat with a stored MAC address and with only the sleep-proxy wake path available. Also close the lid during an active cast, then disconnect the viewer and confirm LocalCast releases its session power assertions and virtual display. Capture `pmset -g log` and the TidalDrift log timestamps to distinguish network DarkWake, full wake, listener recovery, and first video; the system’s full-wake notification alone does not identify every network wake ([Apple DTS explanation](https://developer.apple.com/forums/thread/770517)).
+For the wake regressions, enable auto-wake in TidalDrift and network wake on the host, then test these cases:
+
+1. Sleep the host and launch **Screen Share** while its Bonjour entry still looks online. Repeat after it looks offline, with a saved MAC address and with only the sleep-proxy path available. Verify the Screen Sharing service becomes usable, not merely discoverable.
+2. Leave a stale Wi-Fi address among the device's candidates while Ethernet remains reachable. Repeat Screen Share and Start Cast using the hostname and alternate adapter. Record timeouts and the address that succeeds.
+3. Disable macOS Screen Sharing, leave LocalCast hosting enabled, and sleep the host. **Start Cast** must attempt its UDP handshake without waiting for TCP 5900. Verify authentication, first video, and keyboard/mouse control.
+4. For closed-lid behavior, connect the host to AC power, disconnect any Screen Sharing session, close the lid, and let the host sleep. Repeat Start Cast with online and offline discovery status, then stream for at least three minutes. Also close the lid during an active cast, disconnect the viewer, and confirm LocalCast releases its session power assertions and virtual display.
+
+Capture `pmset -g log` and TidalDrift log timestamps to distinguish network DarkWake, full wake, listener recovery, and first video; the system's full-wake notification alone does not identify every network wake ([Apple DTS explanation](https://developer.apple.com/forums/thread/770517)). These steps are a manual validation plan; they do not establish that hardware wake testing has passed.
 
 Unit tests and the synthetic benchmark complement these checks; they do not replace two-Mac validation or certify a particular resolution/frame-rate target.
 
