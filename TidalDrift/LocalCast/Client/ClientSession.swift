@@ -40,6 +40,8 @@ extension ClientSessionDelegate {
 class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegate {
     @Published var remoteAccessibilityGranted: Bool?
     @Published var remoteSupportsDrops = false
+    @Published var remoteSupportsPaste = false
+    @Published var remoteSupportsTargetedDrops = false
     @Published var dropStatus: String?
     private let logger = Logger(subsystem: "com.tidaldrift", category: "ClientSession")
 
@@ -79,6 +81,10 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
 
     private let device: DiscoveredDevice
     private var hostEndpoint: NWEndpoint?
+    private var connectionCandidates: [String] = []
+    private var connectionCandidateIndex = 0
+    private var candidateRefreshTask: Task<Void, Never>?
+    private var candidateRefreshState = CandidateRefreshState()
     private var heartbeatTimer: Timer?
     private var lastHeartbeatSent: Date?
     private var lastRTTms: Double = 0
@@ -180,20 +186,93 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
     // MARK: - Clipboard sync
 
     @MainActor
-    func receiveDrop(from pasteboard: NSPasteboard) -> Bool {
-        guard isConnected, remoteSupportsDrops, clipboardEngine?.receiveDrop(from: pasteboard) == true else {
+    func receiveDrop(from pasteboard: NSPasteboard, at point: ClipboardDropPoint? = nil) -> Bool {
+        let hasFiles = pasteboard.canReadObject(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true])
+        if hasFiles && (!remoteSupportsTargetedDrops || point == nil) {
+            dropStatus = "Update both Macs to drop files at their remote destination."
+            return false
+        }
+        guard isConnected, remoteSupportsDrops,
+              clipboardEngine?.receiveDrop(from: pasteboard, at: point) == true else {
             let alert = NSAlert()
             alert.messageText = "LocalCast could not accept this drop"
             alert.informativeText = "Both Macs need a version supporting LocalCast drops. Connect with a password and enable clipboard sync on both Macs. Drop regular files, text or images within the clipboard transfer limit; folders are not supported."
             alert.runModal()
             return false
         }
-        dropStatus = "Drop offered — paste on the host after transfer"
+        if !hasFiles { dropStatus = "Clipboard content offered — press Paste after it reaches the host." }
         return true
+    }
+
+    /// The viewer consumes Cmd-V and asks the host to paste only after the
+    /// content arrives. Sending an independent key event races clipboard sync.
+    @MainActor
+    func sendPaste(modifiers: UInt64) {
+        guard isConnected, inputCaptureEnabled else { return }
+        guard Self.clipboardTransportReady(
+            requiresAuthentication: !(password?.isEmpty ?? true),
+            hasSessionKey: transport.sessionKey != nil,
+            isAuthenticating: isAuthenticating, isRecovering: reauthInProgress
+        ) else {
+            dropStatus = "Paste is unavailable while LocalCast reconnects."
+            return
+        }
+        if Self.shouldPasteExistingRemoteClipboard(
+            remoteCopyChangeCount: remoteCopyChangeCount,
+            currentChangeCount: NSPasteboard.general.changeCount,
+            clipboardFromPeer: clipboardEngine?.isCurrentClipboardFromPeer == true
+        ) {
+            // Cmd-C/X was forwarded to the host, but its copy may not have
+            // reached our polling clipboard channel yet. Preserve that copy.
+            sendInput(.keyDown(keyCode: 9, modifiers: modifiers))
+            sendInput(.keyUp(keyCode: 9, modifiers: modifiers))
+            return
+        }
+        remoteCopyChangeCount = nil
+        guard remoteSupportsPaste else {
+            dropStatus = "Update the host to support synchronized Paste in LocalCast."
+            return
+        }
+        guard remoteAccessibilityGranted != false else {
+            dropStatus = "Enable Accessibility for TidalDrift on the host to paste."
+            return
+        }
+        guard clipboardEngine?.sendPaste(modifiers: modifiers) == true else {
+            dropStatus = "Paste was not sent. Enable Clipboard Sync and copy supported text, an image, or regular files; files and large copies require a password."
+            return
+        }
+    }
+
+    static func shouldPasteExistingRemoteClipboard(remoteCopyChangeCount: Int?, currentChangeCount: Int,
+                                                   clipboardFromPeer: Bool) -> Bool {
+        (remoteCopyChangeCount != nil && remoteCopyChangeCount == currentChangeCount) || clipboardFromPeer
+    }
+
+    /// Password sessions never downgrade clipboard packets to plaintext while
+    /// recovery replaces their key. Keyless sessions remain an explicit option.
+    static func clipboardTransportReady(requiresAuthentication: Bool, hasSessionKey: Bool,
+                                        isAuthenticating: Bool, isRecovering: Bool) -> Bool {
+        !isAuthenticating && !isRecovering && (!requiresAuthentication || hasSessionKey)
+    }
+
+    @MainActor
+    func handleClipboardActionResult(_ result: ClipboardActionResult) {
+        clipboardEngine?.handleActionResult(result)
+    }
+
+    @MainActor
+    func noteRemoteCopy() {
+        guard isConnected, Self.clipboardTransportReady(
+            requiresAuthentication: !(password?.isEmpty ?? true),
+            hasSessionKey: transport.sessionKey != nil,
+            isAuthenticating: isAuthenticating, isRecovering: reauthInProgress
+        ) else { return }
+        remoteCopyChangeCount = NSPasteboard.general.changeCount
     }
 
     /// Created and driven on the main actor once the session is post-auth.
     private var clipboardEngine: ClipboardSyncEngine?
+    private var remoteCopyChangeCount: Int?
     private let clipboardBulk = ClipboardBulkClient()
     /// The host resolves this address for the UDP session; the bulk channel
     /// connects to the same address on the clipboard port.
@@ -221,41 +300,32 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         }
     }
 
+    @MainActor
     func connect(password: String? = nil) async throws {
+        candidateRefreshTask?.cancel()
+        candidateRefreshTask = nil
+        candidateRefreshState.invalidate()
+        let generation = candidateRefreshState.generation
         self.password = password
         connectionStartTime = Date()
 
         logger.info("Connecting to LocalCast host '\(self.device.name)'...")
-        await MainActor.run {
-            self.connectionPhase = .resolving
-            self.connectionStatus = "Resolving \(self.device.name)..."
-        }
+        connectionPhase = .resolving
+        connectionStatus = "Resolving \(device.name)..."
 
-        // Use ConnectionResolver with the ipFirst strategy + short timeout
-        // (matches the fix in main for the VNC path, c8d9a7f). The previous
-        // hostnameFirst / 8-second config ran three sequential getaddrinfo
-        // calls on .local hostnames, which block the full timeout on
-        // congested LANs or VPNs — the number one reason LocalCast connects
-        // appeared to "hang forever" before any packets flowed.
-        let resolvedAddress: String
-        do {
-            let resolved = try await ConnectionResolver.shared.resolve(
-                device: device,
-                strategy: .ipFirst,
-                timeout: 5.0
-            )
-            resolvedAddress = resolved.address
-            logger.info("LocalCast: Resolved to \(resolved.address) via \(resolved.method.rawValue)")
-        } catch {
-            // Fall back to cached IP if resolution fails
-            resolvedAddress = self.device.ipAddress
-            logger.warning("LocalCast: Resolution failed, using cached IP: \(self.device.ipAddress)")
+        // UDP readiness does not prove reachability. Try candidates through the
+        // actual stream handshake, without requiring Screen Sharing to be on.
+        let initialCandidates = await ConnectionResolver.shared.connectionCandidates(for: device)
+        try Task.checkCancellation()
+        guard candidateRefreshState.generation == generation else { throw CancellationError() }
+        connectionCandidates = initialCandidates
+        guard let resolvedAddress = connectionCandidates.first else {
+            throw ConnectionResolver.ResolutionError.invalidDevice
         }
+        connectionCandidateIndex = 0
 
-        await MainActor.run {
-            self.connectionPhase = .connecting
-            self.connectionStatus = "Connecting to \(self.device.name)..."
-        }
+        connectionPhase = .connecting
+        connectionStatus = "Connecting to \(device.name)..."
 
         // Store the host endpoint with resolved address (port from config so it can be changed if blocked)
         let port = NWEndpoint.Port(rawValue: LocalCastConfiguration.hostPort)!
@@ -270,11 +340,9 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
 
         if let password = password, !password.isEmpty {
             // Auth required — start the handshake instead of heartbeat
-            await MainActor.run {
-                self.isAuthenticating = true
-                self.connectionPhase = .authenticating
-                self.connectionStatus = "Authenticating..."
-            }
+            isAuthenticating = true
+            connectionPhase = .authenticating
+            connectionStatus = "Authenticating..."
             sendAuthRequest()
         } else {
             // No auth — go straight to heartbeat + keyframes
@@ -283,7 +351,8 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
 
         // Start diagnostic timer to detect connection issues
         DispatchQueue.main.async { [weak self] in
-            self?.startDiagnosticTimer()
+            guard let self, self.candidateRefreshState.generation == generation else { return }
+            self.startDiagnosticTimer()
         }
     }
 
@@ -352,6 +421,10 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             guard let self = self else { return }
             guard let startTime = self.connectionStartTime else { return }
             let elapsed = Date().timeIntervalSince(startTime)
+            if elapsed >= 2, elapsed < Self.maxDiagnosticDuration {
+                self.tryNextNetworkAddress()
+                self.refreshNetworkCandidatesIfNeeded(elapsed: elapsed)
+            }
 
             switch Self.diagnosticAction(
                 elapsed: elapsed,
@@ -362,6 +435,9 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             case .stop:
                 self.diagnosticTimer?.invalidate()
                 self.diagnosticTimer = nil
+                self.candidateRefreshTask?.cancel()
+                self.candidateRefreshTask = nil
+                self.candidateRefreshState.invalidate()
             case .wait:
                 break
             case .retryConnection(let phase):
@@ -380,6 +456,87 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
                 self.requestKeyFrame()
             }
         }
+    }
+
+    /// Move only while the handshake has had no answer. Never abandon an
+    /// authenticated session or misinterpret a password failure as a route failure.
+    private func tryNextNetworkAddress() {
+        guard connectionCandidates.count > 1, isAwaitingInitialHostResponse else { return }
+        connectionCandidateIndex = (connectionCandidateIndex + 1) % connectionCandidates.count
+        let address = connectionCandidates[connectionCandidateIndex]
+        transport.stopListening()
+        hostEndpoint = .hostPort(host: .init(address), port: .init(rawValue: LocalCastConfiguration.hostPort)!)
+        resolvedHostAddress = address
+        if isAuthenticating {
+            sendAuthRequest()
+        } else {
+            requestKeyFrame()
+        }
+    }
+
+    private var isAwaitingInitialHostResponse: Bool {
+        heartbeatsReceived == 0 && !authChallengeReceived && transport.sessionKey == nil
+            && !isConnected && authError == nil
+    }
+
+    /// A sleeping Mac may renew DHCP after the first half-second DNS lookup.
+    /// Refresh within the existing handshake deadline, then try newly learned
+    /// addresses before cycling through the stale adapters again.
+    private func refreshNetworkCandidatesIfNeeded(elapsed: TimeInterval) {
+        guard candidateRefreshTask == nil,
+              let generation = candidateRefreshState.beginRefresh(
+                elapsed: elapsed, hasHostResponse: !isAwaitingInitialHostResponse
+              ) else { return }
+        let target = device
+        candidateRefreshTask = Task { @MainActor [weak self] in
+            let refreshed = await ConnectionResolver.shared.connectionCandidates(for: target, timeout: 0.5)
+            guard let self, self.candidateRefreshState.generation == generation else { return }
+            self.candidateRefreshTask = nil
+            guard !Task.isCancelled, let start = self.connectionStartTime,
+                  self.candidateRefreshState.acceptsResult(
+                    generation: generation,
+                    elapsed: Date().timeIntervalSince(start),
+                    hasHostResponse: !self.isAwaitingInitialHostResponse
+                  ) else { return }
+            let candidates = Self.mergingConnectionCandidates(
+                existing: self.connectionCandidates, refreshed: refreshed,
+                currentAddress: self.resolvedHostAddress
+            )
+            guard candidates != self.connectionCandidates else { return }
+            self.connectionCandidates = candidates
+            self.connectionCandidateIndex = 0
+            self.tryNextNetworkAddress()
+        }
+    }
+
+    struct CandidateRefreshState {
+        private(set) var generation: UInt64 = 0
+        private var lastRefreshElapsed: TimeInterval = 0
+
+        mutating func invalidate() {
+            generation &+= 1
+            lastRefreshElapsed = 0
+        }
+
+        mutating func beginRefresh(elapsed: TimeInterval, hasHostResponse: Bool) -> UInt64? {
+            guard !hasHostResponse, elapsed >= lastRefreshElapsed + 8,
+                  elapsed < ClientSession.maxDiagnosticDuration else { return nil }
+            lastRefreshElapsed = elapsed
+            return generation
+        }
+
+        func acceptsResult(generation: UInt64, elapsed: TimeInterval, hasHostResponse: Bool) -> Bool {
+            self.generation == generation && !hasHostResponse
+                && elapsed >= 0 && elapsed < ClientSession.maxDiagnosticDuration
+        }
+    }
+
+    static func mergingConnectionCandidates(existing: [String], refreshed: [String], currentAddress: String?) -> [String] {
+        let known = Set(existing)
+        let additions = refreshed.filter { !known.contains($0) }
+        guard !additions.isEmpty else { return existing }
+        var seen = Set<String>()
+        return ([currentAddress].compactMap { $0 } + additions + existing).filter { seen.insert($0).inserted }
     }
 
     // MARK: - Auth Handshake (Client Side)
@@ -562,11 +719,16 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
     deinit {
         heartbeatTimer?.invalidate()
         diagnosticTimer?.invalidate()
+        candidateRefreshTask?.cancel()
         transport.stopListening()
         decoder.invalidate()
     }
 
     func disconnect() {
+        candidateRefreshTask?.cancel()
+        candidateRefreshTask = nil
+        candidateRefreshState.invalidate()
+        connectionStartTime = nil
         heartbeatTimer?.invalidate()
         heartbeatTimer = nil
         diagnosticTimer?.invalidate()
@@ -886,6 +1048,11 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
 
     @MainActor
     private func startClipboardSync() {
+        guard Self.clipboardTransportReady(
+            requiresAuthentication: !(password?.isEmpty ?? true),
+            hasSessionKey: transport.sessionKey != nil,
+            isAuthenticating: isAuthenticating, isRecovering: reauthInProgress
+        ) else { return }
         // A loopback session (viewing this same Mac) would have both roles
         // watching one pasteboard.
         if let host = resolvedHostAddress,
@@ -895,6 +1062,9 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
 
         let engine = clipboardEngine ?? ClipboardSyncEngine()
         clipboardEngine = engine
+        engine.actionStatusChanged = { [weak self] message in
+            self?.dropStatus = message
+        }
 
         engine.sendUpdate = { [weak self] payload in
             self?.sendClipboardUpdate(payload)
@@ -958,17 +1128,35 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
     }
 
     private func stopClipboardSync() {
-        clipboardBulk.cancelActive()
-        clipboardOutboundLock.lock()
-        clipboardOutbound = nil
-        clipboardOutboundLock.unlock()
-        DispatchQueue.main.async { [weak self] in
-            self?.clipboardEngine?.stop()
+        // Recovery clears the transport key immediately after this call. An
+        // asynchronous stop leaves the retry task able to send in that gap.
+        if Thread.isMainThread {
+            MainActor.assumeIsolated { stopClipboardSyncOnMain() }
+        } else {
+            DispatchQueue.main.sync { self.stopClipboardSyncOnMain() }
         }
     }
 
+    @MainActor
+    private func stopClipboardSyncOnMain() {
+        clipboardEngine?.stop()
+        remoteCopyChangeCount = nil
+        clipboardBulk.cancelActive()
+        clipboardOutboundLock.lock()
+        clipboardOutbound = nil
+        recentFetchTokens.removeAll()
+        clipboardOutboundLock.unlock()
+    }
+
+    @MainActor
     private func sendClipboardUpdate(_ payload: ClipboardUpdatePayload) {
-        guard let endpoint = hostEndpoint,
+        guard clipboardEngine?.isRunning == true,
+              Self.clipboardTransportReady(
+                requiresAuthentication: !(password?.isEmpty ?? true),
+                hasSessionKey: transport.sessionKey != nil,
+                isAuthenticating: isAuthenticating, isRecovering: reauthInProgress
+              ),
+              let endpoint = hostEndpoint,
               let encoded = try? JSONEncoder().encode(payload) else { return }
         let packet = LocalCastPacket(
             type: .clipboardUpdate,
@@ -1168,6 +1356,9 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         guard now.timeIntervalSince(lastReauthAttempt) >= Self.reauthMinInterval else { return }
         lastReauthAttempt = now
         reauthCycles += 1
+        // End this clipboard epoch before removing its key. Retried actions
+        // must not leak plaintext or run again against the restarted host.
+        stopClipboardSync()
 
         if reauthCycles > Self.maxReauthCycles {
             recoveryAbandoned = true
@@ -1276,6 +1467,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
     // MARK: - UDPTransportDelegate
 
     func udpTransport(_ transport: UDPTransport, didReceivePacket packet: LocalCastPacket, wasAuthenticated: Bool, from endpoint: NWEndpoint) {
+        guard endpoint == hostEndpoint else { return }
         // Once the session key is established, only packets decrypted under it
         // are trusted. Sessions without a key (auth disabled) legitimately run
         // in plaintext and are unaffected.
@@ -1301,6 +1493,9 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
                         guard let self else { return }
                         self.isConnected = true
                         self.hasBeenConnected = true
+                        if let address = self.resolvedHostAddress {
+                            NetworkDiscoveryService.shared.recordConnection(to: self.device, address: address)
+                        }
                         self.clearRecoveryState()
                         self.connectionPhase = .streaming
                         self.connectionStatus = "Streaming"
@@ -1336,46 +1531,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             }
 
         case .heartbeat:
-            let capabilities = packet.payload.count >= 2 ? packet.payload[packet.payload.startIndex + 1] : nil
-            DispatchQueue.main.async { [weak self] in
-                self?.remoteAccessibilityGranted = capabilities.map { $0 & 0x01 != 0 }
-                self?.remoteSupportsDrops = capabilities.map { $0 & 0x02 != 0 } ?? false
-            }
-            // Pong received - record round-trip latency for the HUD.
-            recordHeartbeatResponse(Date())
-            if let flags = packet.payload.first {
-                // Current hosts echo the ping's own send timestamp, so the RTT
-                // is measured against the exact packet that came back rather
-                // than whichever ping happened to go out last.
-                let sentAt = packet.timestamp - kCFAbsoluteTimeIntervalSince1970
-                let rtt = (CFAbsoluteTimeGetCurrent() - sentAt) * 1000
-                if rtt >= 0, rtt < 10_000 { lastRTTms = rtt }
-                let hostFastLAN = flags & HostSession.pongFlagFastLAN != 0
-                if hostFastLAN != transport.isFastLAN {
-                    transport.setFastLAN(hostFastLAN, jumbo: false)
-                    logger.info("⚡️ Host Fast LAN \(hostFastLAN ? "on" : "off"); widened reassembly window to match")
-                }
-            } else if let sent = lastHeartbeatSent {
-                lastRTTms = Date().timeIntervalSince(sent) * 1000
-            }
-            heartbeatsReceived += 1
-            if !isConnected {
-                DispatchQueue.main.async { [weak self] in
-                    guard let self else { return }
-                    // While a stage-2 re-auth is underway, keep showing
-                    // "Reconnecting...": a bare plaintext pong from a restarted
-                    // host that is still in .waitingForAuth is not progress and
-                    // must not be mistaken for it.
-                    guard !self.reauthInProgress else { return }
-                    if self.connectionPhase == .connecting
-                        || self.connectionPhase == .firewallBlocked
-                        || self.connectionPhase == .reconnecting {
-                        self.connectionPhase = .waitingForVideo
-                        self.connectionStatus = ConnectionPhase.waitingForVideo.rawValue
-                        self.logger.info("✅ Heartbeat response received, UDP path is open, waiting for video")
-                    }
-                }
-            }
+            handleHeartbeat(packet)
 
         case .stats:
             // Update UI stats from host
@@ -1404,12 +1560,65 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
                 self?.clipboardEngine?.handleRemoteUpdate(payload)
             }
 
+        case .clipboardActionResult:
+            guard packet.payload.count <= LocalCastConfiguration.clipboardInlinePacketCap,
+                  let result = try? JSONDecoder().decode(ClipboardActionResult.self, from: packet.payload) else { return }
+            DispatchQueue.main.async { [weak self] in
+                self?.handleClipboardActionResult(result)
+            }
+
         case .clipboardFetchRequest:
             guard packet.payload.count == 32 else { return }
             handleClipboardFetchRequest(token: packet.payload)
 
         default:
             lcDebug("❓ ClientSession: Received unknown packet type: \(packet.type)")
+        }
+    }
+
+    /// Apply host capabilities and liveness without mixing them with media decoding.
+    private func handleHeartbeat(_ packet: LocalCastPacket) {
+        let capabilities = packet.payload.count >= 2 ? packet.payload[packet.payload.startIndex + 1] : nil
+        DispatchQueue.main.async { [weak self] in
+            self?.remoteAccessibilityGranted = capabilities.map { $0 & 0x01 != 0 }
+            self?.remoteSupportsDrops = capabilities.map { $0 & 0x02 != 0 } ?? false
+            self?.remoteSupportsPaste = capabilities.map { $0 & 0x04 != 0 } ?? false
+            self?.remoteSupportsTargetedDrops = capabilities.map { $0 & 0x08 != 0 } ?? false
+        }
+        // Pong received - record round-trip latency for the HUD.
+        recordHeartbeatResponse(Date())
+        if let flags = packet.payload.first {
+            // Current hosts echo the ping's own send timestamp, so the RTT
+            // is measured against the exact packet that came back rather
+            // than whichever ping happened to go out last.
+            let sentAt = packet.timestamp - kCFAbsoluteTimeIntervalSince1970
+            let rtt = (CFAbsoluteTimeGetCurrent() - sentAt) * 1000
+            if rtt >= 0, rtt < 10_000 { lastRTTms = rtt }
+            let hostFastLAN = flags & HostSession.pongFlagFastLAN != 0
+            if hostFastLAN != transport.isFastLAN {
+                transport.setFastLAN(hostFastLAN, jumbo: false)
+                logger.info("⚡️ Host Fast LAN \(hostFastLAN ? "on" : "off"); widened reassembly window to match")
+            }
+        } else if let sent = lastHeartbeatSent {
+            lastRTTms = Date().timeIntervalSince(sent) * 1000
+        }
+        heartbeatsReceived += 1
+        if !isConnected {
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                // While a stage-2 re-auth is underway, keep showing
+                // "Reconnecting...": a bare plaintext pong from a restarted
+                // host that is still in .waitingForAuth is not progress and
+                // must not be mistaken for it.
+                guard !self.reauthInProgress else { return }
+                if self.connectionPhase == .connecting
+                    || self.connectionPhase == .firewallBlocked
+                    || self.connectionPhase == .reconnecting {
+                    self.connectionPhase = .waitingForVideo
+                    self.connectionStatus = ConnectionPhase.waitingForVideo.rawValue
+                    self.logger.info("✅ Heartbeat response received, UDP path is open, waiting for video")
+                }
+            }
         }
     }
 

@@ -553,7 +553,6 @@ struct MenuBarDeviceRow: View {
                         QuickActionIcon(icon: "display", color: .blue, tooltip: "Screen Share (VNC)") {
                             (NSApp.delegate as? AppDelegate)?.runAfterMenuDismissed {
                                 Task {
-                                    await WakeOnLANService.shared.prepareForConnection(to: device, service: .screenSharing)
                                     try? await ScreenShareConnectionService.shared.connect(to: device)
                                 }
                             }

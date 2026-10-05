@@ -80,47 +80,49 @@ struct NetworkUtils {
     }
     
     static func getLocalIPAddress() -> String? {
-        var address: String?
-        var ifaddr: UnsafeMutablePointer<ifaddrs>?
-        
-        guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else {
-            return nil
-        }
-        
-        defer { freeifaddrs(ifaddr) }
-        
-        var ptr = firstAddr
-        while true {
-            let interface = ptr.pointee
-            let addrFamily = interface.ifa_addr.pointee.sa_family
-            
-            if addrFamily == UInt8(AF_INET) {
-                let name = String(cString: interface.ifa_name)
-                // Skip loopback
-                if name != "lo0" {
-                    var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-                    getnameinfo(interface.ifa_addr, socklen_t(interface.ifa_addr.pointee.sa_len),
-                               &hostname, socklen_t(hostname.count),
-                               nil, socklen_t(0), NI_NUMERICHOST)
-                    let ip = String(cString: hostname)
-                    
-                    // Prefer en0 (Wi-Fi) but accept any valid local IP
-                    if name == "en0" {
-                        return ip
-                    }
-                    if address == nil {
-                        address = ip
-                    }
-                }
-            }
-            
-            guard let next = interface.ifa_next else { break }
-            ptr = next
-        }
-        
-        return address
+        localNetworkAddresses().first?.address
     }
-    
+
+    /// Active IPv4 adapters, with their actual SystemConfiguration media type.
+    /// Excludes loopback and inactive interfaces; preserves VPN routes as fallback.
+    static func localNetworkAddresses() -> [DeviceNetworkAddress] {
+        var kinds: [String: DeviceNetworkAddress.Kind] = [:]
+        if let interfaces = SCNetworkInterfaceCopyAll() as? [SCNetworkInterface] {
+            for interface in interfaces {
+                guard let name = SCNetworkInterfaceGetBSDName(interface) as String? else { continue }
+                let type = SCNetworkInterfaceGetInterfaceType(interface)
+                kinds[name] = type == kSCNetworkInterfaceTypeIEEE80211 ? .wifi :
+                    (type == kSCNetworkInterfaceTypeEthernet ? .ethernet : .other)
+            }
+        }
+        var first: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&first) == 0 else { return [] }
+        defer { freeifaddrs(first) }
+        var result: [DeviceNetworkAddress] = []
+        var current = first
+        while let pointer = current {
+            defer { current = pointer.pointee.ifa_next }
+            let interface = pointer.pointee
+            guard let address = interface.ifa_addr,
+                  address.pointee.sa_family == UInt8(AF_INET),
+                  interface.ifa_flags & UInt32(IFF_UP) != 0,
+                  interface.ifa_flags & UInt32(IFF_RUNNING) != 0,
+                  interface.ifa_flags & UInt32(IFF_LOOPBACK) == 0 else { continue }
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            guard getnameinfo(address, socklen_t(address.pointee.sa_len), &host,
+                              socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0 else { continue }
+            let ip = String(cString: host)
+            guard ip != "0.0.0.0" else { continue }
+            let kind = kinds[String(cString: interface.ifa_name)] ?? .other
+            result.append(DeviceNetworkAddress(address: ip, kind: kind))
+        }
+        let priority: [DeviceNetworkAddress.Kind: Int] = [.ethernet: 0, .wifi: 1, .other: 2]
+        return result.sorted {
+            if $0.kind != $1.kind { return priority[$0.kind]! < priority[$1.kind]! }
+            return $0.address < $1.address
+        }
+    }
+
     static func getAllIPAddresses() -> [String: String] {
         var addresses: [String: String] = [:]
         var ifaddr: UnsafeMutablePointer<ifaddrs>?

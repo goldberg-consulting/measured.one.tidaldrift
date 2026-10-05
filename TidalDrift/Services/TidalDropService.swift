@@ -78,7 +78,7 @@ class TidalDropService: ObservableObject {
             copyToMountedShare(file: url, destination: mountedPath, device: device)
         } else {
             print("🌊 TidalDrop: No mounted share, using peer-to-peer")
-            sendFile(at: url, to: device.ipAddress)
+            sendFile(at: url, to: device)
         }
     }
     
@@ -101,11 +101,11 @@ class TidalDropService: ObservableObject {
                     self.notifyCompletion(fileName: fileName, isIncoming: false, viaMountedShare: true)
                 } catch {
                     print("TidalDrop: Mounted share write failed, using peer-to-peer: \(error)")
-                    self.sendFileWithData(fileName: fileName, fileData: fileData, to: device.ipAddress)
+                    self.sendFileWithData(fileName: fileName, fileData: fileData, to: device)
                 }
             }
         } else {
-            sendFileWithData(fileName: fileName, fileData: fileData, to: device.ipAddress)
+            sendFileWithData(fileName: fileName, fileData: fileData, to: device)
         }
     }
     
@@ -204,7 +204,7 @@ class TidalDropService: ObservableObject {
             if didStartAccess { file.stopAccessingSecurityScopedResource() }
             
             // Fallback to peer-to-peer
-            sendFile(at: file, to: device.ipAddress)
+            sendFile(at: file, to: device)
             return
         }
         
@@ -212,7 +212,7 @@ class TidalDropService: ObservableObject {
         guard let fileData = try? Data(contentsOf: file) else {
             print("❌ TidalDrop: Cannot read source file, falling back to peer-to-peer")
             if didStartAccess { file.stopAccessingSecurityScopedResource() }
-            sendFile(at: file, to: device.ipAddress)
+            sendFile(at: file, to: device)
             return
         }
         
@@ -276,7 +276,7 @@ class TidalDropService: ObservableObject {
                     }
                     
                     // Try peer-to-peer as fallback
-                    self.sendFileWithData(fileName: fileName, fileData: fileData, to: device.ipAddress)
+                    self.sendFileWithData(fileName: fileName, fileData: fileData, to: device)
                 } else {
                     DispatchQueue.main.async {
                         self.activeTransfers[transferId]?.status = .failed("Copy failed: \(error.localizedDescription)")
@@ -287,6 +287,39 @@ class TidalDropService: ObservableObject {
     }
     
     /// Send file using pre-loaded data (used as fallback)
+    private func sendFile(at url: URL, to device: DiscoveredDevice) {
+        resolveTransferAddress(for: device, fileName: url.lastPathComponent, fileSize: 0) { address in
+            self.sendFile(at: url, to: address)
+        }
+    }
+
+    private func sendFileWithData(fileName: String, fileData: Data, to device: DiscoveredDevice) {
+        resolveTransferAddress(for: device, fileName: fileName, fileSize: Int64(fileData.count)) { address in
+            self.sendFileWithData(fileName: fileName, fileData: fileData, to: address)
+        }
+    }
+
+    private func resolveTransferAddress(
+        for device: DiscoveredDevice, fileName: String, fileSize: Int64,
+        send: @escaping (String) -> Void
+    ) {
+        Task { @MainActor in
+            var target = device
+            target.port = 5902
+            do {
+                let resolved = try await ConnectionResolver.shared.resolve(device: target, strategy: .ipFirst, timeout: 5)
+                NetworkDiscoveryService.shared.recordConnection(to: device, address: resolved.address)
+                send(resolved.address)
+            } catch {
+                let id = UUID()
+                activeTransfers[id] = DropTransfer(
+                    id: id, fileName: fileName, fileSize: fileSize, progress: 0,
+                    isIncoming: false, status: .failed(error.localizedDescription), remoteEndpoint: device.ipAddress
+                )
+            }
+        }
+    }
+
     private func sendFileWithData(fileName: String, fileData: Data, to ipAddress: String) {
         print("🌊 TidalDrop: Peer-to-peer fallback for \(fileName)")
         

@@ -26,6 +26,7 @@ struct LocalCastPacket {
         case disconnect = 21          // Client notifies host it is leaving so the host can re-arm auth
         case clipboardUpdate = 22     // Either side announces a clipboard change (inline content or bulk offer)
         case clipboardFetchRequest = 23 // Host asks the client to connect and push offered clipboard content (payload: offer token)
+        case clipboardActionResult = 24 // Completion/failure of an explicit paste or targeted file drop
     }
     
     static let headerSize = 13 // 1 (type) + 4 (seq) + 8 (timestamp)

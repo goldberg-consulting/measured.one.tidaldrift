@@ -1646,7 +1646,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         let flags: UInt8 = _fastLANActive ? Self.pongFlagFastLAN : 0
         profileLock.unlock()
         let inputPermission: UInt8 = inputInjector.hasAccessibilityPermission ? 0x01 : 0
-        let capabilities: UInt8 = inputPermission | 0x02
+        let capabilities: UInt8 = inputPermission | 0x02 | 0x04 | 0x08
         let pong = LocalCastPacket(
             type: .heartbeat,
             sequenceNumber: ping.sequenceNumber,

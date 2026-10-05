@@ -3,52 +3,6 @@ import Network
 import Combine
 import OSLog
 
-private func runDnsSdLookup(name: String, type: String, domain: String, timeout: TimeInterval, maxLines: Int, logger: Logger) -> String {
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/usr/bin/dns-sd")
-    process.arguments = ["-L", name, type, domain]
-    let pipe = Pipe()
-    process.standardOutput = pipe
-    process.standardError = pipe
-    let outputLock = NSLock()
-    var outputData = Data()
-    let finished = DispatchSemaphore(value: 0)
-    pipe.fileHandleForReading.readabilityHandler = { handle in
-        let data = handle.availableData
-        if data.isEmpty { handle.readabilityHandler = nil; return }
-        outputLock.lock()
-        outputData.append(data)
-        outputLock.unlock()
-    }
-    process.terminationHandler = { _ in
-        finished.signal()
-    }
-    do {
-        try process.run()
-    } catch {
-        logger.warning("dns-sd -L failed to start for \(name): \(error.localizedDescription)")
-        return ""
-    }
-    if finished.wait(timeout: .now() + timeout) == .timedOut {
-        process.terminate()
-        if finished.wait(timeout: .now() + 0.5) == .timedOut {
-            kill(process.processIdentifier, SIGKILL)
-            _ = finished.wait(timeout: .now() + 0.5)
-        }
-    }
-    pipe.fileHandleForReading.readabilityHandler = nil
-    let remaining = pipe.fileHandleForReading.availableData
-    outputLock.lock()
-    outputData.append(remaining)
-    let data = outputData
-    outputLock.unlock()
-    let output = String(data: data, encoding: .utf8) ?? ""
-    return output
-        .split(separator: "\n")
-        .prefix(maxLines)
-        .joined(separator: "\n")
-}
-
 class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDelegate, NetServiceDelegate {
     private let logger = Logger(subsystem: "com.tidaldrift", category: "Discovery")
     static let shared = NetworkDiscoveryService()
@@ -1184,7 +1138,7 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
     }
 
     private func cacheKey(matchingIP ipAddress: String) -> String? {
-        deviceCache.first { $0.value.ipAddress == ipAddress }?.key
+        deviceCache.first { $0.value.connectionAddresses.contains(ipAddress) }?.key
     }
 
     private func resolveHostnameToIP(_ hostname: String, completion: @escaping (String?) -> Void) {
@@ -1311,6 +1265,8 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         let existingKey = deviceCache[newCacheKey] != nil ? newCacheKey : cacheKey(matchingIP: ipAddress)
         if let existingKey, var existingDevice = deviceCache[existingKey] {
             existingDevice.lastSeen = Date()
+            existingDevice.rememberAddress(existingDevice.ipAddress)
+            existingDevice.rememberAddress(ipAddress)
             existingDevice.ipAddress = ipAddress
             existingDevice.port = Self.screenSharingPort(existing: existingDevice.port, incoming: port, service: service)
             if let service = service {
@@ -1440,7 +1396,12 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             let pid = DiscoveredDevice.normalizedIdentityComponent(device.peerId)
             let host = DiscoveredDevice.normalizedHostname(device.hostname)
             let idx = groups.firstIndex { group in
-                group.contains { other in
+                // A shared hostname must not bridge two distinct peer IDs.
+                if let pid, group.contains(where: {
+                    guard let otherID = DiscoveredDevice.normalizedIdentityComponent($0.peerId) else { return false }
+                    return otherID != pid
+                }) { return false }
+                return group.contains { other in
                     if let pid, let op = DiscoveredDevice.normalizedIdentityComponent(other.peerId), pid == op {
                         return true
                     }
@@ -1478,7 +1439,10 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         }
 
         var base = sorted[0]
+        base.rememberAddress(base.ipAddress)
         for other in sorted.dropFirst() {
+            for address in other.connectionAddresses { base.rememberAddress(address) }
+            if base.lastConnectedAddress == nil { base.lastConnectedAddress = other.lastConnectedAddress }
             base.services.formUnion(other.services)
             base.isTidalDriftPeer = base.isTidalDriftPeer || other.isTidalDriftPeer
             base.isTrusted = base.isTrusted || other.isTrusted
@@ -1558,8 +1522,9 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
                     let dName = device.name.lowercased()
                     let dHost = device.hostname.lowercased().replacingOccurrences(of: ".local", with: "")
 
-                    if dName == inputHostname || dHost == inputHostname ||
-                       dName.contains(inputHostname) || inputHostname.contains(dName) {
+                    if let inputPeerId, let existingPeerId = device.peerId,
+                       inputPeerId != existingPeerId { continue }
+                    if dName == inputHostname || dHost == inputHostname {
                         matchedIP = ip
                         break
                     }
@@ -1580,9 +1545,18 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
                 device.peerTidalDriftName = peerInfo.tidalDriftName
                 device.peerId = peerInfo.peerId
 
+                device.lastSeen = Date()
+                if let host = peerInfo.resolvedHostname { device.hostname = host }
+                if let addresses = peerInfo.networkAddresses {
+                    device.networkAddresses = addresses
+                } else {
+                    device.rememberAddress(device.ipAddress)
+                    device.rememberAddress(inputIP)
+                }
+
                 // Keep the most accurate IP
                 if !inputIP.isEmpty && inputIP != "Unknown" {
-                    device.ipAddress = inputIP
+                    device.ipAddress = peerInfo.networkAddresses?.first?.address ?? inputIP
                 }
 
                 let updatedKey = self.cacheKey(for: device)
@@ -1595,7 +1569,7 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
             } else {
                 // Create a new device entry for this TidalDrift peer
                 let displayName = hostname.replacingOccurrences(of: ".local", with: "")
-                let newDevice = DiscoveredDevice(
+                var newDevice = DiscoveredDevice(
                     name: displayName,
                     hostname: hostname.hasSuffix(".local") ? hostname : "\(hostname).local",
                     ipAddress: peerInfo.ipAddress.isEmpty || peerInfo.ipAddress == "Unknown" ? "Resolving..." : peerInfo.ipAddress,
@@ -1613,12 +1587,30 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
                     peerTidalDriftName: peerInfo.tidalDriftName,
                     peerId: peerInfo.peerId
                 )
+                newDevice.networkAddresses = peerInfo.networkAddresses
+                if let host = peerInfo.resolvedHostname { newDevice.hostname = host }
+                newDevice.ipAddress = peerInfo.networkAddresses?.first?.address ?? newDevice.ipAddress
                 self.deviceCache[self.cacheKey(for: newDevice)] = newDevice
                 self.deviceCacheLock.unlock()
                 print("🌊 TidalDrift PEER: ✅ Created new device entry for peer '\(displayName)'")
             }
             self.updatePublishedDevices()
         }
+    }
+
+    /// Record a verified route on the existing card without changing its identity.
+    @MainActor
+    func recordConnection(to device: DiscoveredDevice, address: String) {
+        deviceCacheLock.lock()
+        let key = cacheKey(for: device)
+        if var current = deviceCache[key] {
+            current.rememberAddress(address)
+            current.ipAddress = address
+            current.lastConnectedAddress = address
+            deviceCache[key] = current
+        }
+        deviceCacheLock.unlock()
+        updatePublishedDevices()
     }
 
     // MARK: - Active IP Scanning (for VPNs and when Bonjour fails)

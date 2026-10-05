@@ -26,6 +26,29 @@ struct ClipboardUpdatePayload: Codable {
     /// Explicit drop: download files immediately instead of waiting for Paste.
     /// Optional for compatibility with older peers.
     var eagerFiles: Bool? = nil
+    /// Explicit paste is performed only after these representations are ready.
+    var pasteModifiers: UInt64? = nil
+    /// A file drop's location in the streamed image, with a top-left origin.
+    var dropPoint: ClipboardDropPoint? = nil
+    /// Ordering is scoped to this sender's engine lifetime. Older peers omit
+    /// both fields; retries retain the original revision and update ID.
+    var senderID: UUID? = nil
+    var revision: UInt64? = nil
+
+    var isAction: Bool { pasteModifiers != nil || dropPoint != nil }
+}
+
+struct ClipboardDropPoint: Codable, Equatable {
+    let x: Double
+    let y: Double
+
+    var isValid: Bool { x.isFinite && y.isFinite && (0...1).contains(x) && (0...1).contains(y) }
+}
+
+struct ClipboardActionResult: Codable {
+    let updateId: UUID
+    let success: Bool
+    let message: String
 }
 
 /// Announces content too large for the inline path. The receiver fetches it
@@ -96,16 +119,17 @@ enum ClipboardPasteboard {
             forClasses: [NSURL.self],
             options: [.urlReadingFileURLsOnly: true]
         ) as? [URL], !urls.isEmpty {
-            // Regular files only in v1; directories are skipped.
-            let regular = urls.filter { url in
-                (try? url.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true
-            }
-            if !regular.isEmpty {
-                return ClipboardSnapshot(
-                    kind: .files, text: nil, rtf: nil, png: nil,
-                    fileURLs: regular, digest: filesDigest(regular)
-                )
-            }
+            // Treat a file selection as a unit. Sending only its regular files,
+            // or falling through to Finder's filename text for a folder, makes
+            // an explicit Paste silently insert the wrong content.
+            guard urls.allSatisfy({ url in
+                guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]) else { return false }
+                return values.isRegularFile == true && values.isSymbolicLink != true
+            }) else { return nil }
+            return ClipboardSnapshot(
+                kind: .files, text: nil, rtf: nil, png: nil,
+                fileURLs: urls, digest: filesDigest(urls)
+            )
         }
 
         if let png = pasteboard.data(forType: .png) ?? pngFromTIFF(pasteboard.data(forType: .tiff)) {
