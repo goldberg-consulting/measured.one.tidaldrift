@@ -107,4 +107,81 @@ final class NetworkHandoffTests: XCTestCase {
         let many = (1...100).map { DeviceNetworkAddress(address: "192.0.2.\($0)", kind: .ethernet) }
         XCTAssertLessThanOrEqual(DeviceNetworkAddress.txtValue(many).utf8.count + "addrs=".utf8.count, 255)
     }
+
+    func test_reusedHistoricalAddressDoesNotInheritAnotherPeersIdentity() {
+        var original = device()
+        original.ipAddress = "192.0.2.20"
+        original.rememberAddress("192.0.2.10")
+        original.isTrusted = true
+        original.savedCredentialRef = "office-credentials"
+        let cache = [original.discoveryKey: original]
+        for service in [DiscoveredDevice.ServiceType.screenSharing, .localCast] {
+            let replacement = DiscoveredDevice(
+                name: "Different Mac", hostname: "different.local", ipAddress: "192.0.2.10", services: [service]
+            )
+            XCTAssertNil(DiscoveryIdentityMatcher.matchingKey(in: cache, for: replacement),
+                         "A historical route must not transfer peer ID, trust, or credentials to a new computer")
+        }
+        let replacementPeer = DiscoveredDevice(
+            name: "Different Mac", hostname: "different.local", ipAddress: "192.0.2.10", peerId: "different-peer"
+        )
+        XCTAssertNil(DiscoveryIdentityMatcher.matchingKey(in: cache, for: replacementPeer))
+    }
+
+    func test_conflictingPeerIDsCannotMergeEvenWithSameCurrentAddressAndHostname() {
+        let original = device()
+        var replacement = original
+        replacement.peerId = "different-peer"
+        XCTAssertNil(DiscoveryIdentityMatcher.matchingKey(in: [original.discoveryKey: original], for: replacement))
+    }
+
+    func test_differentlyNamedComputerCannotClaimCurrentAddressOfKnownPeer() {
+        let original = device()
+        let replacement = DiscoveredDevice(
+            name: "Different Mac", hostname: "different.local", ipAddress: original.ipAddress
+        )
+        XCTAssertNil(DiscoveryIdentityMatcher.matchingKey(in: [original.discoveryKey: original], for: replacement))
+    }
+
+    func test_sameDisplayNameCannotOverrideConflictingHostnamesAtReusedCurrentAddress() {
+        var original = device()
+        original.isTrusted = true
+        original.savedCredentialRef = "office-credentials"
+        let replacement = DiscoveredDevice(
+            name: original.name, hostname: "different.local", ipAddress: original.ipAddress
+        )
+        XCTAssertNil(DiscoveryIdentityMatcher.matchingKey(in: [original.discoveryKey: original], for: replacement),
+                     "A repeated display name must not override conflicting hostnames and inherit the old identity")
+    }
+
+    func test_samePeerStillMergesAcrossActiveAdaptersAndHostnameChanges() {
+        let original = device()
+        var updated = original
+        updated.name = "Renamed Office"
+        updated.hostname = "renamed-office.local"
+        updated.ipAddress = "192.0.2.30"
+        updated.networkAddresses = [.init(address: "192.0.2.30", kind: .ethernet)]
+        XCTAssertEqual(DiscoveryIdentityMatcher.matchingKey(in: [original.discoveryKey: original], for: updated),
+                       original.discoveryKey)
+        let serviceOnSecondaryAdapter = DiscoveredDevice(
+            name: original.name, hostname: original.hostname, ipAddress: "192.0.2.2", services: [.localCast]
+        )
+        XCTAssertEqual(DiscoveryIdentityMatcher.matchingKey(
+            in: [original.discoveryKey: original], for: serviceOnSecondaryAdapter
+        ), original.discoveryKey, "An exact hostname still joins the services of the same multi-adapter computer")
+    }
+
+    func test_onlyAnonymousUntrustedScanRecordsCanBeEnrichedByAddressAlone() {
+        var scan = DiscoveredDevice(name: "Mac at 192.0.2.10", hostname: "Unknown", ipAddress: "192.0.2.10")
+        let incoming = DiscoveredDevice(name: "Office", hostname: "office.local", ipAddress: scan.ipAddress)
+        XCTAssertEqual(DiscoveryIdentityMatcher.matchingKey(in: [scan.discoveryKey: scan], for: incoming), scan.discoveryKey)
+        scan.hostname = "Mac at 192.0.2.10.local"
+        XCTAssertEqual(DiscoveryIdentityMatcher.matchingKey(in: [scan.discoveryKey: scan], for: incoming), scan.discoveryKey,
+                       "The synthetic scan hostname must not prevent enriching an anonymous record")
+        scan.isTrusted = true
+        XCTAssertNil(DiscoveryIdentityMatcher.matchingKey(in: [scan.discoveryKey: scan], for: incoming))
+        scan.isTrusted = false
+        scan.savedCredentialRef = "saved-reference"
+        XCTAssertNil(DiscoveryIdentityMatcher.matchingKey(in: [scan.discoveryKey: scan], for: incoming))
+    }
 }

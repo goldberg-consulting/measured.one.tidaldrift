@@ -845,9 +845,18 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
 
     /// Add LocalCast service to a device by IP address
     private func addLocalCastToDevice(ipAddress: String, name: String, authRequired: Bool?) {
+        let incoming = DiscoveredDevice(
+            name: name.replacingOccurrences(of: "-", with: " "), hostname: "\(name).local",
+            ipAddress: ipAddress, services: [.localCast], localCastAuthRequired: authRequired
+        )
         deviceCacheLock.lock()
 
-        if let existingKey = cacheKey(matchingIP: ipAddress), var device = deviceCache[existingKey] {
+        if let existingKey = DiscoveryIdentityMatcher.matchingKey(in: deviceCache, for: incoming),
+           var device = deviceCache[existingKey] {
+            device.rememberAddress(device.ipAddress)
+            device.rememberAddress(ipAddress)
+            device.ipAddress = ipAddress
+            device.lastSeen = Date()
             if !device.services.contains(.localCast) {
                 device.services.insert(.localCast)
             }
@@ -1137,10 +1146,6 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         device.discoveryKey
     }
 
-    private func cacheKey(matchingIP ipAddress: String) -> String? {
-        deviceCache.first { $0.value.connectionAddresses.contains(ipAddress) }?.key
-    }
-
     private func resolveHostnameToIP(_ hostname: String, completion: @escaping (String?) -> Void) {
         // Use getaddrinfo to resolve hostname to IP
         queue.async {
@@ -1262,7 +1267,7 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         }
 
         deviceCacheLock.lock()
-        let existingKey = deviceCache[newCacheKey] != nil ? newCacheKey : cacheKey(matchingIP: ipAddress)
+        let existingKey = DiscoveryIdentityMatcher.matchingKey(in: deviceCache, for: incomingDevice)
         if let existingKey, var existingDevice = deviceCache[existingKey] {
             existingDevice.lastSeen = Date()
             existingDevice.rememberAddress(existingDevice.ipAddress)
@@ -1499,37 +1504,18 @@ class NetworkDiscoveryService: NSObject, ObservableObject, NetServiceBrowserDele
         print("🌊 TidalDrift PEER: Attempting to mark '\(hostname)' at \(peerInfo.ipAddress) as peer")
 
         DispatchQueue.main.async {
-            // Normalize input hostname
-            let inputHostname = hostname.lowercased().replacingOccurrences(of: ".local", with: "")
             let inputIP = peerInfo.ipAddress
-            let inputPeerId = peerInfo.peerId
+            let incoming = DiscoveredDevice(
+                name: hostname.replacingOccurrences(of: ".local", with: ""),
+                hostname: peerInfo.resolvedHostname ?? hostname,
+                ipAddress: inputIP, peerId: peerInfo.peerId
+            )
 
             self.deviceCacheLock.lock()
 
-            // Check cache directly first
-            var matchedIP: String?
-
-            // Match by stable peer identity first, then by current IP, then by hostname.
-            if let inputPeerId, !inputPeerId.isEmpty,
-               let existing = self.deviceCache.first(where: { $0.value.peerId == inputPeerId }) {
-                matchedIP = existing.key
-            } else if !inputIP.isEmpty,
-                      let existing = self.deviceCache.first(where: { $0.value.ipAddress == inputIP }) {
-                matchedIP = existing.key
-            } else {
-                // Match by hostname or name in cache
-                for (ip, device) in self.deviceCache {
-                    let dName = device.name.lowercased()
-                    let dHost = device.hostname.lowercased().replacingOccurrences(of: ".local", with: "")
-
-                    if let inputPeerId, let existingPeerId = device.peerId,
-                       inputPeerId != existingPeerId { continue }
-                    if dName == inputHostname || dHost == inputHostname {
-                        matchedIP = ip
-                        break
-                    }
-                }
-            }
+            // A peer ID overrides adapter choice; an address cannot override
+            // a conflicting peer identity or a different named computer.
+            let matchedIP = DiscoveryIdentityMatcher.matchingKey(in: self.deviceCache, for: incoming)
 
             if let ip = matchedIP, var device = self.deviceCache[ip] {
                 device.isTidalDriftPeer = true

@@ -20,7 +20,7 @@ final class LocalCastDropCoordinatesTests: XCTestCase {
     func testLetterboxAndInvalidGeometryRejectDrops() {
         let rect = CGRect(x: 100, y: 50, width: 800, height: 400)
         XCTAssertNil(LocalCastDropCoordinates.normalized(CGPoint(x: 50, y: 100), videoRect: rect, flipped: true))
-        XCTAssertNil(LocalCastDropCoordinates.normalized(CGPoint(x: 300, y: .nan), videoRect: rect, flipped: true))
+        XCTAssertNil(LocalCastDropCoordinates.normalized(CGPoint(x: 300, y: CGFloat.nan), videoRect: rect, flipped: true))
         XCTAssertNil(LocalCastDropCoordinates.normalized(.zero, videoRect: .zero, flipped: true))
     }
 }
