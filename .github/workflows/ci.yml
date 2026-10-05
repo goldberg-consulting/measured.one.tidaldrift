@@ -67,7 +67,7 @@ jobs:
           # Require Apple's Developer ID certificate chain, including its application leaf.
           REQUIREMENT='anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists'
           REQUIREMENT+=' and certificate leaf[field.1.2.840.113635.100.6.1.13] exists'
-          codesign --verify --deep --strict --test-requirement="$REQUIREMENT" "$APP"
+          codesign --verify --deep --strict --test-requirement="=$REQUIREMENT" "$APP"
 
       - name: Uninstall test cask
         if: always()
