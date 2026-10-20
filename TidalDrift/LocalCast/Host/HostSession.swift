@@ -423,20 +423,10 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     /// caps even when unchanged; a capture restart resets the stream to the
     /// configured fps, so the cap must be pushed again.
     func refreshThermalPolicy(force: Bool = false) {
-        let state = configuration.thermalThrottle ? ProcessInfo.processInfo.thermalState : .nominal
-        let cap: Int
-        let scale: Double
-        switch state {
-        case .serious:
-            cap = 30
-            scale = 0.5
-        case .critical:
-            cap = 15
-            scale = 0.25
-        default:
-            cap = .max
-            scale = 1.0
-        }
+        let state = ProcessInfo.processInfo.thermalState
+        let policy = StreamingThermalPolicy(state: state, enabled: configuration.thermalThrottle)
+        let cap = policy.frameRateCap
+        let scale = policy.bitrateScale
 
         adaptiveQueue.async { [weak self] in
             guard let self else { return }

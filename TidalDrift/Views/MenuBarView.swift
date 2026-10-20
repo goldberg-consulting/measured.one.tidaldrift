@@ -247,7 +247,7 @@ struct MenuBarView: View {
     }
 
     /// Host-side picker: choose whether to share the whole desktop or a single
-    /// app. Apps are enumerated on this Mac (requires Screen Recording).
+    /// app or individual window. Enumeration requires Screen Recording.
     private var shareTargetPicker: some View {
         Menu {
             Button {
@@ -259,10 +259,23 @@ struct MenuBarView: View {
             if !hostApps.isEmpty {
                 Divider()
                 ForEach(hostApps) { app in
-                    Button {
-                        Task { await localCast.shareApp(processID: app.processID, appName: app.name) }
-                    } label: {
-                        Text(app.name)
+                    Menu(app.name) {
+                        Button("Share App") {
+                            Task { await localCast.shareApp(processID: app.processID, appName: app.name) }
+                        }
+                        if !app.windows.isEmpty {
+                            Divider()
+                            ForEach(app.windows) { window in
+                                Button(window.title) {
+                                    Task {
+                                        await localCast.shareWindow(
+                                            windowID: CGWindowID(window.windowID),
+                                            windowTitle: "\(app.name) — \(window.title)"
+                                        )
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }

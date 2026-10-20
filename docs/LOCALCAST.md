@@ -39,7 +39,9 @@ The device's online badge can remain visible while a sleep proxy answers discove
 
 ## Choose what to share
 
-On the host, open the menu-bar **Sharing:** menu and choose **Entire Desktop** or an app. Use **Refresh App List** after opening an app if it is missing.
+On the host, open the menu-bar **Sharing:** menu and choose **Entire Desktop**, or open an app's submenu and choose **Share App** or an individual window title. Use **Refresh App List** after opening an app or window if it is missing.
+
+To work in just one remote window, select its title on the host, then use **Start Cast** on the client Mac. The window appears in the client's native viewer, and mouse and keyboard input operate the app on the host. The app and its files remain on the host. Both people share the host's desktop session and input; this does not create an independent session for the client.
 
 Inside the viewer, click the top-edge chevron to open **Stream Controls**, then choose **Apps**. You can switch to **Full Display**, stream an app, expand its row to choose a window, or bring the app to the foreground. The current target also appears in the bottom status bar; clicking it opens the Apps tab.
 
@@ -95,6 +97,8 @@ Bitrate, frame rate, and encoder quality update live. **Video Codec**, **Streami
 - **Auto transport** begins conservatively and uses connection measurements to select Fast LAN behavior on a clean wired link. **Resilient (Wi-Fi)** retains pacing for uneven links. Fast LAN does not require or assume jumbo frames.
 - **FEC** adds parity traffic to recover some missing video fragments. It can help on a lossy link at the cost of extra bandwidth.
 - **Region-aware streaming (experimental)** sends changed areas as lossless tiles and uses full-frame video for large changes. Both peers need support. Keep this distinction in mind when comparing its performance with the default video path.
+
+Thermal throttling starts at **fair** pressure with a 45 fps ceiling and 75% of requested bitrate, then steps down to 30 fps / half bitrate at **serious** and 15 fps / quarter bitrate at **critical**. It never raises a lower requested frame rate. Requested quality returns when pressure clears. This reduces LocalCast work; it cannot control heat from other apps or macOS Screen Sharing.
 
 ### Changes that need reconnection or a host restart
 
