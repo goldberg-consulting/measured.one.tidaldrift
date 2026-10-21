@@ -80,8 +80,8 @@ struct LocalCastConfiguration: Codable {
     /// retransmit. Host-side and safe to update live.
     var forwardErrorCorrection: Bool = false
 
-    /// Thermal throttling: when macOS reports serious/critical thermal pressure,
-    /// the host steps the stream's frame rate and bitrate down (30 fps / half
+    /// Thermal throttling: when macOS reports fair or higher thermal pressure,
+    /// the host steps the stream's frame rate and bitrate down (45 fps / 75% at fair, 30 fps / half
     /// bitrate at serious, 15 fps / quarter bitrate at critical) and restores
     /// them when the machine cools. Host-side and safe to update live.
     var thermalThrottle: Bool = true

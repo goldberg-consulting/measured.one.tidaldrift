@@ -164,7 +164,7 @@ struct LocalCastSettingsView: View {
                         .help("Composites the host's cursor into the video. Off (default), your local cursor is the pointer, removing the network round trip from pointer motion. Turn on for view-only sessions. Applies live.")
 
                     Toggle("Thermal throttling", isOn: $thermalThrottle)
-                        .help("When macOS reports thermal pressure, automatically lowers the stream's frame rate and bitrate (30 fps / half bitrate at serious, 15 fps / quarter bitrate at critical) so the host cools down, then restores quality. Host-side; applies live.")
+                        .help("When macOS reports thermal pressure, automatically lowers the stream's frame rate and bitrate (45 fps / 75% bitrate at fair, 30 fps / half at serious, 15 fps / quarter at critical) so the host cools down, then restores quality. Host-side; applies live.")
 
                     Text("On lossy Wi-Fi these keep motion smooth and recover quickly. On a clean wired link they have little effect. Turn them off to force fixed-bitrate, play-everything behavior.")
                         .font(.caption)
