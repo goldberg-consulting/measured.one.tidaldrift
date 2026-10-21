@@ -236,8 +236,7 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
             // than fixed top/bottom bands matters in full screen, where a
             // band would swallow clicks meant for the remote menu bar and Dock.
             let pointInContent = contentView.convert(event.locationInWindow, from: nil)
-            if event.type != .scrollWheel,
-               self.overlayFrames.contains(where: { $0.insetBy(dx: -4, dy: -4).contains(pointInContent) }) {
+            if self.overlayFrames.contains(where: { $0.insetBy(dx: -4, dy: -4).contains(pointInContent) }) {
                 if self.diagCount <= 20 { lcDebug("🖱️ PASS-THROUGH: viewer control at \(NSStringFromPoint(pointInContent))") }
                 return event
             }
@@ -355,19 +354,6 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
     ) {
         guard videoRect.width > 0, videoRect.height > 0 else { return }
 
-        // Scroll carries deltas, not a position; forward it regardless of where
-        // the cursor is (even over the letterbox bars). The precise flag rides
-        // along so the host injects pixels for trackpads and lines for a
-        // physical wheel; without it a wheel notch was injected as ~1 pixel.
-        if event.type == .scrollWheel {
-            clientSession.sendInput(.scroll(
-                deltaX: event.scrollingDeltaX,
-                deltaY: event.scrollingDeltaY,
-                precise: event.hasPreciseScrollingDeltas
-            ))
-            return
-        }
-
         let rawX = (point.x - videoRect.minX) / videoRect.width
         let yFromBottom = (point.y - videoRect.minY) / videoRect.height
         // The remote expects top-left origin (y down). NSHostingView is usually
@@ -380,6 +366,16 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
         let relativeY = min(max(rawY, 0), 1)
 
         switch event.type {
+        case .scrollWheel:
+            // Carry the hit point in the same packet as the deltas: mouse-move
+            // packets can be lost, and the host user may have moved the cursor.
+            guard videoRect.contains(point) else { return }
+            clientSession.sendInput(.scroll(
+                deltaX: event.scrollingDeltaX,
+                deltaY: event.scrollingDeltaY,
+                precise: event.hasPreciseScrollingDeltas,
+                position: CGPoint(x: relativeX, y: relativeY)
+            ))
         case .mouseMoved, .leftMouseDragged, .rightMouseDragged:
             clientSession.sendInput(.mouseMove(x: relativeX, y: relativeY))
         case .leftMouseDown:

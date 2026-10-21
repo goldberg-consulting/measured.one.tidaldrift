@@ -55,6 +55,8 @@ The bottom status bar switches between **Remote Control** and **View Only**. Pre
 
 While control is enabled and the viewer is focused, typing and pointer actions go to the host. Host Accessibility permission enables input injection. Viewer Accessibility permission enables capture of system shortcuts; without it, ordinary keys use a fallback handler.
 
+Scroll over the streamed content to target the area beneath the viewer pointer. Mouse wheels use line scrolling; trackpads and Magic Mouse use pixel scrolling. Small deltas accumulate instead of being discarded. Scrolling over viewer controls or outside the picture does not scroll the host. Both Macs need version 1.8.6 or later for pointer-targeted scroll packets; older peers still accept the original delta-only format.
+
 - **⌘⇧I:** release or resume remote control.
 - **⌘C / ⌘X:** copy or cut in the remote app while controlling the viewer.
 - **⌘V:** send the current local clipboard and wait for transfer before remote Paste. After a remote copy or cut, use that host clipboard until a new local copy replaces it.
