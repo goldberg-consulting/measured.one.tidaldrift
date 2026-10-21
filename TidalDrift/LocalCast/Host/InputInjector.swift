@@ -69,6 +69,8 @@ class InputInjector {
     /// subsequent move can be injected as a drag rather than a plain move.
     /// Guarded by `heldStateLock`.
     private var heldMouseButton: Int?
+    /// Fractional scroll state shares the held-input lock and resets on departure.
+    private var scrollEventBuilder = RemoteScrollEventBuilder()
 
     /// Limits the release-visible click-mapping diagnostic to the first few clicks.
     private var mouseDownLogCount = 0
@@ -83,7 +85,8 @@ class InputInjector {
         /// trackpads/Magic Mouse (deltas are pixels), false for a physical
         /// scroll wheel (deltas are lines). The host must inject with the
         /// matching CGScrollEventUnit or wheel scrolling is ~20x too slow.
-        case scroll(deltaX: Double, deltaY: Double, precise: Bool)
+        /// Position is normalized within the video; nil supports older viewers.
+        case scroll(deltaX: Double, deltaY: Double, precise: Bool, position: CGPoint? = nil)
     }
     
     /// Check if we have Accessibility permission (required for input injection)
@@ -428,24 +431,13 @@ class InputInjector {
             lcDebug("[INPUT-DIAG] 💉 INJECTING keyUp keyCode=\(keyCode)")
             event.post(tap: .cghidEventTap)
             
-        case .scroll(let deltaX, let deltaY, let precise):
-            // Precise (trackpad/Magic Mouse) deltas are pixels; wheel deltas
-            // are lines. Injecting lines as pixels made one wheel notch move
-            // ~1 pixel instead of ~1 line, which read as "scrolling barely
-            // works" with a physical mouse.
-            let units: CGScrollEventUnit = precise ? .pixel : .line
-            // Round away from zero so a single notch or a slow trackpad drift
-            // is never truncated to a no-op.
-            let dy = Int32(deltaY.rounded(.toNearestOrAwayFromZero))
-            let dx = Int32(deltaX.rounded(.toNearestOrAwayFromZero))
-            guard dx != 0 || dy != 0 else { return }
-            guard let event = CGEvent(scrollWheelEvent2Source: nil, units: units, wheelCount: 2, wheel1: dy, wheel2: dx, wheel3: 0) else {
-                logger.error("❌ Failed to create scroll event")
-                return
-            }
-            if inputCount <= 5 || inputCount % 100 == 0 {
-                logger.info("🔄 InputInjector: scroll deltaX=\(deltaX), deltaY=\(deltaY), units=\(precise ? "pixel" : "line")")
-            }
+        case .scroll(let deltaX, let deltaY, let precise, let position):
+            let location = position.map { normalizedToScreenCoordinates(x: $0.x, y: $0.y) }
+            heldStateLock.lock()
+            let event = scrollEventBuilder.makeEvent(
+                deltaX: deltaX, deltaY: deltaY, precise: precise, location: location)
+            heldStateLock.unlock()
+            guard let event else { return }
             event.post(tap: .cghidEventTap)
         }
     }
@@ -461,6 +453,7 @@ class InputInjector {
         heldModifierKeyCodes.removeAll()
         let stuckButton = heldMouseButton
         heldMouseButton = nil
+        scrollEventBuilder = RemoteScrollEventBuilder()
         heldStateLock.unlock()
 
         for keyCode in stuckKeys {
@@ -520,13 +513,20 @@ extension InputInjector.RemoteInput {
             var m = modifiers.bigEndian
             withUnsafeBytes(of: &k) { data.append(contentsOf: $0) }
             withUnsafeBytes(of: &m) { data.append(contentsOf: $0) }
-        case .scroll(let deltaX, let deltaY, let precise):
+        case .scroll(let deltaX, let deltaY, let precise, let position):
             data.append(6)
             var dx = deltaX.bitPattern.bigEndian
             var dy = deltaY.bitPattern.bigEndian
             withUnsafeBytes(of: &dx) { data.append(contentsOf: $0) }
             withUnsafeBytes(of: &dy) { data.append(contentsOf: $0) }
             data.append(precise ? 1 : 0)
+            // Append-only extension: older hosts still read the original deltas.
+            if let position {
+                var x = Double(position.x).bitPattern.bigEndian
+                var y = Double(position.y).bitPattern.bigEndian
+                withUnsafeBytes(of: &x) { data.append(contentsOf: $0) }
+                withUnsafeBytes(of: &y) { data.append(contentsOf: $0) }
+            }
         }
         return data
     }
@@ -570,7 +570,16 @@ extension InputInjector.RemoteInput {
             // 17-byte payloads come from builds that predate the precise flag;
             // they always injected as pixels, so keep that reading for them.
             let precise = data.count >= 18 ? data[17] == 1 : true
-            return .scroll(deltaX: dx, deltaY: dy, precise: precise)
+            guard dx.isFinite, dy.isFinite else { return nil }
+            var position: CGPoint?
+            if data.count > 18 {
+                guard data.count >= 34 else { return nil }
+                let x = Double(bitPattern: u64(18..<26))
+                let y = Double(bitPattern: u64(26..<34))
+                guard x.isFinite, y.isFinite else { return nil }
+                position = CGPoint(x: x, y: y)
+            }
+            return .scroll(deltaX: dx, deltaY: dy, precise: precise, position: position)
         default:
             return nil
         }
