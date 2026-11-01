@@ -158,7 +158,7 @@ struct LocalCastSettingsView: View {
                             Text(profile.displayName).tag(profile)
                         }
                     }
-                    .help("Auto picks Fast LAN on a clean wired link (low RTT, no loss) and Resilient on Wi-Fi. Fast LAN drops pacing, widens the reassembly window, loosens the keyframe cap, and raises bitrate. Datagrams remain safe for standard Ethernet MTUs. Applies live.")
+                    .help("Auto adjusts the streaming profile using connection feedback. Fast LAN allows higher quality and uses lighter pacing for large frames. Optional Network tuning below controls sending separately. Applies live.")
 
                     Toggle("Show remote cursor in stream", isOn: $captureCursor)
                         .help("Composites the host's cursor into the video. Off (default), your local cursor is the pointer, removing the network round trip from pointer motion. Turn on for view-only sessions. Applies live.")
@@ -183,6 +183,9 @@ struct LocalCastSettingsView: View {
 
                 Divider()
                 
+                NetworkTuningView()
+                Divider()
+
                 VStack(alignment: .leading, spacing: 12) {
                     Text("Security")
                         .font(.subheadline)

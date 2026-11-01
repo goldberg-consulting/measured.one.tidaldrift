@@ -88,3 +88,42 @@ Keep local credentials, signing certificates, generated app bundles, and DMGs ou
 For bug reports, use [GitHub Issues](https://github.com/goldberg-consulting/measured.one.tidaldrift/issues) and include the app version, macOS version on each machine, network setup, steps to reproduce, and relevant diagnostics. In Console, filter for the `com.tidaldrift` subsystem. Remove credentials, personal file paths, and private device details before sharing logs.
 
 Maintainers should use the [release guide](RELEASE.md) for packaging and publishing. Contributions are covered by the [MIT license](LICENSE).
+
+## Network test helper
+
+Packaged apps include iperf3 3.21 in `Contents/Helpers/iperf3`; users do not need
+Homebrew. The release workflow and all three app packaging scripts call `Scripts/bundle-iperf3.sh`, which
+verifies the upstream archive SHA-256, builds arm64 and x86_64 slices with a macOS
+13 deployment target, links libiperf statically without OpenSSL, signs the helper,
+and includes the upstream license under `Contents/Resources/ThirdParty/`.
+The first packaging run needs internet access and a C compiler. SwiftPM Debug
+runs can use a Homebrew iperf3 installation; release apps require the bundled copy.
+
+The updated test requires the updated app on both Macs. TCP port 5905 carries
+small control messages from private/link-local peers. After a TCP handshake,
+the responder starts a one-off iperf3 server for each phase, on a random port
+bound to the same local IPv4 address. The firewall must allow the app/helper's TCP and UDP
+traffic. A disconnect or a 50-second lease ends the helper; individual tests are
+limited to ten seconds. Each helper also exits after its one test or twelve
+seconds waiting for a client, independently of the app. The control protocol is LAN-only, not user authentication;
+do not expose it or the temporary iperf listener through port forwarding.
+
+The UI reports single-stream TCP receive throughput in both directions, then UDP
+receiver loss and jitter at a selectable limit of 100, 250, 500, or 1000 Mbps
+(default 100), capped at half the corresponding TCP throughput on slower links. This is a streaming delivery check, not a claim that UDP can run
+loss-free at the full TCP rate. RTT is measured on the control connection. The
+selected source address is also bound for iperf, and the UI identifies that route.
+Missing or malformed reports are errors, never synthetic packet loss.
+
+To exercise the bundled helper locally without installing or launching the app:
+
+```bash
+cd TidalDrift
+bash Scripts/bundle-iperf3.sh /tmp/TidalDrift-network-check.app
+TIDALDRIFT_TEST_IPERF=/tmp/TidalDrift-network-check.app/Contents/Helpers/iperf3 \
+  swift test --filter SpeedTestTests
+```
+
+The opt-in integration check runs all four phases over loopback and cancels a
+second test. A separate two-Mac Ethernet run is still required to validate actual
+LAN performance, firewall prompts, and route selection.

@@ -1141,10 +1141,11 @@ struct LocalCastStatsOverlay: View {
                 row("Rate", "\(stats.fps)/s")
                 row("Bitrate", String(format: "%.1f Mbps", stats.bitrateMbps))
                 row("Network RTT", "\(Int(stats.latencyMs)) ms")
-                row("Dropped", "\(stats.droppedPerSec)/s",
-                    warn: stats.droppedPerSec > 0)
+                row("Incomplete", "\(stats.droppedPerSec)/s")
                 row("Recovered", "\(stats.fecRecoveredPerSec)/s")
                 row("Buffer", "\(stats.bufferDepth)")
+                if let failures = stats.decodeFailuresPerSec { row("Decode retries", "\(failures)/s") }
+                if let skips = stats.presentationSkipsPerSec { row("Playback skips", "\(skips)/s") }
             }
             .padding(8)
             .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 8))
@@ -1156,7 +1157,7 @@ struct LocalCastStatsOverlay: View {
             Text(label)
                 .font(.system(size: 10, design: .monospaced))
                 .foregroundStyle(.secondary)
-                .frame(width: 70, alignment: .leading)
+                .frame(width: 90, alignment: .leading)
             Text(value)
                 .font(.system(size: 11, weight: .semibold, design: .monospaced))
                 .foregroundStyle(warn ? .orange : .primary)

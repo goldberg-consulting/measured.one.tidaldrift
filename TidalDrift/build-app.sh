@@ -89,6 +89,8 @@ EOF
 echo -n "APPL????" > "$APP_NAME.app/Contents/PkgInfo"
 echo -e "${GREEN}✓ Bundle${NC}"
 
+bash "$SCRIPT_DIR/Scripts/bundle-iperf3.sh" "$APP_NAME.app" "${DEV_ID:--}"
+
 # Sign
 echo -e "${BLUE}🔏 Signing...${NC}"
 if [ -n "$DEV_ID" ]; then

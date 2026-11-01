@@ -12,8 +12,12 @@ struct DeviceDetailSheet: View {
     @State private var isDiscoveringMAC = false
 
     // Speed test state
+    @AppStorage("localCastTestRate") private var udpTestLimit = 100
     @State private var isRunningSpeedTest = false
     @State private var speedTestResult: SpeedTestService.Result?
+    @State private var speedTestError: String?
+    @State private var speedTestProgress = ""
+    @State private var speedTestTask: Task<Void, Never>?
     @State private var optimizedApplied = false
     @State private var isOpeningAppControl = false
 
@@ -60,6 +64,7 @@ struct DeviceDetailSheet: View {
             footer
         }
         .frame(width: 450, height: 580)
+        .onDisappear { speedTestTask?.cancel() }
         .alert("Connection Error", isPresented: .constant(viewModel.connectionError != nil)) {
             Button("OK") {
                 viewModel.connectionError = nil
@@ -359,7 +364,7 @@ struct DeviceDetailSheet: View {
                     .font(.headline)
                 Spacer()
                 Button {
-                    runSpeedTest()
+                    if isRunningSpeedTest { speedTestTask?.cancel() } else { runSpeedTest() }
                 } label: {
                     HStack(spacing: 6) {
                         if isRunningSpeedTest {
@@ -367,19 +372,31 @@ struct DeviceDetailSheet: View {
                         } else {
                             Image(systemName: "play.fill")
                         }
-                        Text(isRunningSpeedTest ? "Testing…" : "Run Test")
+                        Text(isRunningSpeedTest ? "Cancel" : "Run Test")
                     }
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
-                .disabled(isRunningSpeedTest)
             }
+
+            Picker("Delivery test limit", selection: $udpTestLimit) {
+                ForEach([100, 250, 500, 1000], id: \.self) { rate in
+                    Text("\(rate) Mbps").tag(rate)
+                }
+            }
+            .disabled(isRunningSpeedTest)
+            .help("Choose a higher rate to check delivery closer to your streaming settings. The test stays below half the measured TCP speed.")
 
             if let r = speedTestResult {
                 VStack(alignment: .leading, spacing: 6) {
                     speedRow("Latency", String(format: "%.1f ms (±%.1f jitter)", r.rttMs, r.jitterMs))
-                    speedRow("Download", String(format: "%.1f Mbps  (%.1f%% loss)", r.downloadMbps, r.downloadLossPct))
-                    speedRow("Upload", String(format: "%.1f Mbps  (%.1f%% loss)", r.uploadMbps, r.uploadLossPct))
+                    speedRow("TCP down", String(format: "%.1f Mbps", r.downloadMbps))
+                    speedRow("TCP up", String(format: "%.1f Mbps", r.uploadMbps))
+                    speedRow("UDP down", String(format: "%.2f%% loss at %.1f Mbps", r.downloadLossPct, r.downloadUDPRateMbps))
+                    speedRow("UDP up", String(format: "%.2f%% loss at %.1f Mbps", r.uploadLossPct, r.uploadUDPRateMbps))
+                    Text(String(format: "UDP jitter: ↓ %.2f ms · ↑ %.2f ms", r.downloadUDPJitterMs, r.uploadUDPJitterMs))
+                        .font(.caption)
+                    Text(r.route).font(.caption2).textSelection(.enabled)
                     Text(speedVerdict(r))
                         .font(.caption)
                         .foregroundColor(.secondary)
@@ -389,8 +406,12 @@ struct DeviceDetailSheet: View {
                 if r.downloadMbps > 0 {
                     recommendationView(SpeedTestService.recommend(from: r))
                 }
-            } else if !isRunningSpeedTest {
-                Text("Measures latency and UDP throughput to this peer using the same transport as LocalCast. Both Macs must be updated to a version with the speed-test responder.")
+            } else if isRunningSpeedTest {
+                Text(speedTestProgress).font(.caption)
+            } else if let speedTestError {
+                Text(speedTestError).font(.caption).foregroundColor(.orange)
+            } else {
+                Text("Tests TCP speed and paced UDP delivery with iperf3 in about 30 seconds. Both Macs need the current app. Choose the delivery test rate above; slower connections are tested at a lower rate.")
                     .font(.caption2)
                     .foregroundColor(.secondary)
             }
@@ -466,32 +487,29 @@ struct DeviceDetailSheet: View {
         }
     }
 
-    /// Translate raw numbers into a buffering-vs-bandwidth verdict.
     private func speedVerdict(_ r: SpeedTestService.Result) -> String {
-        if r.downloadMbps <= 0 {
-            return "No throughput measured — the peer may not be running a version with the speed-test responder, or the link dropped everything."
+        if max(r.downloadLossPct, r.uploadLossPct) > 1 {
+            return "Some test packets did not arrive. Try a lower delivery test rate to compare; your current streaming settings have not changed."
         }
-        if r.downloadLossPct > 5 {
-            return String(format: "High download packet loss (%.0f%%). The Wi-Fi link is the bottleneck — lower the streaming quality or use Ethernet.", r.downloadLossPct)
-        }
-        if r.downloadMbps < 25 {
-            return String(format: "Link is ~%.0f Mbps — below comfortable streaming headroom, so lag is bandwidth-bound. Lower quality or go wired.", r.downloadMbps)
-        }
-        if r.uploadLossPct > 8 {
-            return String(format: "Download is clean (~%.0f Mbps), but the uplink drops %.0f%% under a burst. That matters when this Mac is the host: bursty keyframes will shed packets. Pacing/lower bitrate on the host side helps more than raw bandwidth.", r.downloadMbps, r.uploadLossPct)
-        }
-        return String(format: "Link is ~%.0f Mbps with low loss both ways — bandwidth is fine. If streaming is still laggy, the bottleneck is buffering/pipeline, not the network.", r.downloadMbps)
+        return "Delivery looks steady at the tested rates. You can also try a rate closer to your streaming settings."
     }
 
     private func runSpeedTest() {
         isRunningSpeedTest = true
         speedTestResult = nil
+        speedTestError = nil
         optimizedApplied = false
-        Task {
-            let result = await SpeedTestService.shared.runTest(toHost: device.ipAddress)
-            await MainActor.run {
-                speedTestResult = result
+        speedTestTask = Task { @MainActor in
+            defer {
                 isRunningSpeedTest = false
+                speedTestTask = nil
+            }
+            do {
+                speedTestResult = try await SpeedTestService.shared.runTest(toHost: device.ipAddress, udpLimitMbps: udpTestLimit) {
+                    speedTestProgress = $0
+                }
+            } catch {
+                speedTestError = Task.isCancelled ? "Test cancelled." : error.localizedDescription
             }
         }
     }

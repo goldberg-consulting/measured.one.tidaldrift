@@ -28,6 +28,7 @@ protocol UDPTransportDelegate: AnyObject {
     /// newer frame superseded them (i.e. at least one fragment was lost). The
     /// receiver can use this to request recovery (e.g. a keyframe).
     func udpTransportDidLoseFrames(_ transport: UDPTransport)
+    func udpTransportNeedsMediaRefresh(_ transport: UDPTransport)
     /// Called when a droppable (video) frame would exceed the receiver's
     /// fragment cap at the current payload size, so the sender dropped it
     /// instead of emitting a frame that would be rejected wholesale at
@@ -39,6 +40,7 @@ protocol UDPTransportDelegate: AnyObject {
 extension UDPTransportDelegate {
     func udpTransport(_ transport: UDPTransport, clientDidConnect endpoint: NWEndpoint, connection: NWConnection) {}
     func udpTransportDidLoseFrames(_ transport: UDPTransport) {}
+    func udpTransportNeedsMediaRefresh(_ transport: UDPTransport) {}
     func udpTransportFrameExceededCapacity(_ transport: UDPTransport, fragments: Int, limit: Int) {}
 }
 
@@ -320,6 +322,7 @@ class UDPTransport {
 
     /// Feed one per-second client telemetry tick into the pacing controller.
     func notePacingTelemetry(droppedPerSec: Int) {
+        scheduler()?.feedback(incompleteFrames: droppedPerSec)
         pacingLock.lock()
         defer { pacingLock.unlock() }
         // Fast LAN never paces, so widening the gap in response to receiver-side
@@ -445,6 +448,7 @@ class UDPTransport {
         // control packet (e.g. the disconnect bye) still reaches the wire.
         // Cheap: the queue only ever holds a few frames' worth of work.
         sendQueue.sync {}
+        scheduler()?.stop()
 
         listener?.cancel()
         listener = nil
@@ -457,6 +461,52 @@ class UDPTransport {
         connectionsLock.unlock()
     }
     
+    struct SendDiagnostics {
+        var datagrams = 0
+        var localSendFailures = 0
+        var skippedMedia = 0
+    }
+    private let tuningLock = NSLock()
+    private var mediaScheduler: MediaSendScheduler?
+    private var collectSendDiagnostics = false
+    private var diagnostics = SendDiagnostics()
+
+    var sendDiagnostics: SendDiagnostics? {
+        tuningLock.lock(); defer { tuningLock.unlock() }
+        return collectSendDiagnostics ? diagnostics : nil
+    }
+
+    /// Called before hosting starts. Keeping settings fixed for a session avoids
+    /// flushing a queued keyframe as a burst when the user switches tuning off.
+    func configureNetworkTuning(_ options: NetworkTuning) {
+        tuningLock.lock()
+        let old = mediaScheduler
+        collectSendDiagnostics = options.diagnostics
+        diagnostics = SendDiagnostics()
+        mediaScheduler = options.enabled ? MediaSendScheduler(settings: options, send: { [weak self] batch, connection in
+            self?.sendBurst(batch[...], on: connection)
+        }, dropped: { [weak self] in
+            guard let self else { return }
+            self.tuningLock.lock()
+            if self.collectSendDiagnostics { self.diagnostics.skippedMedia += 1 }
+            self.tuningLock.unlock()
+        }, recover: { [weak self] in
+            guard let self else { return }
+            self.delegate?.udpTransportNeedsMediaRefresh(self)
+        }) : nil
+        tuningLock.unlock()
+        old?.stop()
+    }
+
+    func resetMediaPacing() {
+        sendQueue.async { [weak self] in self?.scheduler()?.reset() }
+    }
+
+    private func scheduler() -> MediaSendScheduler? {
+        tuningLock.lock(); defer { tuningLock.unlock() }
+        return mediaScheduler
+    }
+
     private let statsLock = NSLock()
     private var _sendCount = 0
     private var _receiveCount = 0
@@ -521,7 +571,8 @@ class UDPTransport {
         // receiver's drop-to-newest reassembly; tiles and control packets must
         // be delivered whole (a lost tile is healed by periodic refresh instead).
         if data.count + FragmentHeader.size > maxPayloadSize {
-            sendFragmented(data: data, on: connection, droppable: packet.type == .videoFrame)
+            sendFragmented(data: data, on: connection, droppable: packet.type == .videoFrame,
+                           pacedMedia: packet.type == .videoFrame || packet.type == .tileUpdate)
         } else {
             // Small packet, send directly with a "no fragment" header
             var noFragmentData = Data(capacity: FragmentHeader.size + data.count)
@@ -529,6 +580,10 @@ class UDPTransport {
             header.append(into: &noFragmentData)
             noFragmentData.append(data)
             
+            if packet.type == .videoFrame || packet.type == .tileUpdate, let scheduler = scheduler() {
+                scheduler.enqueue([noFragmentData], on: connection)
+                return
+            }
             let packetType = packet.type // Capture for closure
             connection.send(content: noFragmentData, completion: .contentProcessed { [weak self] error in
                 if let error = error {
@@ -546,7 +601,7 @@ class UDPTransport {
     /// remaining 31 bits are the frame counter (wraps after ~414 days at 60fps).
     static let droppableFrameFlag: UInt32 = 0x8000_0000
 
-    private func sendFragmented(data: Data, on connection: NWConnection, droppable: Bool) {
+    private func sendFragmented(data: Data, on connection: NWConnection, droppable: Bool, pacedMedia: Bool) {
         fragmentLock.lock()
         frameCounter &+= 1
         let frameId = (frameCounter & ~Self.droppableFrameFlag) | (droppable ? Self.droppableFrameFlag : 0)
@@ -634,6 +689,11 @@ class UDPTransport {
             }
         }
 
+        if pacedMedia, let scheduler = scheduler() {
+            scheduler.enqueue(sendList, on: connection)
+            return
+        }
+
         // Small frames go out immediately; pacing them would only add latency
         // and they are too small to overrun the link. Loopback always skips
         // pacing. Fast LAN skips it for ordinary frames but micro-paces very
@@ -647,7 +707,7 @@ class UDPTransport {
             ? sendList.count <= Self.fastLANPacedThreshold
             : totalFragments <= pacingFragmentThreshold
         if pacingBypassed || smallEnoughToBlast {
-            Self.sendBurst(sendList[...], on: connection)
+            self.sendBurst(sendList[...], on: connection)
             return
         }
 
@@ -674,10 +734,23 @@ class UDPTransport {
     /// thousands of closures per second saved on the send path; a failed
     /// datagram is indistinguishable from a lost one anyway, and the receiver
     /// drives recovery.
-    private static func sendBurst(_ fragments: ArraySlice<Data>, on connection: NWConnection) {
+    private func sendBurst(_ fragments: ArraySlice<Data>, on connection: NWConnection) {
+        tuningLock.lock()
+        let observe = collectSendDiagnostics
+        if observe { diagnostics.datagrams += fragments.count }
+        tuningLock.unlock()
         connection.batch {
             for fragment in fragments {
-                connection.send(content: fragment, completion: .idempotent)
+                if observe {
+                    connection.send(content: fragment, completion: .contentProcessed { [weak self] error in
+                        guard error != nil, let self else { return }
+                        self.tuningLock.lock()
+                        self.diagnostics.localSendFailures += 1
+                        self.tuningLock.unlock()
+                    })
+                } else {
+                    connection.send(content: fragment, completion: .idempotent)
+                }
             }
         }
     }
@@ -752,7 +825,7 @@ class UDPTransport {
         
         func drain(from start: Int) {
             let end = min(start + batchSize, total)
-            Self.sendBurst(fragments[start..<end], on: connection)
+            self.sendBurst(fragments[start..<end], on: connection)
             if end < total {
                 paceQueue.asyncAfter(deadline: .now() + gap) { drain(from: end) }
             } else {

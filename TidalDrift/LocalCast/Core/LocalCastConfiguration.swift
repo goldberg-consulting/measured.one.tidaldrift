@@ -95,6 +95,9 @@ struct LocalCastConfiguration: Codable {
     /// behavior on a measured fast wired link and Resilient otherwise.
     var transportProfile: TransportProfile = .auto
     
+    /// Optional for decoding configurations saved before network tuning existed.
+    var networkTuning: NetworkTuning? = nil
+
     // Security
     var requireAuthentication: Bool = true
     var inputRateLimit: Int = 120  // events per second, 0 = unlimited
@@ -178,7 +181,7 @@ struct LocalCastConfiguration: Codable {
     /// TCP port for the clipboard bulk channel. The host listens here only
     /// while a session with an authenticated, non-loopback client is running;
     /// the client initiates every connection regardless of transfer direction.
-    /// 5905 is taken by the UDP speed test.
+    /// 5905 is taken by the TCP network-test control service.
     static let clipboardPort: UInt16 = 5906
 
     /// Clipboard payloads whose encoded size is at or below this ride the UDP

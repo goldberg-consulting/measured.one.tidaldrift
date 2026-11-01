@@ -119,6 +119,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         TidalDriftPeerService.shared.stopAdvertising()
         TidalDriftPeerService.shared.stopDiscovery()
         LocalCastService.shared.stopHosting()
+        SpeedTestService.shared.stopResponder()
         DeviceDetailWindowManager.shared.closeAll()
     }
 

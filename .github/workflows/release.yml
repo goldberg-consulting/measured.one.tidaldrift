@@ -115,6 +115,10 @@ jobs:
 
           find "$APP" -exec xattr -c {} \; 2>/dev/null || true
 
+      - name: Bundle iperf3 network-test helper
+        working-directory: TidalDrift
+        run: bash Scripts/bundle-iperf3.sh TidalDrift.app "$DEV_ID"
+
       - name: Sign
         working-directory: TidalDrift
         run: |

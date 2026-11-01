@@ -38,6 +38,8 @@ struct LocalCastStats {
     var droppedPerSec: Int = 0
     var bufferDepth: Int = 0
     var fecRecoveredPerSec: Int = 0
+    var decodeFailuresPerSec: Int?
+    var presentationSkipsPerSec: Int?
 }
 
 struct LocalCastConnection: Identifiable {
@@ -76,6 +78,8 @@ class LocalCastService: ObservableObject {
     var configuration: LocalCastConfiguration = .default
 
     private var hostSession: HostSession?
+
+    var networkDiagnostics: UDPTransport.SendDiagnostics? { hostSession?.networkDiagnostics }
     private var currentHostTarget: HostCaptureTarget = .fullDisplay
     private var tuningSubscription: AnyCancellable?
     private var advertisementProcess: Process?
@@ -353,6 +357,7 @@ class LocalCastService: ObservableObject {
         configuration.regionAware = defaults.object(forKey: "localCastRegionAware") as? Bool ?? false
         configuration.forwardErrorCorrection = defaults.object(forKey: "localCastFEC") as? Bool ?? false
         configuration.captureCursor = defaults.object(forKey: "localCastCaptureCursor") as? Bool ?? false
+        configuration.networkTuning = NetworkTuning.load(from: defaults)
         configuration.thermalThrottle = defaults.object(forKey: "localCastThermalThrottle") as? Bool ?? true
         if let profileRaw = defaults.string(forKey: "localCastTransportProfile"),
            let profile = LocalCastConfiguration.TransportProfile(rawValue: profileRaw) {

@@ -292,9 +292,15 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         transport.delegate = self
         decoder.delegate = self
         decoder.onError = { [weak self] message in
+            if let self, self.collectNetworkDetails {
+                self.mediaClockLock.lock()
+                self.decodeFailures += 1
+                self.mediaClockLock.unlock()
+            }
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                self.connectionStatus = message
+                self.logger.debug("Video recovery: \(message)")
+                self.connectionStatus = "Refreshing the picture…"
                 self.requestKeyFrame()
             }
         }
@@ -1247,6 +1253,9 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         mediaClockLock.unlock()
     }
 
+    private let collectNetworkDetails = UserDefaults.standard.bool(forKey: "localCastNetworkDiagnostics")
+    private var decodeFailures = 0 // guarded by mediaClockLock
+
     private func noteLostFrame() {
         mediaClockLock.lock()
         lostFrameCount += 1
@@ -1254,10 +1263,20 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
     }
 
     /// Snapshot and reset the current stats window atomically.
-    private func takeStatsWindow() -> (frames: Int, tiles: Int, bytes: Int, lost: Int) {
+    private struct StatsWindow {
+        let frames: Int
+        let tiles: Int
+        let bytes: Int
+        let lost: Int
+        let decodeErrors: Int
+    }
+
+    private func takeStatsWindow() -> StatsWindow {
         mediaClockLock.lock()
         defer { mediaClockLock.unlock() }
-        let window = (frameCount, tileUpdateCount, receivedMediaBytes, lostFrameCount)
+        let window = StatsWindow(frames: frameCount, tiles: tileUpdateCount, bytes: receivedMediaBytes,
+                                 lost: lostFrameCount, decodeErrors: decodeFailures)
+        decodeFailures = 0
         frameCount = 0
         tileUpdateCount = 0
         receivedMediaBytes = 0
@@ -1437,7 +1456,9 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
             mode: mode,
             droppedPerSec: window.lost,
             bufferDepth: bufferDepth,
-            fecRecoveredPerSec: recovered
+            fecRecoveredPerSec: recovered,
+            decodeFailuresPerSec: collectNetworkDetails ? window.decodeErrors : nil,
+            presentationSkipsPerSec: collectNetworkDetails ? renderer?.takePresentationSkips() : nil
         )
 
         sendTelemetry(stats)

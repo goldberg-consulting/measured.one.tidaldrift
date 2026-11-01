@@ -65,6 +65,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     let encoder = VideoEncoder()
     let inputInjector = InputInjector()
     let transport = UDPTransport()
+    var networkDiagnostics: UDPTransport.SendDiagnostics? { transport.sendDiagnostics }
 
     /// Clipboard sync over the session (see HostSession+Clipboard.swift).
     /// The engine is created and driven on the main actor; the bulk host has
@@ -463,6 +464,8 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         var updated = newConfig
         updated.requireAuthentication = previous.requireAuthentication
         updated.inputRateLimit = previous.inputRateLimit
+        // Pacing is a session-level choice so switching it never reorders queued frames.
+        updated.networkTuning = previous.networkTuning
         configuration = updated
         transport.fecEnabled = newConfig.forwardErrorCorrection
         if previous.transportProfile != newConfig.transportProfile {
@@ -804,6 +807,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         }
         self.captureTarget = target
         logger.info("Starting host session with target: \(String(describing: target))")
+        transport.configureNetworkTuning(configuration.networkTuning ?? NetworkTuning())
         transport.fecEnabled = configuration.forwardErrorCorrection
 
         // Check and log accessibility permission status (but don't prompt repeatedly)
@@ -1320,8 +1324,14 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
 
     // MARK: - UDPTransportDelegate
 
-    /// The transport dropped a video frame that exceeded the receiver's fragment
-    /// cap. Step encode load down so keyframes become deliverable.
+    /// A bounded sender queue omitted media. Refresh video and tiles after the
+    /// accepted frames finish, without labelling a local queue limit as network loss.
+    func udpTransportNeedsMediaRefresh(_ transport: UDPTransport) {
+        pendingFullRefresh = true
+        encoder.forceKeyFrame()
+    }
+
+    /// Reduce encode load when a frame exceeds the receiver fragment cap.
     func udpTransportFrameExceededCapacity(_ transport: UDPTransport, fragments: Int, limit: Int) {
         handleTransportOverCapacity(fragments: fragments, limit: limit)
     }
@@ -1352,6 +1362,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
 
         transport.pacingBypassed = loopback
         if isNewClient {
+            transport.resetMediaPacing()
             // Fresh viewer: reset adaptation and ignore the connect-time keyframe
             // requests (which aren't loss) for a short grace window.
             resetAdaptiveBitrate()

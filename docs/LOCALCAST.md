@@ -181,3 +181,42 @@ Capture `pmset -g log` and TidalDrift log timestamps to distinguish network Dark
 Unit tests and the synthetic benchmark complement these checks; they do not replace two-Mac validation or certify a particular resolution/frame-rate target.
 
 [Documentation index](README.md)
+
+### Optional network tuning
+
+In **Settings → Metal Streaming → Network tuning**, enable **Smooth outgoing
+traffic** to try a shared sending budget for video and region updates. It is off
+by default, so existing sessions keep their previous sending behavior.
+
+- **Sending limit** sets the maximum paced media rate (100–10,000 Mbps). Start
+  above your video bitrate and below your measured connection speed. It does not
+  raise or lower the encoder's quality setting.
+- **Burst size** controls how much data is handed to the network at once
+  (8–64 KB, default 16 KB). Smaller bursts spread traffic more evenly; larger
+  bursts reduce scheduling work.
+- **Backlog allowance** limits waiting media to a time-based budget (50–500 ms,
+  default 100 ms). A single large frame is allowed to finish even if it takes
+  longer; the hard queue limit is still 8 MB.
+- **Adjust sending speed automatically** reduces the pacing rate when the viewer
+  reports incomplete frames and restores it gradually during clean periods,
+  within 25–100% of your chosen sending limit. This does not determine whether
+  the cause was the network or either Mac.
+- **Collect connection details** is independently optional and off by default.
+  Host settings show cumulative observed sends, local send failures, and media
+  skipped to keep the sending queue bounded. Viewer Stream Controls → Info adds
+  decoding retries and deliberate playback skips. These counters have different
+  meanings and are not combined into a packet-loss percentage. Diagnostics add
+  completion callbacks, so keep them off for ordinary use if they are not needed.
+
+Restart hosting to apply sender settings; reconnect the viewer to apply its
+extra counters. **Reset network tuning** restores the default-off behavior for
+next start. No diagnostic pop-ups are added. Keyboard, mouse, and heartbeat
+messages retain their immediate send path.
+
+The optional scheduler preserves media order across frame boundaries, caps each
+connection's accepted media queue at 8 MB, and requests a fresh picture after
+skipping media under overload. For comparison, the device's **Network Speed
+Test** now offers UDP delivery-test limits of 100, 250, 500, and 1000 Mbps. It caps
+the actual probe at half the measured TCP speed and displays the rate used.
+Use the same picture settings and content for tuning-on/tuning-off comparisons;
+a clean iperf test alone does not establish an improvement to streaming.

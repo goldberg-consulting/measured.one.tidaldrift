@@ -100,6 +100,7 @@ jobs:
   spm:
     name: SwiftPM Build and Test
     runs-on: macos-15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
 
@@ -110,8 +111,16 @@ jobs:
         working-directory: TidalDrift
         run: swift build
 
-      - name: Test with Swift Package Manager
+      - name: Build bundled iperf3 helper
         working-directory: TidalDrift
+        run: |
+          bash Scripts/bundle-iperf3.sh "$RUNNER_TEMP/TidalDrift-network-check.app"
+          codesign --verify --strict "$RUNNER_TEMP/TidalDrift-network-check.app/Contents/Helpers/iperf3"
+
+      - name: Test with Swift Package Manager and bundled iperf3
+        working-directory: TidalDrift
+        env:
+          TIDALDRIFT_TEST_IPERF: ${{ runner.temp }}/TidalDrift-network-check.app/Contents/Helpers/iperf3
         run: swift test
 
   xcodebuild:

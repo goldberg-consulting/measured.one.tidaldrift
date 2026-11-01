@@ -132,6 +132,8 @@ fi
 # Create PkgInfo
 echo -n "APPL????" > "${CONTENTS}/PkgInfo"
 
+bash "$SCRIPT_DIR/bundle-iperf3.sh" "$APP_BUNDLE" "$DEVID_CERT"
+
 # Step 4: Sign with Developer ID and Hardened Runtime
 echo -e "\n${BLUE}[4/6] Signing with Developer ID...${NC}"
 codesign --force --options runtime --deep --sign "${DEVID_CERT}" \

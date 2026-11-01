@@ -134,6 +134,8 @@ find "$APP_BUNDLE" -type d -exec xattr -c {} \; 2>/dev/null || true
 xattr -rc "$APP_BUNDLE" 2>/dev/null || true
 step_done "Bundle"
 
+bash "$SCRIPT_DIR/Scripts/bundle-iperf3.sh" "$APP_BUNDLE" "$DEV_ID"
+
 # [6/8] Sign
 step_start
 echo -e "${BLUE}[6/8] Signing...${NC}"

@@ -43,6 +43,15 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     // clean, so we add only as much latency as smoothness requires.
     private let frameQueueLock = NSLock()
     private var frameQueue: [DecodedFrame] = []
+    private let collectNetworkDetails = UserDefaults.standard.bool(forKey: "localCastNetworkDiagnostics")
+    private var presentationSkips = 0 // guarded by frameQueueLock
+
+    func takePresentationSkips() -> Int {
+        frameQueueLock.lock(); defer { frameQueueLock.unlock() }
+        let count = presentationSkips
+        presentationSkips = 0
+        return count
+    }
     private var lastPresentedFrame: DecodedFrame?
     private var primed = false
     private var lastPresentTime: CFTimeInterval = 0
@@ -66,7 +75,10 @@ class MetalRenderer: NSObject, MTKViewDelegate {
             _latencyMode = newValue
             targetDepth = max(1, minDepth(for: newValue))
             let cap = maxDepth(for: newValue)
-            if frameQueue.count > cap { frameQueue.removeFirst(frameQueue.count - cap) }
+            if frameQueue.count > cap {
+                if collectNetworkDetails { presentationSkips += frameQueue.count - cap }
+                frameQueue.removeFirst(frameQueue.count - cap)
+            }
             primed = false
             frameQueueLock.unlock()
         }
@@ -498,6 +510,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         frameQueue.append(frame)
         // Drop-to-newest if the queue outgrows the cap (we're behind).
         if frameQueue.count > cap {
+            if collectNetworkDetails { presentationSkips += frameQueue.count - cap }
             frameQueue.removeFirst(frameQueue.count - cap)
         }
         frameCount += 1
@@ -589,6 +602,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
                     }
                 } else {
                     if _latencyMode == .low {
+                        if collectNetworkDetails { presentationSkips += max(0, frameQueue.count - 1) }
                         lastPresentedFrame = frameQueue.last
                         frameQueue.removeAll(keepingCapacity: true)
                     } else {
