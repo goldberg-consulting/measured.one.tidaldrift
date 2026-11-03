@@ -4,8 +4,8 @@ import AppKit
 import OSLog
 
 protocol ScreenCaptureManagerDelegate: AnyObject {
-    func screenCaptureManager(_ manager: ScreenCaptureManager, didOutput sampleBuffer: CMSampleBuffer)
-    func screenCaptureManager(_ manager: ScreenCaptureManager, didFailWithError error: Error)
+    func screenCaptureManager(_ manager: ScreenCaptureManager, stream: SCStream, didOutput sampleBuffer: CMSampleBuffer)
+    func screenCaptureManager(_ manager: ScreenCaptureManager, stream: SCStream, didFailWithError error: Error)
 }
 
 /// Capture mode for LocalCast streaming
@@ -46,13 +46,13 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     private let outputStreamLock = NSLock()
     private var outputStreamID: ObjectIdentifier?
 
-    private func setOutputStream(_ stream: SCStream?) {
+    func setOutputStream(_ stream: SCStream?) {
         outputStreamLock.lock()
         outputStreamID = stream.map(ObjectIdentifier.init)
         outputStreamLock.unlock()
     }
 
-    private func isCurrentOutputStream(_ stream: SCStream) -> Bool {
+    func isCurrentOutputStream(_ stream: SCStream) -> Bool {
         outputStreamLock.lock(); defer { outputStreamLock.unlock() }
         return outputStreamID == ObjectIdentifier(stream)
     }
@@ -496,7 +496,7 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .screen, sampleBuffer.isValid, isCurrentOutputStream(stream) else { return }
         lastFrameChange = parseFrameChange(sampleBuffer)
-        delegate?.screenCaptureManager(self, didOutput: sampleBuffer)
+        delegate?.screenCaptureManager(self, stream: stream, didOutput: sampleBuffer)
     }
 
     /// Parse ScreenCaptureKit frame info into changed rects + coverage, and log
@@ -557,6 +557,6 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         guard isCurrentOutputStream(stream) else { return }
         logger.error("Stream stopped with error: \(error.localizedDescription)")
-        delegate?.screenCaptureManager(self, didFailWithError: error)
+        delegate?.screenCaptureManager(self, stream: stream, didFailWithError: error)
     }
 }

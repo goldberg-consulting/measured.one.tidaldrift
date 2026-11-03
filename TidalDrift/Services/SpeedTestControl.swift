@@ -99,9 +99,17 @@ final class SpeedTestControl {
         return try await receive()
     }
 
+    /// Network.framework can append an interface scope to a numeric address.
+    /// The helper and BSD sockets take the IPv4 bytes without that display suffix.
+    static func numericIPv4(_ description: String) -> String? {
+        let bare = description.prefix { $0 != "%" }
+        guard let address = IPv4Address(String(bare)) else { return nil }
+        return address.rawValue.map { String($0) }.joined(separator: ".")
+    }
+
     var localAddress: String? {
         guard case .hostPort(let host, _) = connection.currentPath?.localEndpoint else { return nil }
-        return "\(host)"
+        return Self.numericIPv4("\(host)")
     }
 
     var interfaceDescription: String {

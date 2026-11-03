@@ -25,14 +25,42 @@ final class SpeedTestService {
         let rttMs: Double
         let jitterMs: Double
         let downloadMbps: Double
-        let downloadLossPct: Double
         let uploadMbps: Double
-        let uploadLossPct: Double
-        let downloadUDPRateMbps: Double
-        let uploadUDPRateMbps: Double
-        let downloadUDPJitterMs: Double
-        let uploadUDPJitterMs: Double
+        let downloadUDP: UDPDelivery
+        let uploadUDP: UDPDelivery
         let route: String
+
+        var udpUnderTarget: Bool { downloadUDP.underTarget || uploadUDP.underTarget }
+
+        var deliveryVerdict: String {
+            if udpUnderTarget {
+                return "The sender ran below target. The loss figures describe the rates actually sent."
+            }
+            if max(downloadUDP.lossPercent, uploadUDP.lossPercent) > 1 {
+                return "Some test packets did not arrive. Try a lower delivery test rate to compare; your current streaming settings have not changed."
+            }
+            return "Delivery looks steady at the measured sending rates."
+        }
+    }
+
+    struct UDPDelivery: Sendable {
+        let targetMbps: Double
+        let senderMbps: Double
+        let lossPercent: Double
+        let jitterMs: Double
+
+        init(targetMbps: Double, measurement: IPerfRunner.Measurement) throws {
+            guard let udp = measurement.udp else {
+                throw IPerfRunner.Failure.message("The peer did not return UDP delivery statistics.")
+            }
+            self.targetMbps = targetMbps
+            senderMbps = udp.senderMbps
+            lossPercent = udp.lossPercent
+            jitterMs = udp.jitterMs
+        }
+
+        /// Allow 10% headroom for ordinary pacing and measurement variation.
+        var underTarget: Bool { senderMbps < targetMbps * 0.9 }
     }
 
     func startResponder() {
@@ -70,17 +98,18 @@ final class SpeedTestService {
 
     private func accept(_ connection: NWConnection) {
         guard case .hostPort(let host, _) = connection.endpoint,
-              NetworkUtils.isLocalPeerAddress("\(host)"), controls.count < 4 else {
+              let peerAddress = SpeedTestControl.numericIPv4("\(host)"),
+              NetworkUtils.isLocalPeerAddress(peerAddress), controls.count < 4 else {
             connection.cancel()
             return
         }
         let id = UUID()
         let control = SpeedTestControl(connection: connection)
         controls[id] = control
-        Task { await serve(control, id: id) }
+        Task { await serve(control, id: id, peerAddress: peerAddress) }
     }
 
-    private func serve(_ control: SpeedTestControl, id: UUID) async {
+    private func serve(_ control: SpeedTestControl, id: UUID, peerAddress: String) async {
         // Also bounds malicious/abandoned clients and helpers stuck inside iperf.
         let lease = Task {
             try await Task.sleep(for: .seconds(50))
@@ -113,7 +142,7 @@ final class SpeedTestService {
                     let port = try Self.availablePort(address: address)
                     let helper = try IPerfRunner(executable: executable, arguments: [
                         "-s", "-1", "-4", "-B", address, "-p", String(port), "--forceflush",
-                        "--idle-timeout", "12", "--server-max-duration", "10", "--rcv-timeout", "5000"
+                        "--tidaldrift-peer", peerAddress, "--idle-timeout", "12", "--server-max-duration", "10", "--rcv-timeout", "5000"
                     ])
                     serverOwner = id
                     server = helper
@@ -151,9 +180,9 @@ final class SpeedTestService {
         return UInt16(bigEndian: endpoint.sin_port)
     }
 
-    func runTest(toHost host: String, udpLimitMbps: Int = 100, progress: @escaping (String) -> Void = { _ in }) async throws -> Result {
+    func runTest(toHost selectedHost: String, udpLimitMbps: Int = 100, progress: @escaping (String) -> Void = { _ in }) async throws -> Result {
         guard !runningTest else { throw IPerfRunner.Failure.message("A network test is already running on this Mac.") }
-        guard NetworkUtils.isLocalPeerAddress(host), !host.contains(":") else {
+        guard let host = SpeedTestControl.numericIPv4(selectedHost), NetworkUtils.isLocalPeerAddress(host) else {
             throw IPerfRunner.Failure.message("Choose a local IPv4 address for the network test.")
         }
         let executable = try helperURL ?? IPerfRunner.executable()
@@ -198,11 +227,9 @@ final class SpeedTestService {
         try? await control.send(.init(action: "stop"))
         let mean = rtts.reduce(0, +) / Double(rtts.count)
         let jitter = (rtts.reduce(0) { $0 + pow($1 - mean, 2) } / Double(rtts.count)).squareRoot()
-        return Result(rttMs: mean, jitterMs: jitter, downloadMbps: download.mbps,
-                      downloadLossPct: downloadUDP.lossPercent!, uploadMbps: upload.mbps,
-                      uploadLossPct: uploadUDP.lossPercent!, downloadUDPRateMbps: downloadRate,
-                      uploadUDPRateMbps: uploadRate, downloadUDPJitterMs: downloadUDP.jitterMs!,
-                      uploadUDPJitterMs: uploadUDP.jitterMs!, route: route)
+        return try Result(rttMs: mean, jitterMs: jitter, downloadMbps: download.mbps, uploadMbps: upload.mbps,
+                          downloadUDP: UDPDelivery(targetMbps: downloadRate, measurement: downloadUDP),
+                          uploadUDP: UDPDelivery(targetMbps: uploadRate, measurement: uploadUDP), route: route)
     }
 
     /// Probe streaming delivery below saturation, not loss from an unlimited flood.
@@ -249,9 +276,9 @@ extension SpeedTestService {
     static func recommend(from r: Result) -> Recommendation {
         let up = r.uploadMbps > 0 ? r.uploadMbps : r.downloadMbps
         let budget = min(r.downloadMbps, up)
-        let loss = max(r.downloadLossPct, r.uploadLossPct)
+        let loss = max(r.downloadUDP.lossPercent, r.uploadUDP.lossPercent)
         let lossy = loss > 1
-        let highJitter = max(r.downloadUDPJitterMs, r.uploadUDPJitterMs) > 20
+        let highJitter = max(r.downloadUDP.jitterMs, r.uploadUDP.jitterMs) > 20
 
         let dimension: Int
         let resLabel: String
@@ -268,7 +295,9 @@ extension SpeedTestService {
 
         var bullets: [String] = []
         bullets.append("Resolution: \(resLabel) — based on about \(Int(budget)) Mbps of measured TCP throughput.")
-        bullets.append("UDP delivery was checked at the rates shown above; higher streaming rates may behave differently.")
+        bullets.append(r.udpUnderTarget
+            ? "The sender ran below target. Only the measured sending rates were checked."
+            : "UDP loss describes the measured sending rates. Higher streaming rates may behave differently.")
         bullets.append("Adaptive bitrate: On — eases quality under load, restores it when the link clears.")
         bullets.append("Drop-to-newest + loss recovery: On — keeps motion smooth and heals quickly.")
         if regionAware {
@@ -286,6 +315,8 @@ extension SpeedTestService {
         let headline: String
         if r.downloadMbps <= 0 {
             headline = "Couldn't measure the link — re-run with both Macs updated."
+        } else if r.udpUnderTarget {
+            headline = "Use TCP speed as a starting point. UDP delivery at the target rate remains untested."
         } else if lossy {
             headline = "UDP loss at the tested rates: optimized for resilience."
         } else if budget < 50 {

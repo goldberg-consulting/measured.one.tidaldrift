@@ -117,6 +117,10 @@ jobs:
           bash Scripts/bundle-iperf3.sh "$RUNNER_TEMP/TidalDrift-network-check.app"
           codesign --verify --strict "$RUNNER_TEMP/TidalDrift-network-check.app/Contents/Helpers/iperf3"
 
+      - name: Verify network-test peer isolation
+        working-directory: TidalDrift
+        run: python3 Scripts/test-iperf3-peer.py "$RUNNER_TEMP/TidalDrift-network-check.app/Contents/Helpers/iperf3"
+
       - name: Test with Swift Package Manager and bundled iperf3
         working-directory: TidalDrift
         env:

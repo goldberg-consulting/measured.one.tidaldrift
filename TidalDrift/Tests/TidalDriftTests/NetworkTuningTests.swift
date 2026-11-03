@@ -106,23 +106,39 @@ final class NetworkTuningTests: XCTestCase {
         await fulfillment(of: [dropped], timeout: 3)
         scheduler.stop()
     }
-    func testTimeBudgetSkipsBacklogAndRequestsRecoveryAfterAcceptedFrame() async {
+
+    func testRecoveryRejectsPendingDeltaAndAdmitsRepairKeyFrame() async {
         let connection = await readyConnection()
         defer { connection.cancel() }
         let recorder = Recorder()
-        let dropped = expectation(description: "Time budget limits backlog")
-        let recovered = expectation(description: "Refresh follows accepted frame")
-        let scheduler = MediaSendScheduler(settings: .init(enabled: true, rateMbps: 25, queueMilliseconds: 50),
-                                           send: { batch, _ in recorder.append(batch) },
-                                           dropped: { dropped.fulfill() }, recover: {
-            XCTAssertEqual(recorder.snapshot().0.count, 200)
-            recovered.fulfill()
+        let dropped = expectation(description: "Overflow and pending delta skipped")
+        dropped.expectedFulfillmentCount = 2
+        let requested = expectation(description: "Refresh requested after accepted frame")
+        let repaired = expectation(description: "Complete replacement keyframe transmitted")
+        let resumed = expectation(description: "Next delta transmitted")
+        let scheduler = MediaSendScheduler(settings: .init(enabled: true, rateMbps: 100, queueMilliseconds: 50), send: { batch, _ in
+            recorder.append(batch)
+            if recorder.snapshot().0.count == 2000 { repaired.fulfill() }
+            if batch.first?.first == 4 { resumed.fulfill() }
+        }, dropped: { dropped.fulfill() }, recover: {
+            XCTAssertEqual(recorder.snapshot().0.count, 1000)
+            requested.fulfill()
         })
-        let frame = Array(repeating: Data(repeating: 1, count: 1000), count: 200)
-        scheduler.enqueue(frame, on: connection)
-        scheduler.enqueue(frame, on: connection)
-        await fulfillment(of: [dropped, recovered], timeout: 3)
-        scheduler.stop()
+        defer { scheduler.stop() }
+        let initial = Array(repeating: Data(repeating: 1, count: 1000), count: 1000)
+        let delta = Array(repeating: Data(repeating: 2, count: 1000), count: 100)
+        scheduler.enqueue(initial, on: connection)
+        scheduler.enqueue(delta, on: connection)
+        await fulfillment(of: [requested], timeout: 3)
+
+        // A delta already in the encoder/transport can arrive before the forced
+        // keyframe. Letting it in would leave too little room for this 1 MB repair.
+        scheduler.enqueue(delta, on: connection)
+        scheduler.enqueue(Array(repeating: Data(repeating: 3, count: 1000), count: 1000), on: connection, kind: .keyFrame)
+        await fulfillment(of: [dropped, repaired], timeout: 3)
+        scheduler.enqueue([Data([4])], on: connection)
+        await fulfillment(of: [resumed], timeout: 3)
+        XCTAssertEqual(recorder.snapshot().0, Array(repeating: 1, count: 1000) + Array(repeating: 3, count: 1000) + [4])
     }
 
 }

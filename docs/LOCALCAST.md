@@ -138,7 +138,7 @@ Encode/decode use hardware media engines; Metal handles presentation. Packet han
 
 The full-frame video path is **8-bit 4:2:0 SDR**. Audio, HDR, and 4:4:4 video are not implemented. Hardware codecs and Metal rendering are required; there is no software codec fallback. Initialization failures surface as connection/capture errors.
 
-Capture transitions are serialized, including settings changes, target changes, and recovery. A failed listener or system wake triggers a host restart and client reauthentication. Recovery cancels pending clipboard transfers and Paste/drop requests; request the action again after reconnecting. Check the destination first if a file drop had already started saving. Recovery is bounded; a prolonged outage can require reconnecting.
+Capture transitions are serialized, including settings changes, target changes, and recovery. When macOS interrupts capture, the host stops that stream before starting its replacement. A late error from the old stream cannot stop the replacement. A failed listener or system wake triggers a host restart and client reauthentication. Recovery cancels pending clipboard transfers and Paste/drop requests; request the action again after reconnecting. Check the destination first if a file drop had already started saving. Recovery is bounded; a prolonged outage can require reconnecting.
 
 Video loss can trigger a keyframe request. FEC can reconstruct up to two missing full-size data fragments per block, but not the short final fragment without its length. The protocol does not selectively retransmit video or acknowledge every control operation.
 
@@ -215,8 +215,10 @@ messages retain their immediate send path.
 
 The optional scheduler preserves media order across frame boundaries, caps each
 connection's accepted media queue at 8 MB, and requests a fresh picture after
-skipping media under overload. For comparison, the device's **Network Speed
+skipping media under overload. Pending delta frames and tiles wait for a fresh
+video keyframe before normal delivery resumes. For comparison, the device's **Network Speed
 Test** now offers UDP delivery-test limits of 100, 250, 500, and 1000 Mbps. It caps
-the actual probe at half the measured TCP speed and displays the rate used.
+the requested rate at half the measured TCP speed and displays the actual
+sending rate alongside the target. Loss describes packets sent at the actual rate.
 Use the same picture settings and content for tuning-on/tuning-off comparisons;
 a clean iperf test alone does not establish an improvement to streaming.

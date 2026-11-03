@@ -1,5 +1,6 @@
 import XCTest
 import CryptoKit
+import ScreenCaptureKit
 @testable import TidalDrift
 
 final class LocalCastSettingsTests: XCTestCase {
@@ -102,6 +103,83 @@ final class LocalCastSettingsTests: XCTestCase {
         }
         let value = try await queue.runThrowing { 42 }
         XCTAssertEqual(value, 42)
+    }
+
+    private final class RecoveryHost: HostSession {
+        var startsAfterFailure = 0
+        // Observe the final start without asking ScreenCaptureKit to record
+        // the machine running the tests.
+        override func beginCaptureForClient() {
+            XCTAssertFalse(isCaptureActive)
+            startsAfterFailure += 1
+            withCaptureState { captureActive = true }
+        }
+
+        /// Register an identity without requesting permission or starting capture.
+        func installStream() -> SCStream {
+            let stream = SCStream(filter: SCContentFilter(), configuration: SCStreamConfiguration(), delegate: nil)
+            captureManager.setOutputStream(stream)
+            return stream
+        }
+    }
+
+    func test_captureFailureKeepsSlotUntilTeardownAndRestartsOnlyOnce() async throws {
+        let host = RecoveryHost(configuration: .default)
+        host.isRunning = true
+        host.setActiveClient(endpoint: .hostPort(host: "127.0.0.1", port: 5904), connection: nil)
+        host.withCaptureState { host.captureActive = true }
+        let (gate, release) = AsyncStream<Void>.makeStream()
+        host.captureTransitions.enqueue { for await _ in gate {} }
+        let failure = LocalCastError.connectionFailed("Interrupted capture")
+        let stream = host.installStream()
+        let first = try XCTUnwrap(host.recoverCapture(after: failure, from: stream))
+        let duplicate = try XCTUnwrap(host.recoverCapture(after: failure, from: stream))
+        XCTAssertTrue(host.isCaptureActive, "A heartbeat must not claim a second start before the failed stream stops")
+        release.finish()
+        await first.value
+        await duplicate.value
+        XCTAssertEqual(host.startsAfterFailure, 1)
+        XCTAssertTrue(host.isCaptureActive)
+    }
+
+    func test_oldCaptureFailureCannotStopReplacementAfterDisplayChange() async throws {
+        let host = RecoveryHost(configuration: .default)
+        host.isRunning = true
+        host.setActiveClient(endpoint: .hostPort(host: "127.0.0.1", port: 5904), connection: nil)
+        host.withCaptureState { host.captureActive = true }
+        let oldStream = host.installStream()
+        let (gate, release) = AsyncStream<Void>.makeStream()
+        host.captureTransitions.enqueue {
+            for await _ in gate {}
+            // A display change was already replacing the capture when the
+            // failing stream reported its error.
+            host.withCaptureState {
+                host.captureActive = false
+                host.captureActive = true
+            }
+        }
+        let recovery = try XCTUnwrap(host.recoverCapture(after: LocalCastError.connectionFailed("Old stream"), from: oldStream))
+        release.finish()
+        await recovery.value
+        XCTAssertEqual(host.startsAfterFailure, 0)
+        XCTAssertTrue(host.isCaptureActive)
+    }
+
+    func test_delayedEncoderErrorFromOldSampleDoesNotRestartNewCapture() async throws {
+        let host = RecoveryHost(configuration: .default)
+        host.isRunning = true
+        host.setActiveClient(endpoint: .hostPort(host: "127.0.0.1", port: 5904), connection: nil)
+        host.withCaptureState { host.captureActive = true }
+        let oldStream = host.installStream()
+        let replacement = host.installStream()
+        // The encoder reports its old sample's error *after* the new stream
+        // became active, so comparing the host generation at callback entry
+        // would incorrectly allow the old failure to stop the replacement.
+        let failure = LocalCastError.connectionFailed("Hardware submission failed")
+        let recovery = try XCTUnwrap(host.recoverCapture(after: failure, from: oldStream))
+        await recovery.value
+        XCTAssertTrue(host.captureManager.isCurrentOutputStream(replacement))
+        XCTAssertEqual(host.startsAfterFailure, 0)
     }
 
     func test_failedReplacementKeepsFirstWorkingSettingsUntilEncodedFrame() {
