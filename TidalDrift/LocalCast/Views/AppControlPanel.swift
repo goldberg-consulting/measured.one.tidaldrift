@@ -1,24 +1,16 @@
 import SwiftUI
 import AppKit
 
-// Floating per-app control panel that pairs with macOS Screen Sharing: it
-// rides TidalDrift's control channel to enumerate, focus, and isolate remote
-// apps while the picture comes from VNC ("best of both worlds").
-
 // MARK: - Floating App Control Panel (NSPanel)
 
-/// A floating utility panel that provides remote app control alongside
-/// macOS Screen Sharing. Connects to the host via TidalDrift's control
-/// channel to enumerate and focus remote apps.
+/// Companion controls for an existing LocalCast viewer and its authenticated session.
 class AppControlPanelController: NSWindowController {
     private let session: ClientSession
-    private let device: DiscoveredDevice
     
     /// Called when the panel is closed.
-    var onClose: ((AppControlPanelController) -> Void)?
+    var onClose: (() -> Void)?
     
-    init(device: DiscoveredDevice, session: ClientSession) {
-        self.device = device
+    init(device: DiscoveredDevice, session: ClientSession, showViewer: @escaping () -> Void) {
         self.session = session
         
         let panel = NSPanel(
@@ -35,14 +27,7 @@ class AppControlPanelController: NSWindowController {
         panel.level = .floating
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         
-        let targetDevice = device
-        let contentView = AppControlPanelView(
-            session: session,
-            deviceName: device.name,
-            onOpenScreenShare: {
-                Task { try? await ScreenShareConnectionService.shared.connect(to: targetDevice) }
-            }
-        )
+        let contentView = AppControlPanelView(session: session, deviceName: device.name, showViewer: showViewer)
         panel.contentView = NSHostingView(rootView: contentView)
         
         // Position in the top-right corner of the main screen
@@ -61,26 +46,15 @@ class AppControlPanelController: NSWindowController {
         fatalError("init(coder:) not implemented")
     }
     
-    deinit {
-        session.disconnect()
-    }
-    
-    override func close() {
-        session.disconnect()
-        onClose?(self)
-        onClose = nil
-        super.close()
-    }
 }
 
 extension AppControlPanelController: NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
-        // close() handles cleanup; this fires for user-initiated close via title bar
-        if onClose != nil {
-            session.disconnect()
-            onClose?(self)
-            onClose = nil
-        }
+        // Closing the companion must not take down the picture or leave apps
+        // hidden on the host. Restore is a no-op when nothing is isolated.
+        session.requestRestoreApps()
+        onClose?()
+        onClose = nil
     }
 }
 
@@ -89,7 +63,7 @@ extension AppControlPanelController: NSWindowDelegate {
 struct AppControlPanelView: View {
     @ObservedObject var session: ClientSession
     let deviceName: String
-    var onOpenScreenShare: () -> Void = {}
+    let showViewer: () -> Void
     @State private var expandedAppID: Int32?
     @State private var isolatedAppPID: Int32?
     
@@ -121,12 +95,7 @@ struct AppControlPanelView: View {
         }
         .frame(minWidth: 280, minHeight: 200)
         .onAppear {
-            // Auto-request the app list once the control channel connects
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                if session.remoteApps.isEmpty {
-                    session.requestAppList()
-                }
-            }
+            if session.remoteApps.isEmpty { session.requestAppList() }
         }
     }
     
@@ -145,12 +114,13 @@ struct AppControlPanelView: View {
                 Spacer()
 
                 Button {
-                    onOpenScreenShare()
+                    showViewer()
                 } label: {
                     Image(systemName: "display")
                 }
                 .buttonStyle(.borderless)
-                .help("Open macOS Screen Sharing to this Mac")
+                .accessibilityLabel("Show LocalCast viewer")
+                .help("Bring the LocalCast viewer forward")
 
                 Button {
                     session.requestAppList()
@@ -364,7 +334,7 @@ struct AppControlPanelView: View {
                 .tint(.blue)
                 .help("Bring to front on remote Mac")
                 
-                // Isolate button (hide all other apps for VNC single-app view)
+                // Isolate the app on the shared desktop.
                 Button {
                     if isolatedAppPID == app.processID {
                         session.requestRestoreApps()
@@ -378,7 +348,7 @@ struct AppControlPanelView: View {
                         .foregroundStyle(isolatedAppPID == app.processID ? .orange : .secondary)
                 }
                 .buttonStyle(.borderless)
-                .help(isolatedAppPID == app.processID ? "Restore all hidden apps" : "Isolate: hide all other apps (VNC single-app view)")
+                .help(isolatedAppPID == app.processID ? "Restore all hidden apps" : "Hide the other apps on the host")
                 
                 // Stream button (switches LocalCast capture)
                 Button {

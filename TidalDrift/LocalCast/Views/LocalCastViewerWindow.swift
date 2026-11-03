@@ -36,6 +36,8 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
     private var registeredViewer = false
     private let device: DiscoveredDevice
     private let clientSession: ClientSession
+    private var appControlPanel: AppControlPanelController?
+    var deviceIdentity: String { device.identityKey }
     private var localMonitors: [Any] = []
     private let keyboardTap = RemoteKeyboardTap()
     private var keyboardTapActive = false
@@ -47,7 +49,7 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
     private var cancellables = Set<AnyCancellable>()
     private var remoteResolution: CGSize = CGSize(width: 1280, height: 720)
     private var hasSizedToRemote = false
-    private var didCleanup = false
+    private(set) var didCleanup = false
     private var interceptedPasteKey = false
     
     /// Called when the window is closed so the owner can release its strong reference.
@@ -467,9 +469,24 @@ class LocalCastViewerWindowController: NSWindowController, ClientSessionDelegate
         cleanup()
     }
 
+    /// The panel borrows the viewer's session. Only the viewer disconnects it.
+    func showAppControlPanel() {
+        if appControlPanel == nil {
+            let panel = AppControlPanelController(device: device, session: clientSession) { [weak self] in
+                self?.showWindow(nil)
+            }
+            panel.onClose = { [weak self] in self?.appControlPanel = nil }
+            appControlPanel = panel
+        }
+        appControlPanel?.showWindow(nil)
+        appControlPanel?.window?.makeKeyAndOrderFront(nil)
+    }
+
     private func cleanup() {
         guard !didCleanup else { return }
         didCleanup = true
+        appControlPanel?.close()
+        appControlPanel = nil
         if registeredViewer {
             registeredViewer = false
             Self.openViewerCount -= 1
@@ -656,7 +673,13 @@ struct LocalCastContentView: View {
         ZStack {
             MetalViewRepresentable(mtkView: mtkView)
             
-            if !session.isConnected {
+            if let message = session.capturePauseMessage {
+                Text(message)
+                    .multilineTextAlignment(.center)
+                    .padding()
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+                    .frame(maxWidth: 380)
+            } else if !session.isConnected {
                 connectionStatusOverlay
             }
             

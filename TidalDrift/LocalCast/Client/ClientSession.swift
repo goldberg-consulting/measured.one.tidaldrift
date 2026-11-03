@@ -45,7 +45,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
     @Published var dropStatus: String?
     private let logger = Logger(subsystem: "com.tidaldrift", category: "ClientSession")
 
-    private let transport = UDPTransport()
+    private let transport: UDPTransport
     private let decoder = VideoDecoder()
 
     /// Serial queue for decode and tile application. The transport delegate
@@ -64,6 +64,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
     @Published var isConnected = false
     @Published var connectionStatus: String = "Connecting..."
     @Published var connectionPhase: ConnectionPhase = .connecting
+    @Published private(set) var capturePauseMessage: String?
 
     /// When true, mouse/keyboard events in the viewer are forwarded to the host
     /// and consumed locally. When false, the viewer is view-only.
@@ -81,6 +82,8 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
 
     private let device: DiscoveredDevice
     private var hostEndpoint: NWEndpoint?
+    // Retain only for the user's explicit close. No automatic sends use it.
+    private var pausedHostEndpoint: NWEndpoint?
     private var connectionCandidates: [String] = []
     private var connectionCandidateIndex = 0
     private var candidateRefreshTask: Task<Void, Never>?
@@ -287,8 +290,9 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
     /// collapse.
     private var recentFetchTokens: [(token: Data, at: Date)] = []
 
-    init(device: DiscoveredDevice) {
+    init(device: DiscoveredDevice, transport: UDPTransport = UDPTransport()) {
         self.device = device
+        self.transport = transport
         transport.delegate = self
         decoder.delegate = self
         decoder.onError = { [weak self] message in
@@ -373,8 +377,9 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
     /// the uplink right when the first keyframe is in flight.
     private func startPostAuthFlow() {
         DispatchQueue.main.async { [weak self] in
-            self?.startHeartbeat()
-            self?.startClipboardSync()
+            guard let self, self.hostEndpoint != nil else { return }
+            self.startHeartbeat()
+            self.startClipboardSync()
         }
 
         for delay in [0.0, 0.5, 1.5] {
@@ -747,7 +752,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         // Tell the host we are leaving so it can re-arm auth immediately
         // instead of waiting out the idle timeout. Encrypted under the
         // session key when one is active, so it cannot be forged.
-        if let endpoint = hostEndpoint {
+        if let endpoint = hostEndpoint ?? pausedHostEndpoint {
             let bye = LocalCastPacket(
                 type: .disconnect,
                 sequenceNumber: 0,
@@ -758,6 +763,8 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
         }
 
         transport.stopListening()
+        pausedHostEndpoint = nil
+        hostEndpoint = nil
         transport.sessionKey = nil
         // Invalidate on the decode queue so it serializes behind any in-flight
         // decode instead of tearing down the session mid-frame.
@@ -1212,6 +1219,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
 
     @MainActor
     private func startHeartbeat() {
+        guard hostEndpoint != nil else { return }
         heartbeatTimer?.invalidate()
         heartbeatTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.sendHeartbeat()
@@ -1296,7 +1304,7 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
     /// file's existing timer concurrency style). Arms only after the stream has
     /// gone live at least once; the diagnostic timer owns the pre-connect window.
     private func checkHeartbeatWatchdog() {
-        guard hasBeenConnected, !recoveryAbandoned else { return }
+        guard hasBeenConnected, !recoveryAbandoned, capturePauseMessage == nil else { return }
 
         let now = Date()
 
@@ -1600,11 +1608,15 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
     /// Apply host capabilities and liveness without mixing them with media decoding.
     private func handleHeartbeat(_ packet: LocalCastPacket) {
         let capabilities = packet.payload.count >= 2 ? packet.payload[packet.payload.startIndex + 1] : nil
+        let paused = (packet.payload.first ?? 0) & HostSession.pongFlagCapturePaused != 0
         DispatchQueue.main.async { [weak self] in
             self?.remoteAccessibilityGranted = capabilities.map { $0 & 0x01 != 0 }
             self?.remoteSupportsDrops = capabilities.map { $0 & 0x02 != 0 } ?? false
             self?.remoteSupportsPaste = capabilities.map { $0 & 0x04 != 0 } ?? false
             self?.remoteSupportsTargetedDrops = capabilities.map { $0 & 0x08 != 0 } ?? false
+            if let self, paused, self.capturePauseMessage == nil {
+                self.pauseForHostCapture()
+            }
         }
         // Pong received - record round-trip latency for the HUD.
         recordHeartbeatResponse(Date())
@@ -1641,6 +1653,29 @@ class ClientSession: ObservableObject, UDPTransportDelegate, VideoDecoderDelegat
                 }
             }
         }
+    }
+
+    /// Keep the socket and key for the viewer's explicit disconnect, but
+    /// stop automatic traffic: the next heartbeat after a host wake/idle
+    /// reset would otherwise silently start another capture.
+    private func pauseForHostCapture() {
+        capturePauseMessage = StreamResponse.pausedMessage
+        connectionStatus = StreamResponse.pausedMessage
+        inputCaptureEnabled = false
+        isConnected = false
+        pausedHostEndpoint = hostEndpoint
+        hostEndpoint = nil
+        heartbeatTimer?.invalidate()
+        heartbeatTimer = nil
+        diagnosticTimer?.invalidate()
+        diagnosticTimer = nil
+        candidateRefreshTask?.cancel()
+        candidateRefreshTask = nil
+        candidateRefreshState.invalidate()
+        isAuthenticating = false
+        clientNonce = nil
+        stopClipboardSync()
+        renderer?.setPaused(true, reason: .disconnected)
     }
 
     private func handleAppListResponse(_ payload: Data) {

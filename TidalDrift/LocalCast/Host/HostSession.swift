@@ -16,50 +16,6 @@ enum HostCaptureTarget: Sendable {
     case app(pid_t, name: String)
 }
 
-/// Strictly-ordered executor for capture stop/start transitions. Five triggers
-/// can rebuild capture concurrently (display reconfiguration, transport
-/// capacity reduction, client stream request, runtime config toggle, SCStream
-/// failure restart), and each is a stop-then-start with suspension points in
-/// between. Two interleaved transitions could overwrite the live SCStream
-/// while another start was in flight (leaking a stream that keeps delivering
-/// frames) or leave `captureActive` true with no stream, a silent permanent
-/// freeze. Operations run one at a time in enqueue order; an actor cannot
-/// provide this because actor methods interleave at await points.
-final class CaptureTransitionQueue {
-    private var lastTask: Task<Void, Never>?
-    private let lock = NSLock()
-
-    @discardableResult
-    func enqueue(_ op: @escaping () async -> Void) -> Task<Void, Never> {
-        lock.withLock {
-            let previous = lastTask
-            let task = Task {
-                await previous?.value
-                await op()
-            }
-            lastTask = task
-            return task
-        }
-    }
-
-    func run(_ op: @escaping () async -> Void) async {
-        await enqueue(op).value
-    }
-
-    func runThrowing<T>(_ op: @escaping () async throws -> T) async throws -> T {
-        let task = lock.withLock {
-            let previous = lastTask
-            let task = Task { () throws -> T in
-                await previous?.value
-                return try await op()
-            }
-            lastTask = Task { _ = try? await task.value }
-            return task
-        }
-        return try await task.value
-    }
-}
-
 // Members below use internal (not private) visibility where the packet-handler
 // extension in HostSession+ControlHandlers.swift needs them.
 class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransportDelegate {
@@ -84,6 +40,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     /// by `startFullDisplayCapture` when no physical display is capturable;
     /// torn down when the session stops or the viewer goes idle.
     let virtualDisplay = VirtualDisplayController()
+    let allowHeadlessDisplay = UserDefaults.standard.bool(forKey: HeadlessDisplayPolicy.preferenceKey)
 
     private var storedConfiguration: LocalCastConfiguration
     var configuration: LocalCastConfiguration {
@@ -265,19 +222,9 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     private var captureGeneration: UInt64 = 0
     private let captureStateLock = NSLock()
 
-    /// Bounded retries for mid-session SCStream failures, so a persistently
-    /// failing capture (e.g. permission revoked) cannot restart-loop forever.
-    /// Reset whenever capture starts successfully.
-    private var captureRestartAttempts = 0
-    private let captureRestartLock = NSLock()
-    private static let maxCaptureRestartAttempts = 5
-
-    /// Sync wrapper so async contexts don't take the lock directly (Swift 6).
-    func resetCaptureRestartAttempts() {
-        captureRestartLock.lock()
-        captureRestartAttempts = 0
-        captureRestartLock.unlock()
-    }
+    private var captureFailurePolicy = CaptureFailurePolicy() // guarded by captureStateLock
+    private var captureViewerEpoch: UInt64 = 0 // guarded by captureStateLock
+    var isCapturePaused: Bool { withCaptureState { captureFailurePolicy.isPaused } }
 
     /// Last time a frame was handed to the encoder. Only touched on the
     /// capture queue. Drives the idle media heartbeat (one frame per second on
@@ -357,9 +304,6 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
                 guard self.hasActiveClient else { return }
                 if self.withCaptureState({ self.captureActive }) {
                     self.logger.info("🖥️ Display parameters changed — rebuilding capture at the new mode")
-                    // A display reconfiguration is a known, recoverable cause;
-                    // do not let it eat into the failure-restart budget.
-                    self.resetCaptureRestartAttempts()
                     Task { [weak self] in
                         guard let self else { return }
                         await self.retarget(to: self.captureTarget)
@@ -371,7 +315,6 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
                     // capture now instead of waiting for the client's next
                     // stall nudge.
                     self.logger.info("🖥️ Display appeared with a waiting viewer — starting capture")
-                    self.resetCaptureRestartAttempts()
                     self.beginCaptureForClient()
                     self.encoder.forceKeyFrame()
                 }
@@ -485,7 +428,6 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         }
         captureManager.captureCursor = newConfig.captureCursor
         if rebuild {
-            resetCaptureRestartAttempts()
             await retarget(to: captureTarget)
         } else {
             await captureManager.updateCursorCapture(newConfig.captureCursor)
@@ -867,17 +809,18 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         // in the async task below, so without claiming up front a burst of
         // client packets (heartbeat + keyframe request arriving together) would
         // each pass this guard and start a second SCStream on top of the first.
-        let alreadyActive = withCaptureState { () -> Bool in
-            if captureActive { return true }
+        let claim = withCaptureState { () -> UInt64? in
+            guard !captureActive, captureFailurePolicy.canStart() else { return nil }
             captureActive = true
-            return false
+            return captureGeneration
         }
-        if alreadyActive { return }
+        guard let claim else { return }
         beginStreamActivity()
 
         Task {
             await captureTransitions.run { [weak self] in
-                guard let self, self.isRunning, self.hasActiveClient, self.authState == .authenticated else { return }
+                guard let self, self.isRunning, self.hasActiveClient, self.authState == .authenticated,
+                      self.withCaptureState({ self.captureGeneration == claim && !self.captureFailurePolicy.isPaused }) else { return }
                 do {
                     // Region-aware tiles need tightly-packed BGRA; the default video
                     // path captures NV12. Choose the capture format from the current
@@ -895,7 +838,6 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
                     }
                     self.updateInputBounds()
                     self.startWindowTracking()
-                    self.resetCaptureRestartAttempts()
                     // A fresh capture/encoder starts at the configured fps/bitrate;
                     // re-impose any active thermal caps on the new session.
                     self.settingsRecovery.captureStarted()
@@ -905,11 +847,8 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
                     self.logger.info("✅ Capture started for connected client")
                 } catch {
                     self.logger.error("❌ Failed to start capture for client: \(error.localizedDescription)")
-                    self.withCaptureState { self.captureActive = false }
-                    self.endStreamActivity()
+                    guard await self.finishFailedStart(error, claim: claim) else { return }
                     if self.restorePreviousCaptureSettings(after: error) {
-                        await self.captureManager.stopCapture()
-                        self.encoder.invalidate()
                         self.beginCaptureForClient()
                         return
                     }
@@ -922,9 +861,52 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         }
     }
 
+    /// A viewer's explicit app/window request replaces an existing capture.
+    /// Reserve the new stream before ScreenCaptureKit can report a failure.
+    func claimCaptureReplacement() -> (hadCapture: Bool, generation: UInt64)? {
+        withCaptureState {
+            guard captureFailurePolicy.canStart() else { return nil }
+            let previous = captureActive
+            captureActive = true
+            return (previous, captureGeneration)
+        }
+    }
+
+    /// Both heartbeat-driven starts and explicit stream requests charge the
+    /// same viewer's budget. Hold the slot through cleanup.
+    func finishFailedStart(_ error: Error, claim: UInt64) async -> Bool {
+        guard let paused = withCaptureState({ () -> Bool? in
+            guard captureGeneration == claim else { return nil }
+            captureFailurePolicy.record(error)
+            return captureFailurePolicy.isPaused
+        }) else { return false }
+        let failure = error as NSError
+        if failure.domain == SCStreamError.errorDomain {
+            logger.error("ScreenCaptureKit start failed (code \(failure.code, privacy: .public))")
+        }
+        stopWindowTracking()
+        await captureManager.stopCapture()
+        encoder.invalidate()
+        guard withCaptureState({
+            guard captureGeneration == claim else { return false }
+            captureActive = false
+            return true
+        }) else { return false }
+        if paused {
+            reportCapturePaused()
+            return false
+        }
+        endStreamActivity()
+        return true
+    }
+
     /// Stop ScreenCaptureKit when the viewer goes idle but keep UDP listening.
     private func suspendCaptureForIdleClient() {
-        withCaptureState { captureActive = false }
+        withCaptureState {
+            captureActive = false
+            captureViewerEpoch &+= 1
+            captureFailurePolicy = CaptureFailurePolicy()
+        }
         // Capture failures clear captureActive before the viewer leaves, but
         // can leave power assertions or a partially prepared display behind.
         // Those resources belong to the viewer and must always be released.
@@ -1251,43 +1233,77 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     }
 
     func screenCaptureManager(_ manager: ScreenCaptureManager, stream: SCStream, didFailWithError error: Error) {
-        recoverCapture(after: error, from: stream)
+        recoverCapture(after: error, from: stream, alreadyStopped: true)
     }
 
     /// Keep the failed capture's slot claimed until teardown has finished. A
     /// heartbeat can otherwise start a replacement while this callback waits
     /// to run, and the delayed stop then shuts down the working stream.
     @discardableResult
-    func recoverCapture(after error: Error, from stream: SCStream) -> Task<Void, Never>? {
-        guard isRunning, hasActiveClient,
-              let generation = withCaptureState({ captureActive ? captureGeneration : nil }) else { return nil }
+    func recoverCapture(after error: Error, from stream: SCStream, alreadyStopped: Bool = false) -> Task<Void, Never>? {
+        guard isRunning, hasActiveClient else { return nil }
+        let stopRequested = CaptureFailurePolicy.isStopRequest(error)
+        guard let claim = withCaptureState({ () -> (generation: UInt64, viewer: UInt64)? in
+            guard captureActive, !captureFailurePolicy.isPaused else { return nil }
+            if stopRequested {
+                // Observe a live stream's stop immediately, before a queued
+                // display change can replace it. A retired stream has no say.
+                guard captureManager.isCurrentOutputStream(stream) else { return nil }
+                captureFailurePolicy.record(error)
+            }
+            return (captureGeneration, captureViewerEpoch)
+        }) else { return nil }
         return captureTransitions.enqueue { [weak self] in
             guard let self, self.isRunning, self.hasActiveClient,
-                  self.withCaptureState({ self.captureGeneration == generation }),
-                  self.captureManager.isCurrentOutputStream(stream) else { return }
-            self.logger.error("Capture failure: \(error.localizedDescription); recovering capture")
-            _ = self.restorePreviousCaptureSettings(after: error)
-            let attempt = self.captureRestartLock.withLock {
-                self.captureRestartAttempts += 1
-                return self.captureRestartAttempts
+                  self.withCaptureState({ self.captureViewerEpoch == claim.viewer
+                      && (stopRequested || (!self.captureFailurePolicy.isPaused && self.captureGeneration == claim.generation)) })
+                  else { return }
+            let current = self.captureManager.isCurrentOutputStream(stream)
+            guard stopRequested || current else { return }
+            let failure = error as NSError
+            if failure.domain == SCStreamError.errorDomain {
+                self.logger.error("ScreenCaptureKit stopped capture (code \(failure.code, privacy: .public))")
+            } else {
+                self.logger.error("Capture failed: \(error.localizedDescription)")
             }
-            await self.captureManager.stopCapture()
-            if attempt <= Self.maxCaptureRestartAttempts {
-                try? await Task.sleep(nanoseconds: 800_000_000)
+            let paused = self.withCaptureState {
+                self.captureFailurePolicy.record(error)
+                return self.captureFailurePolicy.isPaused
             }
+            if !paused { _ = self.restorePreviousCaptureSettings(after: error) }
+            if alreadyStopped, current {
+                await self.captureManager.acknowledgeStop(of: stream)
+            } else {
+                await self.captureManager.stopCapture()
+            }
+            if !paused { try? await Task.sleep(nanoseconds: 800_000_000) }
             let released = self.withCaptureState {
-                guard self.captureGeneration == generation else { return false }
+                guard self.captureViewerEpoch == claim.viewer,
+                      stopRequested || self.captureGeneration == claim.generation else { return false }
                 self.captureActive = false
                 return true
             }
             guard released, self.isRunning, self.hasActiveClient else { return }
-            guard attempt <= Self.maxCaptureRestartAttempts else {
-                self.logger.error("Capture restart limit reached; waiting for a new request")
+            if paused {
+                self.reportCapturePaused()
                 return
             }
-            self.logger.info("🔄 Restarting capture after failure (attempt \(attempt))")
             self.beginCaptureForClient()
             self.encoder.forceKeyFrame()
+        }
+    }
+
+    /// Called on the capture transition queue once for a paused viewer.
+    private func reportCapturePaused() {
+        encoder.invalidate()
+        stopWindowTracking()
+        endStreamActivity()
+        releaseUserActivityAssertion()
+        inputInjector.releaseHeldInput()
+        inputInjector.restoreApps()
+        stopClipboardSync()
+        if let endpoint = clientEndpoint {
+            sendStreamError(StreamResponse.pausedMessage, to: endpoint)
         }
     }
 
@@ -1612,9 +1628,9 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         // demonstrably alive: a live viewer sends heartbeats every second, and
         // a dead socket stops. This keeps a single stray datagram from
         // redirecting the stream (and the input slot) mid-session.
-        if hostPassword == nil, let active = clientEndpoint, let last = lastClientPacketAt,
-           Date().timeIntervalSince(last) < Self.keylessTakeoverGrace,
-           String(describing: active) != String(describing: endpoint) {
+        if hostPassword == nil, let active = clientEndpoint,
+           String(describing: active) != String(describing: endpoint),
+           isCapturePaused || lastClientPacketAt.map({ Date().timeIntervalSince($0) < Self.keylessTakeoverGrace }) == true {
             logger.info("🔌 Ignoring new connection from \(String(describing: endpoint)); current viewer is live")
             return
         }
@@ -1653,8 +1669,9 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     /// reassembly window to match. Older clients ignore both.
     private func sendPong(for ping: LocalCastPacket, to endpoint: NWEndpoint) {
         profileLock.lock()
-        let flags: UInt8 = _fastLANActive ? Self.pongFlagFastLAN : 0
+        var flags: UInt8 = _fastLANActive ? Self.pongFlagFastLAN : 0
         profileLock.unlock()
+        if isCapturePaused, clientEndpoint == endpoint { flags |= Self.pongFlagCapturePaused }
         let inputPermission: UInt8 = inputInjector.hasAccessibilityPermission ? 0x01 : 0
         let capabilities: UInt8 = inputPermission | 0x02 | 0x04 | 0x08
         let pong = LocalCastPacket(
@@ -1669,6 +1686,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
     }
 
     static let pongFlagFastLAN: UInt8 = 0x01
+    static let pongFlagCapturePaused: UInt8 = 0x02
 
     /// How recently the keyless viewer must have sent anything for a new
     /// source to be refused the active slot. Clients heartbeat every second,
@@ -1748,8 +1766,12 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             return
         }
         lastClientPacketAt = Date()
+        if isCapturePaused, packet.type != .disconnect {
+            if packet.type == .heartbeat { sendPong(for: packet, to: endpoint) }
+            return
+        }
 
-        if authState == .authenticated, hasActiveClient {
+        if authState == .authenticated, hasActiveClient, packet.type != .disconnect {
             // beginCaptureForClient is idempotent (it re-checks and claims the
             // slot under the lock), so just call it; no need to pre-check here.
             beginCaptureForClient()
@@ -1849,17 +1871,6 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
             pendingFullRefresh = true  // region-aware: send a full frame to heal
             noteClientLossSignal()
 
-            // A keyframe request while capture is down is the client's
-            // pipeline-dead nudge (its watchdog saw live pongs but stale
-            // media). Re-arm the restart budget and bring capture back up;
-            // without this an exhausted restart budget froze the viewer
-            // permanently even though both ends were alive and talking.
-            if authState == .authenticated, hasActiveClient, !withCaptureState({ captureActive }) {
-                logger.warning("🔑 Keyframe requested while capture is down — reviving capture")
-                resetCaptureRestartAttempts()
-                beginCaptureForClient()
-            }
-
         case .appListRequest:
             // Client wants to know what apps are available to stream
             lcDebug("📋 HostSession: Received app list request from client")
@@ -1929,7 +1940,7 @@ class HostSession: ScreenCaptureManagerDelegate, VideoEncoderDelegate, UDPTransp
         }
 
         await captureTransitions.run { [weak self] in
-            guard let self, self.isRunning else { return }
+            guard let self, self.isRunning, !self.isCapturePaused else { return }
             let hadCapture = self.withCaptureState { () -> Bool in
                 let had = self.captureActive
                 self.captureActive = false

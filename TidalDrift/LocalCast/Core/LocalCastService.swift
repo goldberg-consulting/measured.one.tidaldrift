@@ -105,6 +105,7 @@ class LocalCastService: ObservableObject {
     /// Strong references to active viewer window controllers so they (and their
     /// input-capture event monitors) survive for the lifetime of the window.
     private var activeViewerControllers: [LocalCastViewerWindowController] = []
+    private var openingViewers: [String: Task<LocalCastViewerWindowController, Error>] = [:]
 
     
     
@@ -541,6 +542,16 @@ class LocalCastService: ObservableObject {
     // MARK: - Client Mode
 
     func connect(to device: DiscoveredDevice, password: String? = nil) async throws -> LocalCastViewerWindowController {
+        try Task.checkCancellation()
+        let identity = device.identityKey
+        if let pending = openingViewers[identity] { return try await pending.value }
+        let pending = Task { try await createViewer(for: device, password: password) }
+        openingViewers[identity] = pending
+        defer { openingViewers.removeValue(forKey: identity) }
+        return try await pending.value
+    }
+
+    private func createViewer(for device: DiscoveredDevice, password: String?) async throws -> LocalCastViewerWindowController {
         logger.info("Connecting to \(device.name)")
         WakeOnLANService.shared.knock(device: device)
         
@@ -568,9 +579,12 @@ class LocalCastService: ObservableObject {
         guard session.renderer != nil else {
             throw LocalCastError.connectionFailed("Metal rendering is unavailable on this Mac.")
         }
-        do { try await session.connect(password: resolvedPassword) }
-        catch {
+        do {
+            try await session.connect(password: resolvedPassword)
+            guard !controller.didCleanup else { throw CancellationError() }
+        } catch {
             session.disconnect()
+            controller.close()
             throw error
         }
         
@@ -585,52 +599,22 @@ class LocalCastService: ObservableObject {
         return controller
     }
 
-    // MARK: - System Screen Share + App Control (dormant)
-    //
-    // The previous `connectSystemScreenShare(to:)` opened macOS Screen
-    // Sharing.app AND a TidalDrift control channel for per-app enumeration.
-    // That two-tier hybrid produced most of the race conditions and
-    // misleading "firewall blocked" errors we saw in practice. The new
-    // design keeps VNC (via ScreenShareConnectionService.connect) and the
-    // Metal viewer (via connect(to:)) as two independent entry points;
-    // there is no longer a combined mode.
-
-    /// Strong references to active app control panels so their sessions/windows
-    /// stay alive for the lifetime of the panel.
-    private var activeControlPanels: [AppControlPanelController] = []
-
-    /// "Best of both worlds": open macOS Screen Sharing (VNC) for the picture
-    /// and a floating App Control panel over our control channel to focus /
-    /// isolate a single remote app. Isolate hides the host's other apps so the
-    /// Screen Sharing view shows just the chosen app.
-    @discardableResult
-    func openAppControl(for device: DiscoveredDevice, password: String? = nil) async throws -> AppControlPanelController {
-        WakeOnLANService.shared.knock(device: device)
-        // Pixels come from macOS Screen Sharing.
-        try? await ScreenShareConnectionService.shared.connect(to: device)
-
-        // App control rides the LocalCast control channel (port 5904), so the
-        // host needs LocalCast hosting on. Resolve auth the same way as connect.
-        var resolvedPassword = device.localCastAuthRequired == false ? nil : password
-        if device.localCastAuthRequired == true && (resolvedPassword?.isEmpty ?? true) {
-            let creds = await Task.detached(priority: .userInitiated) {
-                try? KeychainService.shared.getCredential(for: device)
-            }.value
-            resolvedPassword = creds?.password
+    /// Show remote app controls alongside the picture from the same LocalCast
+    /// session. Opening a second capture connection can interrupt the first.
+    func openAppControl(for device: DiscoveredDevice, password: String? = nil) async throws {
+        if !activeViewerControllers.contains(where: { $0.deviceIdentity == device.identityKey }) {
+            await WakeOnLANService.shared.prepareForConnection(to: device, service: .localCast)
         }
-
-        let session = ClientSession(device: device)
-        try await session.connect(password: resolvedPassword)
-
-        let controller = AppControlPanelController(device: device, session: session)
-        activeControlPanels.append(controller)
-        controller.onClose = { [weak self] closed in
-            self?.activeControlPanels.removeAll { $0 === closed }
+        try Task.checkCancellation()
+        // Another connection may finish while wake preparation is suspended.
+        let viewer: LocalCastViewerWindowController
+        if let existing = activeViewerControllers.first(where: { $0.deviceIdentity == device.identityKey }) {
+            viewer = existing
+        } else {
+            viewer = try await connect(to: device, password: password)
         }
-        controller.showWindow(nil)
-        controller.window?.makeKeyAndOrderFront(nil)
-        session.requestAppList()
-        return controller
+        viewer.showWindow(nil)
+        viewer.showAppControlPanel()
     }
 
     func disconnect(from device: DiscoveredDevice) {
@@ -677,7 +661,7 @@ enum LocalCastError: LocalizedError {
         case .decoderInitializationFailed:
             return "Hardware video decoding is unavailable for this stream. Try H.264 or a lower resolution."
         case .noDisplayAvailable:
-            return "No display available to share"
+            return "The host has no display available to share. Wake or connect a display, then reconnect."
         case .hostNotReady:
             return "Remote Mac is not ready to share"
         }

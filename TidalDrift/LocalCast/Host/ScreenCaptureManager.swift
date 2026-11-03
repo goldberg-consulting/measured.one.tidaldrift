@@ -470,7 +470,16 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
         await captureOperations.run { await self.performStopCapture() }
     }
 
-    private func performStopCapture() async {
+    /// didStopWithError means WindowServer already stopped this stream. Drop
+    /// local state without asking the service to stop a second time.
+    func acknowledgeStop(of ended: SCStream) async {
+        await captureOperations.run {
+            guard self.isCurrentOutputStream(ended) else { return }
+            _ = self.detachStream()
+        }
+    }
+
+    private func detachStream() -> SCStream? {
         // Detach the stream state first so it is cleared even when the stop
         // call throws. Leaving `stream` set after a failed stop meant a later
         // startStream retried the failing stop and then overwrote the field
@@ -481,8 +490,11 @@ class ScreenCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
         activeConfig = nil
         captureMode = nil
         setGeometry(bounds: nil, windowID: nil)
-        guard let current else { return }
+        return current
+    }
 
+    private func performStopCapture() async {
+        guard let current = detachStream() else { return }
         do {
             try await current.stopCapture()
             logger.info("Stopped screen capture")

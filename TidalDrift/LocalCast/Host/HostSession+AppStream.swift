@@ -108,13 +108,9 @@ extension HostSession {
             // a concurrent retarget or failure restart cannot interleave.
             try await captureTransitions.runThrowing { [weak self] () throws -> Void in
                 guard let self, self.isRunning else { throw CancellationError() }
-                let hadCapture = self.withCaptureState { () -> Bool in
-                    let had = self.captureActive
-                    self.captureActive = false
-                    return had
-                }
+                guard let claim = self.claimCaptureReplacement() else { throw CancellationError() }
                 self.stopWindowTracking()
-                if hadCapture {
+                if claim.hadCapture {
                     lcDebug("🎬 HostSession: Stopping existing capture...")
                     await self.captureManager.stopCapture()
                     self.encoder.invalidate()
@@ -160,16 +156,12 @@ extension HostSession {
 
                     self.updateInputBounds()
                     self.startWindowTracking()
-                    self.withCaptureState { self.captureActive = true }
                     self.settingsRecovery.captureStarted()
                     self.restoreStreamingParameters()
                     self.refreshThermalPolicy(force: true)
                 } catch {
                     // Cleanup belongs to this transition, before a newer request runs.
-                    self.stopWindowTracking()
-                    await self.captureManager.stopCapture()
-                    self.encoder.invalidate()
-                    self.withCaptureState { self.captureActive = false }
+                    guard await self.finishFailedStart(error, claim: claim.generation) else { throw CancellationError() }
                     throw error
                 }
             }
@@ -212,6 +204,8 @@ extension HostSession {
             lcDebug("🎬 HostSession: ✅ Started streaming '\(request.appName ?? "Display")'")
             lcDebug("🎬 HostSession: Response sent to client")
 
+        } catch is CancellationError {
+            return
         } catch {
             lcDebug("❌ HostSession: Stream request failed: \(error.localizedDescription)")
 

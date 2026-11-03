@@ -14,12 +14,18 @@ extension HostSession {
 
     /// Displays ScreenCaptureKit can actually deliver frames from. A
     /// clamshelled built-in panel either vanishes from the list or lingers
-    /// as an inactive/asleep entry that produces no frames; filter both out
-    /// so the virtual-display fallback engages instead of a silent stall.
+    /// as an inactive/asleep entry that produces no frames. Excluding it
+    /// from capture does not establish that the Mac has no connected display.
     static func usableDisplays(in content: SCShareableContent) -> [SCDisplay] {
         content.displays.filter {
             CGDisplayIsActive($0.displayID) != 0 && CGDisplayIsAsleep($0.displayID) == 0
         }
+    }
+
+    private static func displayInventory(_ content: SCShareableContent) -> HeadlessDisplayPolicy.Inventory {
+        var count: UInt32 = 0
+        let status = CGGetOnlineDisplayList(0, nil, &count)
+        return .init(shareableCount: content.displays.count, onlineCount: status == .success ? count : nil)
     }
 
     /// Update the input injector with the current capture bounds
@@ -47,29 +53,27 @@ extension HostSession {
         var content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
         var usable = Self.usableDisplays(in: content)
 
-        // Lid closed with no external monitor: the built-in panel drops out
-        // of the display list entirely and there is nothing to capture.
-        // Create a virtual display (the Jump Desktop / Splashtop approach)
-        // and stream that. Retried once because early macOS 14 builds
-        // transiently rejected creation while zero physical displays were
-        // attached.
-        if usable.isEmpty {
-            logger.warning("No capturable display (lid closed / headless) — creating a virtual display")
-            for attempt in 1...2 {
-                guard virtualDisplay.create() != nil else { break }
-                // WindowServer registration is asynchronous.
-                try? await Task.sleep(nanoseconds: 700_000_000)
+        if usable.isEmpty, allowHeadlessDisplay, virtualDisplay.mayAttemptCreation {
+            let before = Self.displayInventory(content)
+            if before.isHeadless {
+                // Let a wake or a Screen Sharing display-mode switch settle.
+                try await Task.sleep(for: .milliseconds(700))
                 content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+                guard isRunning, hasActiveClient, authState == .authenticated else { throw CancellationError() }
+                if virtualDisplay.createIfHeadless(enabled: allowHeadlessDisplay, before: before,
+                                                   after: Self.displayInventory(content)) != nil {
+                    // Keep the display until this viewer leaves, even when
+                    // WindowServer registration takes longer than this probe.
+                    try await Task.sleep(for: .milliseconds(700))
+                    content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+                }
                 usable = Self.usableDisplays(in: content)
-                if !usable.isEmpty { break }
-                virtualDisplay.destroy()
-                logger.warning("Virtual display did not register with ScreenCaptureKit (attempt \(attempt))")
             }
         }
 
         let mainID = CGMainDisplayID()
         guard let display = usable.first(where: { $0.displayID == mainID }) ?? usable.first else {
-            logger.error("No capturable display and virtual display unavailable")
+            logger.info("Waiting for a display available to ScreenCaptureKit")
             throw LocalCastError.noDisplayAvailable
         }
         let displayID = display.displayID

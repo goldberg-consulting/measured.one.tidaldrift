@@ -55,6 +55,14 @@ If macOS reports that access is “not permitted,” review the allowed users an
 
 For Linux targets, confirm the VNC server is listening and use its VNC password. The [Pi guide](RASPBERRY_PI.md) includes service and port checks.
 
+## The controlled Mac's physical display goes black
+
+If you chose **Screen Share (VNC)** and the remote picture still works, check the connection type in Apple's Screen Sharing app. **High Performance** blanks the controlled Mac's physical displays when you connect as its logged-in user. Disconnect from the viewer, or press **Esc** on a keyboard connected to the controlled Mac to end the session. The Esc shortcut works with **Screen Sharing** enabled, but not with **Remote Management**. See [Apple's screen sharing type guide](https://support.apple.com/guide/mac-help/mchl1883115d/mac).
+
+To keep the physical display visible, select **Standard** when connecting. For a saved, editable connection, open **Window → Connections → All Connections** on the viewer, click the connection's **Info** button, and change **Screen Sharing Type** to **Standard**. See [Apple's connection settings](https://support.apple.com/guide/mac-help/change-screen-sharing-connection-settings-mac-mchl67d5398b/mac).
+
+If the viewer also stops responding and the Mac remains inaccessible after disconnecting, display blanking alone does not explain the failure. Record the time, which Mac went black, whether you used **Screen Share (VNC)** or **Start Cast**, and whether a previously working SSH connection could still reach it. Those details help distinguish a display issue from a system or network failure.
+
 ## SSH signs in as the wrong user
 
 The menu-bar SSH shortcut uses the username of your current Mac account. When the target has a different username, open Terminal and specify it:
@@ -91,7 +99,9 @@ A network wake can leave the Mac in **DarkWake**, where network services can run
 
 Keep the host connected to power for this test, enable **Wake for network access**, and enable **Wake-on-LAN** and **Auto-wake before connecting** in TidalDrift on the viewer. [Apple’s sleep and wake settings guide](https://support.apple.com/guide/mac-help/mchle41a6ccd/mac) explains the host setting. Leave TidalDrift hosting before closing the lid. Give the connection up to a minute to recover; a device listed as online may still be asleep.
 
-If the viewer reports no response, record whether the host woke and whether the same connection works with the lid open. If it connects but shows no video, record that separately: the network is responding, but capture or display recovery may have failed. LocalCast attempts a virtual display when no usable display is available; closed-lid operation still needs validation on the particular Mac and macOS version. Keeping Screen Sharing connected is a temporary workaround while diagnosing this case.
+If the viewer reports no response, record whether the host woke and whether the same connection works with the lid open. If it connects but shows no video, record that separately: the network is responding, but capture or display recovery may have failed. LocalCast normally waits for an existing display. For an intentionally headless host, enable **Settings → Metal Streaming → Allow a virtual display on a headless Mac**, then restart hosting. If macOS lists a sleeping or mirrored monitor, LocalCast does not add a virtual display. Closed-lid behavior depends on the Mac and macOS version.
+
+If macOS stops capture or several capture attempts fail in a minute, LocalCast pauses that viewer and releases its wake assertions. When the display is available again, close the viewer window and reconnect. You do not need to restart TidalDrift.
 
 ## Report a reproducible problem
 

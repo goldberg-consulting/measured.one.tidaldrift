@@ -2,6 +2,27 @@ import Foundation
 import CoreGraphics
 import OSLog
 
+/// A sleeping or mirrored display can be online even when ScreenCaptureKit
+/// has no drawable display. Only two matching, successful inventories allow
+/// an opted-in host to attach a new WindowServer display.
+struct HeadlessDisplayPolicy {
+    static let preferenceKey = "localCastAllowHeadlessDisplay"
+
+    struct Inventory {
+        let shareableCount: Int
+        let onlineCount: UInt32?
+        var isHeadless: Bool { shareableCount == 0 && onlineCount == 0 }
+    }
+
+    private(set) var attempted = false
+
+    mutating func reserveCreation(enabled: Bool, before: Inventory, after: Inventory) -> Bool {
+        guard enabled, !attempted, before.isHeadless, after.isHeadless else { return false }
+        attempted = true
+        return true
+    }
+}
+
 /// Creates a software display via CoreGraphics' private CGVirtualDisplay
 /// classes so a lid-closed or headless host has something for
 /// ScreenCaptureKit to capture.
@@ -24,6 +45,7 @@ final class VirtualDisplayController {
     /// Serializes create/destroy across the capture-transition contexts that
     /// call them (session stop, idle suspend, capture start).
     private let lock = NSLock()
+    private var policy = HeadlessDisplayPolicy()
 
     /// Strong reference keeping the WindowServer display alive.
     private var display: AnyObject?
@@ -31,9 +53,9 @@ final class VirtualDisplayController {
     /// The Quartz display ID of the live virtual display, or nil.
     private(set) var displayID: CGDirectDisplayID?
 
-    var isActive: Bool {
+    var mayAttemptCreation: Bool {
         lock.lock(); defer { lock.unlock() }
-        return display != nil
+        return !policy.attempted
     }
 
     /// 16:9 at a Retina-friendly logical size; capped well under the
@@ -50,13 +72,13 @@ final class VirtualDisplayController {
             && NSClassFromString("CGVirtualDisplayMode") != nil
     }
 
-    /// Create the virtual display and wait for WindowServer to register it.
-    /// Returns the new display ID, or nil when unsupported or rejected
-    /// (macOS 14 betas transiently refused creation with zero physical
-    /// displays attached, so callers should retry once).
-    func create() -> CGDirectDisplayID? {
+    /// The caller owns the viewer lifecycle and waits for registration. A
+    /// failed creation consumes this viewer's attempt too, so a heartbeat
+    /// cannot repeatedly attach and detach monitors during display changes.
+    func createIfHeadless(enabled: Bool, before: HeadlessDisplayPolicy.Inventory,
+                          after: HeadlessDisplayPolicy.Inventory) -> CGDirectDisplayID? {
         lock.lock(); defer { lock.unlock() }
-        if let displayID, display != nil { return displayID }
+        guard policy.reserveCreation(enabled: enabled, before: before, after: after) else { return nil }
 
         guard Self.isSupported else {
             logger.warning("CGVirtualDisplay classes unavailable on this macOS — cannot create a virtual display")
@@ -146,6 +168,7 @@ final class VirtualDisplayController {
     /// reference drops.
     func destroy() {
         lock.lock(); defer { lock.unlock() }
+        policy = HeadlessDisplayPolicy()
         guard display != nil else { return }
         display = nil
         displayID = nil

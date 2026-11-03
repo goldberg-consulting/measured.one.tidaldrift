@@ -546,9 +546,11 @@ struct DeviceDetailSheet: View {
 
             Button {
                 isOpeningAppControl = true
-                Task {
-                    _ = try? await LocalCastService.shared.openAppControl(for: device)
-                    await MainActor.run { isOpeningAppControl = false }
+                Task { @MainActor in
+                    defer { isOpeningAppControl = false }
+                    do { try await LocalCastService.shared.openAppControl(for: device) }
+                    catch is CancellationError { return }
+                    catch { viewModel.connectionError = error.localizedDescription }
                 }
             } label: {
                 HStack(spacing: 6) {
@@ -557,14 +559,14 @@ struct DeviceDetailSheet: View {
                     } else {
                         Image(systemName: "macwindow.on.rectangle")
                     }
-                    Text("Screen Share + App Control")
+                    Text("LocalCast + App Control")
                 }
             }
             .buttonStyle(.borderedProminent)
             .disabled(isOpeningAppControl)
-            .help("Opens macOS Screen Sharing for the picture plus a panel to focus or isolate a single app on the remote Mac.")
+            .help("Show the LocalCast viewer with a panel to focus or isolate a remote app.")
 
-            Text("Picture comes from macOS Screen Sharing; \"Isolate\" hides the remote's other apps so you see just one. Requires LocalCast hosting on the remote Mac (for the control channel).")
+            Text("Start LocalCast hosting on the remote Mac. The viewer and app controls share one connection. Isolate hides the other apps on the host.")
                 .font(.caption2)
                 .foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

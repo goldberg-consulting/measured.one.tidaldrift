@@ -66,6 +66,7 @@ extension HostSession {
     ) {
         userActivityLock.lock()
         defer { userActivityLock.unlock() }
+        guard !isCapturePaused else { return }
         guard now.timeIntervalSince(lastUserActivityDeclaration) >= Self.userActivityMinInterval else { return }
         // Failed requests retry promptly, without doing power-management IPC
         // for every mouse-movement packet when the system keeps rejecting them.
