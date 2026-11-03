@@ -108,13 +108,13 @@ Thermal throttling starts at **fair** pressure with a 45 fps ceiling and 75% of 
 
 Changes to **Require authentication**, **Host password**, and **Input rate limit** in Settings apply after stopping and starting hosting. The menu-bar **Require password** switch restarts hosting automatically; editing its password field still needs a host restart.
 
-## Screen Share + App Control
+## LocalCast + App Control
 
-Device details include **Screen Share + App Control** under **Available Services**. This opens macOS Screen Sharing for the picture and a separate TidalDrift panel for app focus and isolation.
+In device details, choose **Available Services → LocalCast + App Control** to open a LocalCast viewer with a floating app panel. The picture and app commands use the same connection. If a viewer is already open for that Mac, the panel uses it. The host needs LocalCast hosting enabled.
 
-The host needs **both** macOS Screen Sharing and LocalCast hosting enabled. LocalCast supplies the app list and control channel, so enabling macOS Screen Sharing alone is insufficient. Authenticated app control uses the saved LocalCast host password. **Isolate** hides other host apps; it does not create a separate remote desktop or an access boundary around one app.
+**Focus** brings an app forward. **Isolate** hides other apps on the shared desktop; it does not restrict access to one app. Closing the panel restores hidden apps and leaves the viewer open. Closing the viewer closes the panel and disconnects. You can also select a desktop, app, or window in **Stream Controls → Apps**.
 
-For LocalCast’s own app/window capture, open **Start Cast**, then **Stream Controls → Apps**.
+To use the separate macOS Screen Sharing app, choose **Quick Connect → Screen Share** instead.
 
 ## Connection and security details
 
@@ -138,7 +138,7 @@ Encode/decode use hardware media engines; Metal handles presentation. Packet han
 
 The full-frame video path is **8-bit 4:2:0 SDR**. Audio, HDR, and 4:4:4 video are not implemented. Hardware codecs and Metal rendering are required; there is no software codec fallback. Initialization failures surface as connection/capture errors.
 
-Capture transitions are serialized, including settings changes, target changes, and recovery. A failed listener or system wake triggers a host restart and client reauthentication. Recovery cancels pending clipboard transfers and Paste/drop requests; request the action again after reconnecting. Check the destination first if a file drop had already started saving. Recovery is bounded; a prolonged outage can require reconnecting.
+Capture transitions are serialized, including settings changes, target changes, and recovery. When macOS interrupts capture, the host stops that stream before starting its replacement. A late error from the old stream cannot stop the replacement. A failed listener or system wake triggers a host restart and client reauthentication. Recovery cancels pending clipboard transfers and Paste/drop requests; request the action again after reconnecting. Check the destination first if a file drop had already started saving. Recovery is bounded; a prolonged outage can require reconnecting.
 
 Video loss can trigger a keyframe request. FEC can reconstruct up to two missing full-size data fragments per block, but not the short final fragment without its length. The protocol does not selectively retransmit video or acknowledge every control operation.
 
@@ -174,7 +174,7 @@ For the wake regressions, enable auto-wake in TidalDrift and network wake on the
 1. Sleep the host and launch **Screen Share** while its Bonjour entry still looks online. Repeat after it looks offline, with a saved MAC address and with only the sleep-proxy path available. Verify the Screen Sharing service becomes usable, not merely discoverable.
 2. Leave a stale Wi-Fi address among the device's candidates while Ethernet remains reachable. Repeat Screen Share and Start Cast using the hostname and alternate adapter. Record timeouts and the address that succeeds.
 3. Disable macOS Screen Sharing, leave LocalCast hosting enabled, and sleep the host. **Start Cast** must attempt its UDP handshake without waiting for TCP 5900. Verify authentication, first video, and keyboard/mouse control.
-4. For closed-lid behavior, connect the host to AC power, disconnect any Screen Sharing session, close the lid, and let the host sleep. Repeat Start Cast with online and offline discovery status, then stream for at least three minutes. Also close the lid during an active cast, disconnect the viewer, and confirm LocalCast releases its session power assertions and virtual display.
+4. For closed-lid behavior, connect the host to AC power and test both with a connected display and with no display. With default settings LocalCast must never add a display during wake, a Screen Sharing connection, or a display mode switch. For deliberately headless hosting, enable **Allow a virtual display on a headless Mac** in Metal Streaming settings and restart hosting. Only when both ScreenCaptureKit and Core Graphics report zero displays twice may LocalCast attempt one temporary display for the viewer. Close the viewer and confirm its power assertions and any temporary display are released.
 
 Capture `pmset -g log` and TidalDrift log timestamps to distinguish network DarkWake, full wake, listener recovery, and first video; the system's full-wake notification alone does not identify every network wake ([Apple DTS explanation](https://developer.apple.com/forums/thread/770517)). These steps are a manual validation plan; they do not establish that hardware wake testing has passed.
 
@@ -215,8 +215,10 @@ messages retain their immediate send path.
 
 The optional scheduler preserves media order across frame boundaries, caps each
 connection's accepted media queue at 8 MB, and requests a fresh picture after
-skipping media under overload. For comparison, the device's **Network Speed
+skipping media under overload. Pending delta frames and tiles wait for a fresh
+video keyframe before normal delivery resumes. For comparison, the device's **Network Speed
 Test** now offers UDP delivery-test limits of 100, 250, 500, and 1000 Mbps. It caps
-the actual probe at half the measured TCP speed and displays the rate used.
+the requested rate at half the measured TCP speed and displays the actual
+sending rate alongside the target. Loss describes packets sent at the actual rate.
 Use the same picture settings and content for tuning-on/tuning-off comparisons;
 a clean iperf test alone does not establish an improvement to streaming.

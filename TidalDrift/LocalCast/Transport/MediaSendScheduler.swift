@@ -5,13 +5,22 @@ import Network
 /// frame. Control packets bypass this queue. The eight-MB bound prevents an
 /// overloaded sender retaining an unlimited video backlog.
 final class MediaSendScheduler {
+    enum FrameKind {
+        case dependent // Video deltas and region updates need an intact picture.
+        case keyFrame
+    }
+
+    private enum Recovery {
+        case normal, draining, waitingForKeyFrame
+    }
+
     private final class Stream {
         let connection: NWConnection
         var budget: MediaPacingBudget
         var frames: [[Data]] = []
         var fragmentIndex = 0
         var queuedBytes = 0
-        var recovering = false
+        var recovery = Recovery.normal
         let generation = UUID()
         init(connection: NWConnection, settings: NetworkTuning) {
             self.connection = connection
@@ -36,31 +45,41 @@ final class MediaSendScheduler {
         self.recover = recover
     }
 
-    func enqueue(_ fragments: [Data], on connection: NWConnection) {
+    func enqueue(_ fragments: [Data], on connection: NWConnection, kind: FrameKind = .dependent) {
         queue.async { [self] in
-            guard !stopped else { return }
+            guard !stopped, !fragments.isEmpty else { return }
             streams = streams.filter { $0.value.connection.state == .ready }
             let key = ObjectIdentifier(connection)
             let stream = streams[key] ?? Stream(connection: connection, settings: settings)
+            streams[key] = stream
+            if stream.recovery == .draining || (stream.recovery == .waitingForKeyFrame && kind != .keyFrame) {
+                dropped()
+                return
+            }
             let bytes = fragments.reduce(0) { $0 + $1.count }
             // Allow one large frame to finish even if it exceeds the delay target;
             // additional frames must fit the time budget and the hard memory cap.
             let timeBudgetBytes = Int(stream.budget.rateMbps * 125 * Double(settings.queueMilliseconds))
             let limit = min(Self.maximumQueuedBytes, max(bytes, timeBudgetBytes))
-            guard !stream.recovering, stream.queuedBytes + bytes <= limit else {
+            guard stream.queuedBytes + bytes <= limit else {
                 dropped()
-                stream.recovering = true
-                // Frames already accepted stay in order. Once they drain, request
-                // a keyframe before resuming after the omitted encoded frames.
-                if stream.frames.isEmpty { stream.recovering = false; recover() }
+                stream.recovery = .draining
+                if stream.frames.isEmpty { requestKeyFrame(for: stream) }
                 return
             }
             let idle = stream.frames.isEmpty
             stream.frames.append(fragments)
             stream.queuedBytes += bytes
-            streams[key] = stream
+            stream.recovery = .normal
             if idle { drain(key, generation: stream.generation) }
         }
+    }
+
+    private func requestKeyFrame(for stream: Stream) {
+        // The encoder produces the repair asynchronously. A delta already in
+        // flight must not consume the empty queue before the repair arrives.
+        stream.recovery = .waitingForKeyFrame
+        recover()
     }
 
     func reset() { queue.async { [self] in streams.removeAll() } }
@@ -107,9 +126,8 @@ final class MediaSendScheduler {
             queue.asyncAfter(deadline: .now() + stream.budget.delay(at: ProcessInfo.processInfo.systemUptime)) { [weak self] in
                 self?.drain(key, generation: generation)
             }
-        } else if stream.recovering {
-            stream.recovering = false
-            recover()
+        } else if stream.recovery == .draining {
+            requestKeyFrame(for: stream)
         }
     }
 }

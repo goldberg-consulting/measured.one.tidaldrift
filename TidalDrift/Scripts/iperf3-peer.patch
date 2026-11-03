@@ -1,0 +1,118 @@
+--- a/src/iperf.h
++++ b/src/iperf.h
+@@ -36,4 +36,5 @@
+ #include <sys/select.h>
+ #include <sys/socket.h>
++#include <netinet/in.h>
+ #ifndef _GNU_SOURCE
+ # define _GNU_SOURCE
+@@ -314,4 +315,5 @@
+     char     *server_hostname;                  /* -c option */
+     char     *tmp_template;
++    uint32_t tidaldrift_peer;                    /* control peer IPv4, network byte order; 0 if unrestricted */
+     char     *bind_address;                     /* first -B option */
+     char     *bind_dev;                         /* bind to network device */
+@@ -443,4 +445,16 @@
+ };
+ 
++/* Never learn this address from iperf's network parameters: TidalDrift
++ * supplies the established TCP control peer on the server command line. */
++static inline int
++tidaldrift_peer_allowed(const struct iperf_test *test, const struct sockaddr_storage *peer)
++{
++    return !test->tidaldrift_peer || (peer->ss_family == AF_INET &&
++        ((const struct sockaddr_in *)peer)->sin_addr.s_addr == test->tidaldrift_peer);
++}
++
++/* A stray setup packet was consumed. Keep waiting for the intended stream. */
++#define TIDALDRIFT_IGNORE_STREAM (-2)
++
+ /* default settings */
+ #define PORT 5201  /* default port to listen on (don't use the same port as iperf2) */
+--- a/src/iperf_api.h
++++ b/src/iperf_api.h
+@@ -108,4 +108,5 @@
+ #define OPT_SERVER_MAX_DURATION 34
+ #define OPT_GSRO 35
++#define OPT_TIDALDRIFT_PEER 256
+ 
+ /* states */
+--- a/src/iperf_api.c
++++ b/src/iperf_api.c
+@@ -1120,4 +1120,5 @@
+         {"bandwidth", required_argument, NULL, 'b'},
+         {"server-bitrate-limit", required_argument, NULL, OPT_SERVER_BITRATE_LIMIT},
++        {"tidaldrift-peer", required_argument, NULL, OPT_TIDALDRIFT_PEER},
+         {"server-max-duration", required_argument, NULL, OPT_SERVER_MAX_DURATION},
+         {"time", required_argument, NULL, 't'},
+@@ -1592,4 +1593,11 @@
+ 		server_flag = 1;
+ 	        break;
++            case OPT_TIDALDRIFT_PEER:
++                if (inet_pton(AF_INET, optarg, &test->tidaldrift_peer) != 1 || !test->tidaldrift_peer) {
++                    fprintf(stderr, "Invalid TidalDrift control peer IPv4 address\n");
++                    exit(1);
++                }
++                server_flag = 1;
++                break;
+             case OPT_SERVER_MAX_DURATION:
+                 test->max_server_duration = atoi(optarg);
+@@ -2371,4 +2379,8 @@
+ #endif //HAVE_SSL
+ 
++        if (test->tidaldrift_peer && test->protocol->id != Ptcp && test->protocol->id != Pudp) {
++            i_errno = IEPROTOCOL;
++            return -1;
++        }
+         if ((s = test->protocol->listen(test)) < 0) {
+             return -1;
+--- a/src/iperf_server_api.c
++++ b/src/iperf_server_api.c
+@@ -165,4 +165,9 @@
+     }
+ 
++    if (!tidaldrift_peer_allowed(test, &addr)) {
++        close(s);
++        return 0;
++    }
++
+     if (test->ctrl_sck == -1) {
+         /* Server free, accept new client */
+@@ -761,5 +766,5 @@
+                 }
+             }
+-            if (FD_ISSET(test->ctrl_sck, &read_set)) {
++            if (test->ctrl_sck >= 0 && FD_ISSET(test->ctrl_sck, &read_set)) {
+                 if (iperf_handle_message_server(test) < 0) {
+ 		    cleanup_server(test);
+@@ -772,5 +777,8 @@
+                 if (FD_ISSET(test->prot_listener, &read_set)) {
+ 
+-                    if ((s = test->protocol->accept(test)) < 0) {
++                    s = test->protocol->accept(test);
++                    if (s == TIDALDRIFT_IGNORE_STREAM)
++                        continue;
++                    if (s < 0) {
+ 			cleanup_server(test);
+                         return -1;
+--- a/src/iperf_tcp.c
++++ b/src/iperf_tcp.c
+@@ -135,4 +135,8 @@
+         i_errno = IESTREAMCONNECT;
+         return -1;
++    }
++    if (!tidaldrift_peer_allowed(test, &addr)) {
++        close(s);
++        return TIDALDRIFT_IGNORE_STREAM;
+     }
+ #if defined(HAVE_SO_MAX_PACING_RATE)
+--- a/src/iperf_udp.c
++++ b/src/iperf_udp.c
+@@ -546,4 +546,7 @@
+     }
+ 
++    if (!tidaldrift_peer_allowed(test, &sa_peer))
++        return TIDALDRIFT_IGNORE_STREAM;
++
+     if (connect(s, (struct sockaddr *) &sa_peer, len) < 0) {
+         i_errno = IESTREAMACCEPT;

@@ -10,9 +10,6 @@ class VideoEncoder {
     private let logger = Logger(subsystem: "com.tidaldrift", category: "VideoEncoder")
     
     weak var delegate: VideoEncoderDelegate?
-    /// Delivered asynchronously after session access is unlocked. The host can
-    /// restore capture settings without reentering a VideoToolbox operation.
-    var onError: ((String) -> Void)?
     
     private var session: VTCompressionSession?
 
@@ -192,16 +189,16 @@ class VideoEncoder {
         return true
     }
     
-    func encode(_ sampleBuffer: CMSampleBuffer) {
+    /// Report a submission error to this frame's owner, after releasing the
+    /// session lock. An error from a retired capture must not restart its successor.
+    func encode(_ sampleBuffer: CMSampleBuffer, onError: (String) -> Void = { _ in }) {
         guard let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
         var failureMessage: String?
         sessionLock.lock()
         defer {
             sessionLock.unlock()
-            if let failureMessage {
-                Task { [weak self] in self?.onError?(failureMessage) }
-            }
+            if let failureMessage { onError(failureMessage) }
         }
 
         // Auto-reconfigure if the incoming frame resolution doesn't match the

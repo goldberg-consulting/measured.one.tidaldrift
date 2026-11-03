@@ -392,12 +392,14 @@ struct DeviceDetailSheet: View {
                     speedRow("Latency", String(format: "%.1f ms (±%.1f jitter)", r.rttMs, r.jitterMs))
                     speedRow("TCP down", String(format: "%.1f Mbps", r.downloadMbps))
                     speedRow("TCP up", String(format: "%.1f Mbps", r.uploadMbps))
-                    speedRow("UDP down", String(format: "%.2f%% loss at %.1f Mbps", r.downloadLossPct, r.downloadUDPRateMbps))
-                    speedRow("UDP up", String(format: "%.2f%% loss at %.1f Mbps", r.uploadLossPct, r.uploadUDPRateMbps))
-                    Text(String(format: "UDP jitter: ↓ %.2f ms · ↑ %.2f ms", r.downloadUDPJitterMs, r.uploadUDPJitterMs))
+                    speedRow("UDP down", deliverySummary(r.downloadUDP))
+                    speedRow("UDP up", deliverySummary(r.uploadUDP))
+                    Text(String(format: "UDP targets: ↓ %.1f Mbps · ↑ %.1f Mbps", r.downloadUDP.targetMbps, r.uploadUDP.targetMbps))
+                        .font(.caption)
+                    Text(String(format: "UDP jitter: ↓ %.2f ms · ↑ %.2f ms", r.downloadUDP.jitterMs, r.uploadUDP.jitterMs))
                         .font(.caption)
                     Text(r.route).font(.caption2).textSelection(.enabled)
-                    Text(speedVerdict(r))
+                    Text(r.deliveryVerdict)
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -487,11 +489,8 @@ struct DeviceDetailSheet: View {
         }
     }
 
-    private func speedVerdict(_ r: SpeedTestService.Result) -> String {
-        if max(r.downloadLossPct, r.uploadLossPct) > 1 {
-            return "Some test packets did not arrive. Try a lower delivery test rate to compare; your current streaming settings have not changed."
-        }
-        return "Delivery looks steady at the tested rates. You can also try a rate closer to your streaming settings."
+    private func deliverySummary(_ delivery: SpeedTestService.UDPDelivery) -> String {
+        String(format: "%.2f%% loss at %.1f Mbps sent", delivery.lossPercent, delivery.senderMbps)
     }
 
     private func runSpeedTest() {
@@ -547,9 +546,11 @@ struct DeviceDetailSheet: View {
 
             Button {
                 isOpeningAppControl = true
-                Task {
-                    _ = try? await LocalCastService.shared.openAppControl(for: device)
-                    await MainActor.run { isOpeningAppControl = false }
+                Task { @MainActor in
+                    defer { isOpeningAppControl = false }
+                    do { try await LocalCastService.shared.openAppControl(for: device) }
+                    catch is CancellationError { return }
+                    catch { viewModel.connectionError = error.localizedDescription }
                 }
             } label: {
                 HStack(spacing: 6) {
@@ -558,14 +559,14 @@ struct DeviceDetailSheet: View {
                     } else {
                         Image(systemName: "macwindow.on.rectangle")
                     }
-                    Text("Screen Share + App Control")
+                    Text("LocalCast + App Control")
                 }
             }
             .buttonStyle(.borderedProminent)
             .disabled(isOpeningAppControl)
-            .help("Opens macOS Screen Sharing for the picture plus a panel to focus or isolate a single app on the remote Mac.")
+            .help("Show the LocalCast viewer with a panel to focus or isolate a remote app.")
 
-            Text("Picture comes from macOS Screen Sharing; \"Isolate\" hides the remote's other apps so you see just one. Requires LocalCast hosting on the remote Mac (for the control channel).")
+            Text("Start LocalCast hosting on the remote Mac. The viewer and app controls share one connection. Isolate hides the other apps on the host.")
                 .font(.caption2)
                 .foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

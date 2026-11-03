@@ -38,6 +38,7 @@ struct StreamRequest: Codable {
 
 /// Response to a stream request
 struct StreamResponse: Codable {
+    static let pausedMessage = "Screen capture paused on the host. When you’re ready to share again, close this viewer and reconnect."
     let success: Bool
     let message: String?
     let streamingTarget: String?  // What is being streamed

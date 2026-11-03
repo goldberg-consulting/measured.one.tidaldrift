@@ -24,13 +24,6 @@ final class IPerfRunner {
     static func executable() throws -> URL {
         let bundled = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/iperf3")
         if FileManager.default.isExecutableFile(atPath: bundled.path) { return bundled }
-        #if DEBUG
-        // SwiftPM/Xcode development builds do not assemble the .app helper directory.
-        for path in ["/opt/homebrew/bin/iperf3", "/usr/local/bin/iperf3"]
-            where FileManager.default.isExecutableFile(atPath: path) {
-            return URL(fileURLWithPath: path)
-        }
-        #endif
         throw Failure.message("The network-test helper is missing. Install a complete TidalDrift build on both Macs.")
     }
 
@@ -104,8 +97,13 @@ final class IPerfRunner {
 
     struct Measurement: Sendable {
         let mbps: Double
-        let lossPercent: Double?
-        let jitterMs: Double?
+        let udp: UDPStatistics?
+    }
+
+    struct UDPStatistics: Sendable {
+        let senderMbps: Double
+        let lossPercent: Double
+        let jitterMs: Double
     }
 
     /// Both normal and reverse tests use receiver statistics. Sender-side UDP loss
@@ -118,18 +116,24 @@ final class IPerfRunner {
         guard let end = root["end"] as? [String: Any],
               let received = end["sum_received"] as? [String: Any],
               let bits = received["bits_per_second"] as? Double, bits.isFinite, bits >= 0,
-              let seconds = received["seconds"] as? Double, seconds > 0 else {
+              let seconds = received["seconds"] as? Double, seconds.isFinite, seconds > 0 else {
             throw Failure.message("The peer returned an incomplete network measurement. Update both Macs.")
         }
         if udp {
+            guard let sent = end["sum_sent"] as? [String: Any],
+                  let senderBits = sent["bits_per_second"] as? Double, senderBits.isFinite, senderBits > 0,
+                  let senderSeconds = sent["seconds"] as? Double, senderSeconds.isFinite, senderSeconds > 0 else {
+                throw Failure.message("The peer did not return a measured UDP sending rate.")
+            }
             guard let packets = received["packets"] as? Double, packets > 0,
                   let loss = received["lost_percent"] as? Double, loss.isFinite, (0...100).contains(loss),
                   let jitter = received["jitter_ms"] as? Double, jitter.isFinite, jitter >= 0 else {
                 throw Failure.message("The peer did not return valid UDP receiver statistics.")
             }
-            return Measurement(mbps: bits / 1_000_000, lossPercent: loss, jitterMs: jitter)
+            return Measurement(mbps: bits / 1_000_000, udp: UDPStatistics(
+                senderMbps: senderBits / 1_000_000, lossPercent: loss, jitterMs: jitter))
         }
-        return Measurement(mbps: bits / 1_000_000, lossPercent: nil, jitterMs: nil)
+        return Measurement(mbps: bits / 1_000_000, udp: nil)
     }
 
     static func clientArguments(host: String, localAddress: String, port: UInt16,

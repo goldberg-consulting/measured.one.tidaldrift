@@ -522,7 +522,7 @@ class UDPTransport {
     /// synchronous `NWConnection.send` calls there blocked the encoder's XPC
     /// return path and was a major heat source at high bitrate. The queue is
     /// serial, so packet ordering is preserved across all callers.
-    func send(packet: LocalCastPacket, on connection: NWConnection, forcePlaintext: Bool = false) {
+    func send(packet: LocalCastPacket, on connection: NWConnection, forcePlaintext: Bool = false, isKeyFrame: Bool = false) {
         // Snapshot the session key at enqueue time, not inside the async block.
         // The auth flow installs or clears the key immediately after handing a
         // packet to send (authChallenge goes out plaintext, then the key goes
@@ -532,11 +532,11 @@ class UDPTransport {
         // packet in plaintext, which the peer rightly drops.
         let keyAtEnqueue = forcePlaintext ? nil : sessionKey
         sendQueue.async { [weak self] in
-            self?.performSend(packet: packet, on: connection, key: keyAtEnqueue)
+            self?.performSend(packet: packet, on: connection, key: keyAtEnqueue, isKeyFrame: isKeyFrame)
         }
     }
 
-    private func performSend(packet: LocalCastPacket, on connection: NWConnection, key: SymmetricKey?) {
+    private func performSend(packet: LocalCastPacket, on connection: NWConnection, key: SymmetricKey?, isKeyFrame: Bool) {
         let raw = packet.serialize()
         statsLock.lock()
         _sendCount += 1
@@ -570,9 +570,15 @@ class UDPTransport {
         // Check if we need to fragment. Only video frames are "droppable" by the
         // receiver's drop-to-newest reassembly; tiles and control packets must
         // be delivered whole (a lost tile is healed by periodic refresh instead).
+        let media: MediaSendScheduler.FrameKind?
+        switch packet.type {
+        case .videoFrame: media = isKeyFrame ? .keyFrame : .dependent
+        case .tileUpdate: media = .dependent
+        default: media = nil
+        }
         if data.count + FragmentHeader.size > maxPayloadSize {
             sendFragmented(data: data, on: connection, droppable: packet.type == .videoFrame,
-                           pacedMedia: packet.type == .videoFrame || packet.type == .tileUpdate)
+                           media: media)
         } else {
             // Small packet, send directly with a "no fragment" header
             var noFragmentData = Data(capacity: FragmentHeader.size + data.count)
@@ -580,8 +586,8 @@ class UDPTransport {
             header.append(into: &noFragmentData)
             noFragmentData.append(data)
             
-            if packet.type == .videoFrame || packet.type == .tileUpdate, let scheduler = scheduler() {
-                scheduler.enqueue([noFragmentData], on: connection)
+            if let media, let scheduler = scheduler() {
+                scheduler.enqueue([noFragmentData], on: connection, kind: media)
                 return
             }
             let packetType = packet.type // Capture for closure
@@ -601,7 +607,7 @@ class UDPTransport {
     /// remaining 31 bits are the frame counter (wraps after ~414 days at 60fps).
     static let droppableFrameFlag: UInt32 = 0x8000_0000
 
-    private func sendFragmented(data: Data, on connection: NWConnection, droppable: Bool, pacedMedia: Bool) {
+    private func sendFragmented(data: Data, on connection: NWConnection, droppable: Bool, media: MediaSendScheduler.FrameKind?) {
         fragmentLock.lock()
         frameCounter &+= 1
         let frameId = (frameCounter & ~Self.droppableFrameFlag) | (droppable ? Self.droppableFrameFlag : 0)
@@ -689,8 +695,8 @@ class UDPTransport {
             }
         }
 
-        if pacedMedia, let scheduler = scheduler() {
-            scheduler.enqueue(sendList, on: connection)
+        if let media, let scheduler = scheduler() {
+            scheduler.enqueue(sendList, on: connection, kind: media)
             return
         }
 
@@ -836,7 +842,7 @@ class UDPTransport {
         paceQueue.async { drain(from: 0) }
     }
     
-    func send(packet: LocalCastPacket, to endpoint: NWEndpoint, forcePlaintext: Bool = false) {
+    func send(packet: LocalCastPacket, to endpoint: NWEndpoint, forcePlaintext: Bool = false, isKeyFrame: Bool = false) {
         let endpointKey = describeEndpoint(endpoint)
         
         // Verbose logging for input events
@@ -851,7 +857,7 @@ class UDPTransport {
             if packet.type == .inputEvent {
                 lcDebug("   Using INCOMING connection, state: \(incomingConn.state)")
             }
-            send(packet: packet, on: incomingConn, forcePlaintext: forcePlaintext)
+            send(packet: packet, on: incomingConn, forcePlaintext: forcePlaintext, isKeyFrame: isKeyFrame)
             return
         }
         
@@ -887,10 +893,10 @@ class UDPTransport {
                 if packet.type == .inputEvent {
                     lcDebug("   Delayed send, connection state now: \(connection.state)")
                 }
-                self?.send(packet: packet, on: connection, forcePlaintext: forcePlaintext)
+                self?.send(packet: packet, on: connection, forcePlaintext: forcePlaintext, isKeyFrame: isKeyFrame)
             }
         } else {
-            send(packet: packet, on: connection, forcePlaintext: forcePlaintext)
+            send(packet: packet, on: connection, forcePlaintext: forcePlaintext, isKeyFrame: isKeyFrame)
         }
     }
     

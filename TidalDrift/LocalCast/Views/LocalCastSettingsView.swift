@@ -5,6 +5,7 @@ struct LocalCastSettingsView: View {
     @AppStorage("localCastCodec") var codec: LocalCastConfiguration.Codec = .hevc
     @AppStorage("localCastAdaptive") var adaptiveQuality = true
     @AppStorage("localCastAutoHost") var autoHost = false
+    @AppStorage(HeadlessDisplayPolicy.preferenceKey) var allowHeadlessDisplay = false
     @AppStorage("localCastRequireAuth") var requireAuth = true
     @AppStorage("localCastInputRateLimit") var inputRateLimit = 120
     @AppStorage("localCastMaxDimension") var maxDimension = 0
@@ -117,6 +118,9 @@ struct LocalCastSettingsView: View {
                     
                     Toggle("Auto-host on launch", isOn: $autoHost)
                         .help("Automatically start hosting when TidalDrift launches")
+
+                    Toggle("Allow a virtual display on a headless Mac", isOn: $allowHeadlessDisplay)
+                        .help("Applies the next time hosting starts. A viewer may create a temporary display only when macOS reports no connected displays.")
                 }
                 .padding(.leading, 8)
 

@@ -106,9 +106,6 @@ extension HostSession {
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.isRunning, self.hasActiveClient, self.isCaptureActive else { return }
             self.logger.info("🪟 Streamed window resized to \(Int(bounds.width))x\(Int(bounds.height)) — rebuilding capture")
-            // A user resizing a window is expected, not a failure; keep it out
-            // of the restart budget that guards a genuinely broken capture.
-            self.resetCaptureRestartAttempts()
             Task { [weak self] in
                 guard let self else { return }
                 await self.retarget(to: self.captureTarget)
@@ -164,7 +161,6 @@ extension HostSession {
     private func applyFallback(_ fallback: (target: HostCaptureTarget, label: String)) {
         Task { [weak self] in
             guard let self else { return }
-            self.resetCaptureRestartAttempts()
             await self.retarget(to: fallback.target)
             self.onClientRetarget?(fallback.target, fallback.label)
         }

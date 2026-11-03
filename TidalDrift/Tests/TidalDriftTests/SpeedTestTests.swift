@@ -7,14 +7,15 @@ final class SpeedTestTests: XCTestCase {
         let json = Data(#"{"end":{"sum_sent":{"seconds":5,"bits_per_second":100000000,"lost_percent":0},"sum_received":{"seconds":5,"bits_per_second":95000000,"packets":1000,"lost_percent":5,"jitter_ms":0.25}}}"#.utf8)
         let result = try IPerfRunner.parse(json, udp: true)
         XCTAssertEqual(result.mbps, 95)
-        XCTAssertEqual(result.lossPercent, 5)
-        XCTAssertEqual(result.jitterMs, 0.25)
+        XCTAssertEqual(result.udp?.senderMbps, 100)
+        XCTAssertEqual(result.udp?.lossPercent, 5)
+        XCTAssertEqual(result.udp?.jitterMs, 0.25)
     }
 
     @MainActor
     func testFailedAndIncompleteReportsNeverBecomePacketLoss() {
         for json in [#"{"error":"server is busy"}"#, #"{"end":{}}"#,
-                     #"{"end":{"sum_received":{"seconds":5,"bits_per_second":0,"packets":0,"lost_percent":100,"jitter_ms":0}}}"#] {
+                     #"{"end":{"sum_sent":{"seconds":5,"bits_per_second":1000000},"sum_received":{"seconds":5,"bits_per_second":0,"packets":0,"lost_percent":100,"jitter_ms":0}}}"#] {
             XCTAssertThrowsError(try IPerfRunner.parse(Data(json.utf8), udp: true))
         }
     }
@@ -24,8 +25,36 @@ final class SpeedTestTests: XCTestCase {
         let json = Data(#"{"end":{"sum_received":{"seconds":5,"bits_per_second":9400000000}}}"#.utf8)
         let result = try IPerfRunner.parse(json, udp: false)
         XCTAssertEqual(result.mbps, 9400)
-        XCTAssertNil(result.lossPercent)
-        XCTAssertNil(result.jitterMs)
+        XCTAssertNil(result.udp)
+    }
+
+    @MainActor
+    func testUnderfilledCleanProbeDoesNotValidateTarget() throws {
+        let json = Data(#"{"end":{"sum_sent":{"seconds":5,"bits_per_second":219000},"sum_received":{"seconds":5,"bits_per_second":219000,"packets":100,"lost_percent":0,"jitter_ms":0.2}}}"#.utf8)
+        let measurement = try IPerfRunner.parse(json, udp: true)
+        let download = try SpeedTestService.UDPDelivery(targetMbps: 1, measurement: measurement)
+        let upload = try SpeedTestService.UDPDelivery(targetMbps: 0.22, measurement: measurement)
+        let result = SpeedTestService.Result(rttMs: 1, jitterMs: 0, downloadMbps: 1000, uploadMbps: 1000,
+                                             downloadUDP: download, uploadUDP: upload, route: "Loopback")
+        XCTAssertEqual(download.senderMbps, 0.219, accuracy: 0.00001)
+        XCTAssertTrue(download.underTarget)
+        XCTAssertFalse(upload.underTarget)
+        XCTAssertTrue(result.deliveryVerdict.contains("below target"))
+        XCTAssertTrue(SpeedTestService.recommend(from: result).headline.contains("remains untested"))
+    }
+
+    @MainActor
+    func testMissingUDPSenderCannotCertifyATargetRate() {
+        let json = Data(#"{"end":{"sum_received":{"seconds":5,"bits_per_second":1000000,"packets":100,"lost_percent":0,"jitter_ms":0.2}}}"#.utf8)
+        XCTAssertThrowsError(try IPerfRunner.parse(json, udp: true))
+    }
+
+    @MainActor
+    func testControlPeerAndBindAddressNormalizeInterfaceScopes() {
+        XCTAssertEqual(SpeedTestControl.numericIPv4("192.168.1.4%en1"), "192.168.1.4")
+        XCTAssertEqual(SpeedTestControl.numericIPv4("127.0.0.1"), "127.0.0.1")
+        XCTAssertNil(SpeedTestControl.numericIPv4("fe80::1%en0"))
+        XCTAssertNil(SpeedTestControl.numericIPv4("test.local"))
     }
 
     @MainActor
@@ -52,13 +81,15 @@ final class SpeedTestTests: XCTestCase {
         defer { service.stopResponder() }
         try await Task.sleep(for: .milliseconds(300))
         let result = try await service.runTest(toHost: "127.0.0.1", udpLimitMbps: 500)
-        XCTAssertEqual(result.downloadUDPRateMbps, min(500, max(0.1, result.downloadMbps * 0.5)))
+        XCTAssertEqual(result.downloadUDP.targetMbps, min(500, max(0.1, result.downloadMbps * 0.5)))
+        XCTAssertGreaterThan(result.downloadUDP.senderMbps, 0)
+        XCTAssertGreaterThan(result.uploadUDP.senderMbps, 0)
         XCTAssertGreaterThan(result.downloadMbps, 0)
         XCTAssertGreaterThan(result.uploadMbps, 0)
-        XCTAssertTrue((0...100).contains(result.downloadLossPct))
-        XCTAssertTrue((0...100).contains(result.uploadLossPct))
+        XCTAssertTrue((0...100).contains(result.downloadUDP.lossPercent))
+        XCTAssertTrue((0...100).contains(result.uploadUDP.lossPercent))
         XCTAssertTrue(result.route.contains("127.0.0.1"))
-        print("iperf integration: TCP down \(result.downloadMbps), up \(result.uploadMbps) Mbps; UDP down \(result.downloadLossPct), up \(result.uploadLossPct)%")
+        print("iperf integration: TCP down \(result.downloadMbps), up \(result.uploadMbps) Mbps; UDP down \(result.downloadUDP.lossPercent), up \(result.uploadUDP.lossPercent)%")
         try await Task.sleep(for: .milliseconds(300))
         let task = Task { try await service.runTest(toHost: "127.0.0.1") }
         try await Task.sleep(for: .seconds(2))
