@@ -538,6 +538,11 @@ class TidalDropService: ObservableObject {
                 return
             }
             
+            if d == TidalTransferChannel.magic {
+                Task { @MainActor in TidalTransferInbox.shared.accept(TidalTransferChannel(connection), peer: remoteIP) }
+                return
+            }
+
             let metadataSize = Int(d.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self).bigEndian })
             
             guard metadataSize > 0 && metadataSize <= 1_048_576 else {
@@ -869,14 +874,7 @@ class TidalDropService: ObservableObject {
         let metadata = FileMetadata(fileName: name, fileSize: size)
         guard let metadataData = try? JSONEncoder().encode(metadata) else { return }
         
-        var header = Data()
-        let metadataSize = UInt32(metadataData.count).bigEndian
-        header.append(Data([
-            UInt8((metadataSize >> 24) & 0xFF),
-            UInt8((metadataSize >> 16) & 0xFF),
-            UInt8((metadataSize >> 8) & 0xFF),
-            UInt8(metadataSize & 0xFF)
-        ]))
+        var header = TidalTransferChannel.length(metadataData.count)
         header.append(metadataData)
         
         print("🌊 TidalDrop: Sending header (\(header.count) bytes) + file (\(fileData.count) bytes)")

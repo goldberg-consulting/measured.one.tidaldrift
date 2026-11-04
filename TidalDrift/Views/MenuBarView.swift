@@ -409,6 +409,11 @@ struct MenuBarView: View {
     
     private var actionsSection: some View {
         VStack(spacing: 2) {
+            MenuBarActionButton(icon: "shippingbox", label: "Tidal Transfer…") {
+                (NSApp.delegate as? AppDelegate)?.runAfterMenuDismissed {
+                    TidalTransferWindow.shared.show()
+                }
+            }
             MenuBarActionButton(icon: "arrow.clockwise", label: discoveryService.isScanningSubnet ? "Scanning..." : "Discover Devices") {
                 Task {
                     NetworkDiscoveryService.shared.refreshScan()
