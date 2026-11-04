@@ -73,7 +73,9 @@ final class TidalTransferFolderCopyTests: XCTestCase {
         try files.createDirectory(at: dest, withIntermediateDirectories: false)
         let first = root.appendingPathComponent("first")
         let second = root.appendingPathComponent("second")
-        try Data("hello".utf8).write(to: first)
+        let nested = first.appendingPathComponent("nested/deeper")
+        try files.createDirectory(at: nested, withIntermediateDirectories: true)
+        try Data("hello".utf8).write(to: nested.appendingPathComponent("data"))
         try Data("goodbye".utf8).write(to: second)
         do {
             _ = try await TidalTransferFolderCopy.copy([first, second], to: dest) { tick in
@@ -133,6 +135,32 @@ final class TidalTransferFolderCopyTests: XCTestCase {
             XCTFail("A locked top-level item cannot safely publish under its final name")
         } catch { XCTAssertTrue(error.localizedDescription.contains("is locked")) }
         XCTAssertEqual(try files.contentsOfDirectory(atPath: dest.path), [])
+    }
+
+    func testCleanupKeepsPublishedSelectionWhenLaterStagedCopyIsLocked() async throws {
+        let root = try sandbox()
+        let first = root.appendingPathComponent("first")
+        let locked = root.appendingPathComponent("locked")
+        let dest = root.appendingPathComponent("out")
+        try files.createDirectory(at: dest, withIntermediateDirectories: false)
+        try Data("first".utf8).write(to: first)
+        try Data("second".utf8).write(to: locked)
+        try XCTSkipUnless(chflags(locked.path, UInt32(UF_IMMUTABLE)) == 0, "The volume must support the Finder Locked flag.")
+        XCTAssertEqual(chflags(locked.path, 0), 0)
+        defer { _ = chflags(locked.path, 0) }
+        do {
+            // A concurrent Finder lock after preflight is preserved by the
+            // native clone. The second rename fails after the first succeeds.
+            _ = try await TidalTransferFolderCopy.copy([first, locked], to: dest) { tick in
+                if tick.completedItems == 0 { _ = chflags(locked.path, UInt32(UF_IMMUTABLE)) }
+            }
+            XCTFail("Publishing the locked staged copy must fail")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("Copied 1 of 2"))
+            XCTAssertFalse(error.localizedDescription.contains("could not be fully cleaned up"))
+        }
+        XCTAssertEqual(try files.contentsOfDirectory(atPath: dest.path), ["first"])
+        XCTAssertEqual(try Data(contentsOf: dest.appendingPathComponent("first")), Data("first".utf8))
     }
 
     func testNativeDataCopyWithoutClonePreservesPayloadAndReportsBytes() throws {

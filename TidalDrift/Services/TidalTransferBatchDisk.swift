@@ -14,6 +14,26 @@ enum TidalTransferDisk {
             && opened.st_dev == linked.st_dev && opened.st_ino == linked.st_ino
     }
 
+    /// Remove one known entry in a private workspace. Never recurse into an
+    /// unexpected item or follow links in the path to its parent.
+    @discardableResult
+    static func removeEntry(_ relative: String, from root: Int32, directory: Bool) -> Bool {
+        let components = relative.split(separator: "/", omittingEmptySubsequences: false)
+        guard let leaf = components.last, !relative.utf8.contains(0),
+              components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else { return false }
+        let parents = components.dropLast()
+        let fd = parents.isEmpty ? root :
+            openat(root, parents.joined(separator: "/"), O_RDONLY | O_DIRECTORY | O_NOFOLLOW_ANY | O_CLOEXEC)
+        guard fd >= 0 else { return errno == ENOENT }
+        defer { if !parents.isEmpty { close(fd) } }
+        let name = String(leaf)
+        while unlinkat(fd, name, directory ? AT_REMOVEDIR : 0) != 0 {
+            if errno == EINTR { continue }
+            return errno == ENOENT
+        }
+        return true
+    }
+
     static func makePrivateDirectory(in parent: Int32, named name: String) throws -> Int32 {
         guard mkdirat(parent, name, 0o700) == 0 else { throw error(name) }
         let fd = openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
@@ -111,10 +131,17 @@ extension TidalTransferBatch {
         }
         let payload = "payload"
         let stage = try TidalTransferDisk.makePrivateDirectory(in: work, named: payload)
-        var published = false
+        var published = false, createdCount = 0
         defer {
-            if !published, TidalTransferDisk.isPinned(stage, in: work, named: payload) {
-                _ = removefileat(work, payload, nil, removefile_flags_t(REMOVEFILE_RECURSIVE))
+            if !published {
+                // Parent-first creation means reverse order only needs unlink
+                // and empty-directory removal. A foreign item is never walked.
+                for index in (0..<createdCount).reversed() {
+                    TidalTransferDisk.removeEntry(tree.paths[index], from: stage, directory: entries[index].directory)
+                }
+                if TidalTransferDisk.isPinned(stage, in: work, named: payload) {
+                    TidalTransferDisk.removeEntry(payload, from: work, directory: true)
+                }
             }
             close(stage)
         }
@@ -133,10 +160,12 @@ extension TidalTransferBatch {
                 guard parent >= 0 else { throw TidalTransferDisk.error(entry.name) }
                 defer { close(parent) }
                 guard mkdirat(parent, entry.name, 0o700) == 0 else { throw TidalTransferDisk.error(entry.name) }
+                createdCount = index + 1
                 continue
             }
             let fd = openat(stage, path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW_ANY | O_CLOEXEC, 0o600)
             guard fd >= 0 else { throw TidalTransferDisk.error(entry.name) }
+            createdCount = index + 1
             // Observe close failures from e.g. an SMB destination reporting a
             // delayed I/O error. On any error the entire private batch is removed.
             var needsClose = true

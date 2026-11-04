@@ -67,22 +67,12 @@ enum TidalTransferFolderCopy {
             }
             try verifyDirectory(folder, descriptor: parent)
         } catch {
-            // Remove only this copy's numbered entries relative to the open staging
-            // descriptor, never a replacement directory at the original path.
-            for i in sources.indices where removefileat(stage, String(i), nil, removefile_flags_t(REMOVEFILE_RECURSIVE)) < 0 && errno != ENOENT {
-                // Copied flags or read-only directories can prevent ordinary cleanup.
-                for entry in plan where entry.relative == String(i) || entry.relative.hasPrefix(String(i) + "/") {
-                    let fd = openat(stage, entry.relative, O_EVTONLY | O_NOFOLLOW_ANY | O_NONBLOCK | O_CLOEXEC)
-                    if fd >= 0 {
-                        _ = fchflags(fd, 0)
-                        if entry.isDirectory { _ = fchmod(fd, 0o700) }
-                        close(fd)
-                    }
-                }
-                _ = removefileat(stage, String(i), nil, removefile_flags_t(REMOVEFILE_RECURSIVE))
-            }
+            // The manifest is ordered by top-level selection, parent before child.
+            // Previously published selections no longer belong to staging.
+            let firstUnpublished = String(saved.count)
+            discardStaged(plan.drop(while: { $0.relative != firstUnpublished }), from: stage)
             if !TidalTransferDisk.isPinned(stage, in: parent, named: temporary) || unlinkat(parent, temporary, AT_REMOVEDIR) != 0 {
-                throw Failure("Copied \(saved.count) of \(sources.count) selected items. \(error.localizedDescription) Temporary data remains in \(temporary).")
+                throw Failure("Copied \(saved.count) of \(sources.count) selected items. \(error.localizedDescription) The temporary folder \(temporary) moved or could not be fully cleaned up.")
             }
             guard !saved.isEmpty else { throw error }
             throw Failure("Copied \(saved.count) of \(sources.count) selected items. \(error.localizedDescription)")
@@ -93,6 +83,34 @@ enum TidalTransferFolderCopy {
         }
         ledger.update(name: nil, force: true)
         return saved
+    }
+
+    /// Remove only planned names, with each parent pinned beneath the original
+    /// staging descriptor. Never recursively delete a replacement by pathname.
+    private static func discardStaged(_ entries: ArraySlice<Entry>, from stage: Int32) {
+        var needsRetry = false
+        for entry in entries.reversed() {
+            if !TidalTransferDisk.removeEntry(entry.relative, from: stage, directory: entry.isDirectory) { needsRetry = true }
+        }
+        guard needsRetry else { return }
+        // Copied Finder flags and directory permissions can prevent unlinkat.
+        // Make remaining staged copies deletable from the top down. Do not
+        // modify a symlink target, a mounted volume, or a multiply linked file.
+        var stageInfo = stat()
+        guard fstat(stage, &stageInfo) == 0 else { return }
+        for entry in entries where entry.kind != S_IFLNK {
+            let fd = openat(stage, entry.relative, O_EVTONLY | O_NOFOLLOW_ANY | O_NONBLOCK | O_CLOEXEC)
+            guard fd >= 0 else { continue }
+            defer { close(fd) }
+            var info = stat()
+            guard fstat(fd, &info) == 0, info.st_dev == stageInfo.st_dev,
+                  info.st_mode & mode_t(S_IFMT) == entry.kind, entry.isDirectory || info.st_nlink == 1 else { continue }
+            _ = fchflags(fd, 0)
+            if entry.isDirectory { _ = fchmod(fd, 0o700) }
+        }
+        for entry in entries.reversed() {
+            TidalTransferDisk.removeEntry(entry.relative, from: stage, directory: entry.isDirectory)
+        }
     }
 
     private static func verifyDirectory(_ url: URL, descriptor: Int32) throws {

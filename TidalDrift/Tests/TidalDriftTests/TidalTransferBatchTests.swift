@@ -114,6 +114,23 @@ final class TidalTransferBatchTests: XCTestCase {
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: dest.path), [])
     }
 
+    func test_cleanupCannotFollowParentLinkOrRemoveUnrelatedContents() throws {
+        let fm = FileManager.default, dest = try fixture(), outside = try fixture()
+        try Data([42]).write(to: outside.appendingPathComponent("keep"))
+        try fm.createSymbolicLink(at: dest.appendingPathComponent("dir"), withDestinationURL: outside)
+        let fd = open(dest.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        XCTAssertGreaterThanOrEqual(fd, 0)
+        defer { close(fd) }
+        XCTAssertFalse(TidalTransferDisk.removeEntry("dir/keep", from: fd, directory: false))
+        XCTAssertFalse(TidalTransferDisk.removeEntry("../keep", from: fd, directory: false))
+        XCTAssertEqual(try Data(contentsOf: outside.appendingPathComponent("keep")), Data([42]))
+        let unexpected = dest.appendingPathComponent("unexpected")
+        try fm.createDirectory(at: unexpected, withIntermediateDirectories: false)
+        try Data([7]).write(to: unexpected.appendingPathComponent("unlisted"))
+        XCTAssertFalse(TidalTransferDisk.removeEntry("unexpected", from: fd, directory: true))
+        XCTAssertEqual(try Data(contentsOf: unexpected.appendingPathComponent("unlisted")), Data([7]))
+    }
+
     func test_workspaceReplacementIsNeverPublishedOrRecursivelyRemoved() async throws {
         let fm = FileManager.default
         let manifest = try JSONEncoder().encode([entry("received", bytes: 1)])
