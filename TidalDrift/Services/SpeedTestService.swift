@@ -19,7 +19,16 @@ final class SpeedTestService {
     private var runningTest = false
     private let helperURL: URL?
 
-    init(helperURL: URL? = nil) { self.helperURL = helperURL }
+    private let controlPort: NWEndpoint.Port
+    var listeningPort: NWEndpoint.Port? {
+        guard let listener, case .ready = listener.state else { return nil }
+        return listener.port
+    }
+
+    init(helperURL: URL? = nil, controlPort: NWEndpoint.Port = 5905) {
+        self.helperURL = helperURL
+        self.controlPort = controlPort
+    }
 
     struct Result: Sendable {
         let rttMs: Double
@@ -66,7 +75,11 @@ final class SpeedTestService {
     func startResponder() {
         guard listener == nil else { return }
         do {
-            let listener = try NWListener(using: SpeedTestControl.parameters(), on: NWEndpoint.Port(rawValue: Self.port)!)
+            let parameters = SpeedTestControl.parameters()
+            // The integration fixture uses a private loopback port so it never
+            // interacts with an installed copy's production responder.
+            if controlPort == .any { parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any) }
+            let listener = try NWListener(using: parameters, on: controlPort)
             listener.newConnectionHandler = { [weak self] connection in
                 Task { @MainActor in self?.accept(connection) }
             }
@@ -187,7 +200,11 @@ final class SpeedTestService {
         }
         let executable = try helperURL ?? IPerfRunner.executable()
         runningTest = true
-        let connection = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: Self.port)!,
+        guard let port = controlPort == .any ? listeningPort : controlPort else {
+            runningTest = false
+            throw IPerfRunner.Failure.message("The network-test listener isn’t ready.")
+        }
+        let connection = NWConnection(host: NWEndpoint.Host(host), port: port,
                                       using: SpeedTestControl.parameters())
         let control = SpeedTestControl(connection: connection)
         defer {

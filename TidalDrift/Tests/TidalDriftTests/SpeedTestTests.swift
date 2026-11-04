@@ -76,10 +76,14 @@ final class SpeedTestTests: XCTestCase {
         guard let path = ProcessInfo.processInfo.environment["TIDALDRIFT_TEST_IPERF"] else {
             throw XCTSkip("Set TIDALDRIFT_TEST_IPERF to the bundled helper to run the network integration check.")
         }
-        let service = SpeedTestService(helperURL: URL(fileURLWithPath: path))
+        let service = SpeedTestService(helperURL: URL(fileURLWithPath: path), controlPort: .any)
         service.startResponder()
         defer { service.stopResponder() }
-        try await Task.sleep(for: .milliseconds(300))
+        for _ in 0..<200 {
+            if service.listeningPort != nil { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        _ = try XCTUnwrap(service.listeningPort)
         let result = try await service.runTest(toHost: "127.0.0.1", udpLimitMbps: 500)
         XCTAssertEqual(result.downloadUDP.targetMbps, min(500, max(0.1, result.downloadMbps * 0.5)))
         XCTAssertGreaterThan(result.downloadUDP.senderMbps, 0)

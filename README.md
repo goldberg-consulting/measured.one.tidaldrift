@@ -13,6 +13,7 @@ TidalDrift brings the computers on your local network into one place. Find a nea
 - **Work on another Mac.** Use LocalCast for desktop and app/window streaming, with remote mouse and keyboard control. You’ll see it called **Metal Streaming** in the app.
 - **Use familiar connections.** Open macOS Screen Sharing for VNC, Finder for shared folders, or Terminal for SSH.
 - **Copy here, paste there.** Sync text, rich text, images, and files during LocalCast sessions. File and large-content transfers require a password-authenticated session.
+- **Copy batches with Tidal Transfer.** Open **Tidal Transfer…** from the menu bar, select a nearby Mac or mounted folder, then drop files and folders into the window. [How to transfer](docs/FILE_TRANSFER.md#tidal-transfer)
 - **Send files with TidalDrop.** Keep TidalDrift in the Dock, drop files onto its icon, choose one or more devices, and send. TidalDrop uses an existing mounted share when available or a direct connection to another TidalDrift app.
 - **Find your devices.** Bonjour discovers advertised services; **Discover Devices** also scans the local subnet. Saved credentials live in Keychain, and Wake-on-LAN can help bring a sleeping device back.
 - **Connect to a Raspberry Pi.** The Linux companion sets up a VNC desktop and SSH discovery. See the [Raspberry Pi guide](docs/RASPBERRY_PI.md).

@@ -7,7 +7,7 @@ Start with [Getting started](GETTING_STARTED.md) to connect two Macs. Looking fo
 - [Getting started](GETTING_STARTED.md): install, configure permissions, and make your first connection.
 - [LocalCast / Metal Streaming](LOCALCAST.md): share a desktop or app and adjust the viewing experience.
 - [Clipboard sync](CLIPBOARD_SYNC.md): copy text, images, and files across a LocalCast session.
-- [File transfer](FILE_TRANSFER.md): send files with TidalDrop or open a shared folder.
+- [File transfer](FILE_TRANSFER.md): use Tidal Transfer for batches, use TidalDrop, or open a shared folder.
 - [Discovery and networking](BONJOUR_DISCOVERY.md): how devices appear and what your network needs.
 - [Raspberry Pi and Linux](RASPBERRY_PI.md): set up a Linux target for VNC and SSH.
 - [Troubleshooting](TROUBLESHOOTING.md): start with the symptom you’re seeing.
